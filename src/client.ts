@@ -847,7 +847,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const sakuraPanelLink = element('a', 'dsh-mobile-control__text-link'); sakuraPanelLink.href = 'https://www.natfrp.com/user/'; sakuraPanelLink.target = '_blank'; sakuraPanelLink.rel = 'noopener noreferrer'; sakuraPanelLink.textContent = t('sakuraPanelLink')
   const sakuraTokenLabel = element('label', 'dsh-mobile-control__token-label'); sakuraTokenLabel.textContent = t('sakuraTokenLabel')
   const sakuraToken = element('input', 'dsh-mobile-control__token'); sakuraToken.type = 'password'; sakuraToken.autocomplete = 'off'; sakuraToken.spellcheck = false; sakuraToken.placeholder = t('tokenPlaceholder'); sakuraTokenLabel.append(sakuraToken)
-  const sakuraTokenSave = element('button', 'dsh-mobile-control__primary dsh-mobile-control__cpolar-connect'); sakuraTokenSave.type = 'button'; sakuraTokenSave.textContent = t('saveConnect')
+  const sakuraTokenSave = element('button', 'dsh-mobile-control__primary dsh-mobile-control__cpolar-connect'); sakuraTokenSave.type = 'button'; sakuraTokenSave.textContent = t('saveToken')
   const sakuraTunnelsTitle = element('h3', 'dsh-mobile-control__section-title'); sakuraTunnelsTitle.textContent = t('sakuraTunnelsTitle')
   const sakuraTunnelStatus = element('p', 'dsh-mobile-control__component-status'); sakuraTunnelStatus.textContent = ''
   const sakuraTunnelRow = element('div', 'dsh-mobile-control__ws-paths-row')
@@ -1744,7 +1744,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
         remoteStatus.textContent = t('sakuraTokenSavedNow')
         renderRemote(data)
       }, error => { remoteFailureText = t('configureFailed', { error: String(error) }); remoteStatus.textContent = remoteFailureText })
-      .finally(() => { remoteProviderBusy = false; sakuraTokenSave.setAttribute('aria-busy', 'false'); sakuraTokenSave.textContent = t('saveConnect'); loadRemote() })
+      .finally(() => { remoteProviderBusy = false; sakuraTokenSave.setAttribute('aria-busy', 'false'); sakuraTokenSave.textContent = t('saveToken'); loadRemote() })
   }
   sakuraTokenSave.addEventListener('click', sakuraTokenSaveClick)
   const loadSakuraTunnels = (): void => {

@@ -8,10 +8,6 @@ import {
   combineClientSignalLifetime,
   combineClientSignals,
   CONTROL_STYLES,
-  createFrpServerTemplateForClipboard,
-  createFrpAttachFrpcTomlForClipboard,
-  createFrpAttachTemplateForClipboard,
-  frpAttachFormErrorCode,
   clientReleaseInfo,
   diagnosticEntriesForRender,
   diagnosticControllerAction,
@@ -440,9 +436,10 @@ describe('mobile native Back before layout navigation', () => {
 describe('mobile-control localization', () => {
   it('uses raw Host controller codes to render specific actions in every locale', async () => {
     const failures = [
-      { provider: 'tailscale', code: 'funnel_permission_required', key: 'funnelPermission' },
-      { provider: 'frp', code: 'frp_component_missing', key: 'frpMissing' },
-      { provider: 'tailscale', code: 'sidecar_exited', key: 'controlChannelFailed' },
+      { provider: 'cloudflared', code: 'cloudflared_component_missing', key: 'cloudflaredMissing' },
+      { provider: 'sakurafrp', code: 'sakurafrp_tunnel_banned', key: 'sakuraTunnelBanned' },
+      { provider: 'sakurafrp', code: 'sakurafrp_token_missing', key: 'sakuraTokenMissing' },
+      { provider: 'cloudflared', code: 'control_channel_failed', key: 'controlChannelFailed' },
     ] as const
     for (const { provider, code, key } of failures) {
       const snapshot: DiagnosticSnapshot = {
@@ -469,7 +466,7 @@ describe('mobile-control localization', () => {
     for (const locale of ['en', 'it', 'zh'] as const) {
       const fallback = DIAGNOSTIC_REASON_MESSAGES[locale]['remote-controller-error'][1]
       expect(diagnosticControllerAction('future_provider_error', locale, fallback)).toBe(fallback)
-      expect(diagnosticControllerAction('cpolar_port_unavailable', locale, fallback)).toBe(fallback)
+      expect(diagnosticControllerAction('legacy_tunnel_error', locale, fallback)).toBe(fallback)
     }
   })
 
@@ -490,20 +487,23 @@ describe('mobile-control localization', () => {
     expect(CONTROL_STYLES).toContain('dsh-mobile-control__qr img{border-radius:12px;background:#fff')
   })
 
-  it('keeps the named-tunnel form behind an explicit mode choice and never persists the token in the DOM', () => {
+  it('renders the Mobile Access panel as a bottom sheet on phone viewports', () => {
+    // Below 600px the floating desktop card becomes a full-width sheet docked
+    // to the viewport bottom, clearing the home indicator on the last edge.
+    expect(CONTROL_STYLES).toContain('@media(max-width:599px){')
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control{left:0;right:0;bottom:0}')
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel{width:100%;max-height:min(86dvh,calc(100dvh - 64px));border-radius:18px 18px 0 0;border-bottom:0;padding-bottom:calc(16px + env(safe-area-inset-bottom))}')
+  })
+
+  it('keeps the named-tunnel form masked and never persists the token in the DOM', () => {
     const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
-    // The mode selector stages a choice; only Save reaches the provider, so clicking
-    // between the two can never silently discard a saved token.
-    expect(source).toContain("cloudflaredModeQuick.addEventListener('click'")
-    expect(source).toContain("cloudflaredModeNamed.addEventListener('click'")
-    expect(source).toContain('const cloudflaredShownMode = cloudflaredModeDraft ?? cloudflaredTunnelMode')
     // The connector token is a credential: a masked input, posted once, cleared after.
     expect(source).toContain("cloudflaredToken.type = 'password'")
     expect(source).toContain('/remote/cloudflared/tunnel')
     expect(source).toContain('/remote/cloudflared/tunnel/purge')
     expect(source).toContain('cloudflaredToken.value = \'\'')
-    // Quick tunnels allocate their own address, so the named fields stay hidden.
-    expect(source).toContain('cloudflaredTunnel.hidden = cloudflaredShownMode !== \'named\'')
+    // Untouched form fields mirror the saved configuration instead of keeping stale drafts.
+    expect(source).toContain('if (!cloudflaredHostnameDirty) cloudflaredHostname.value = configuredCloudflaredHostname')
     expect(CONTROL_STYLES).toContain('.dsh-mobile-control__tunnel[hidden]{display:none}')
   })
 
@@ -640,13 +640,8 @@ describe('mobile-control localization', () => {
       requestTimeout: 'Operazione scaduta. Verifica che DSH sia ancora in esecuzione e riprova.',
     })
     expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).diagnosticsCopied?.toLowerCase()).toContain('redacted report')
-    expect(MOBILE_CONTROL_MESSAGES.en.cpolarReady).toContain('temporary addresses')
-    expect(MOBILE_CONTROL_MESSAGES.it.cpolarReady).toContain('indirizzi temporanei')
     expect(MOBILE_CONTROL_MESSAGES.zh.mobileAccess).toBe('移动访问')
-    expect(MOBILE_CONTROL_MESSAGES.zh.cpolarReady).toContain('临时地址')
     expect(MOBILE_CONTROL_MESSAGES.zh.lanSetupRequired).toContain('选择上方网络')
-    expect(MOBILE_CONTROL_MESSAGES.zh.frpAttachTokenReenter).toContain('重新输入共享 Token')
-    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).frpEntryTlsPublic).not.toContain('IP certificate')
     const englishReasons = Object.keys(DIAGNOSTIC_REASON_MESSAGES.en).sort()
     expect(Object.keys(DIAGNOSTIC_REASON_MESSAGES.it).sort()).toEqual(englishReasons)
     expect(Object.keys(DIAGNOSTIC_REASON_MESSAGES.zh).sort()).toEqual(englishReasons)
@@ -659,67 +654,88 @@ describe('mobile-control localization', () => {
     expect(LOCALIZED_DIAGNOSTIC_COPY.zh.networkAction).toContain('dsh-mobile setup')
   })
 
-  it('maps every remote provider the host can report, including cloudflared', () => {
+  it('maps every remote provider the host can report, including SakuraFrp', () => {
     // The control UI maps the host's provider string onto its own union and
     // falls back to the built-in provider when the name is unknown. A provider
     // missing from that mapping would silently render another provider's
     // wording and state instead of failing, so every supported name is pinned.
-    for (const provider of ['tailscale', 'cpolar', 'cloudflared', 'frp', 'origin'] as const) {
+    for (const provider of ['cloudflared', 'sakurafrp'] as const) {
       expect(parseMobileRemoteProvider(provider)).toBe(provider)
     }
-    expect(parseMobileRemoteProvider('cloudfare')).toBe('tailscale')
-    expect(parseMobileRemoteProvider('')).toBe('tailscale')
-    expect(parseMobileRemoteProvider(undefined)).toBe('tailscale')
-    expect(parseMobileRemoteProvider(42)).toBe('tailscale')
+    expect(parseMobileRemoteProvider('sakura')).toBe('sakurafrp')
+    expect(parseMobileRemoteProvider('')).toBe('sakurafrp')
+    expect(parseMobileRemoteProvider(undefined)).toBe('sakurafrp')
+    expect(parseMobileRemoteProvider(42)).toBe('sakurafrp')
   })
 
-  it('localizes both cloudflared tunnel modes without implying either is the only one', () => {
+  it('localizes the named-tunnel cloudflared catalog and drops the quick-tunnel keys', () => {
     // Keys appended with Object.assign are not part of the inferred catalog type,
-    // so read them through the same cast the existing origin assertions use.
+    // so read them through the same cast the other assertions use.
     const en = MOBILE_CONTROL_MESSAGES.en as Record<string, string>
     const it = MOBILE_CONTROL_MESSAGES.it as Record<string, string>
     const zh = MOBILE_CONTROL_MESSAGES.zh as Record<string, string>
-    // The provider now runs a quick tunnel *or* a named tunnel, so the badge and
-    // description must not claim an account is never needed.
-    expect(en.cloudflaredBadge).toBe('Account optional')
-    expect(zh.cloudflaredBadge).toBe('账号可选')
-    expect(it.cloudflaredBadge).toBe('Account facoltativo')
+    // Quick tunnels are gone: only the named-tunnel card remains, so the badge
+    // must describe a named tunnel rather than an optional account.
+    expect(en.cloudflaredBadge).toBe('Named tunnel')
+    expect(zh.cloudflaredBadge).toBe('命名隧道')
+    expect(it.cloudflaredBadge).toBe('Tunnel con nome')
     expect(en.prepareCloudflared).toBe('Prepare cloudflared')
     for (const [catalog, label] of [[en, 'en'], [it, 'it'], [zh, 'zh']] as const) {
-      expect(catalog.cloudflaredDescription, label).toMatch(/quick|快速|rapido/iu)
-      expect(catalog.cloudflaredDescription, label).toMatch(/named|命名|con nome/iu)
-    }
-    // A quick tunnel is temporary, rate-limited, and carries no uptime promise;
-    // the UI must say so rather than implying a production-grade channel.
-    expect(en.cloudflaredQuickNote).toContain('rate-limited')
-    expect(en.cloudflaredQuickNote).toContain('no uptime guarantee')
-    expect(zh.cloudflaredQuickNote).toContain('无可用性保证')
-    expect(it.cloudflaredQuickNote).toContain('senza garanzia')
-    // The named-tunnel note must state the token's real handling, because that is
-    // the part a user cannot verify from the UI.
-    expect(en.cloudflaredNamedNote).toContain('environment')
-    expect(zh.cloudflaredNamedNote).toContain('环境变量')
-    expect(it.cloudflaredNamedNote).toContain('ambiente')
-    // The component-readiness line no longer describes only a quick tunnel: the
-    // mode-specific note carries that, and a stale claim here would contradict it.
-    for (const [catalog, label] of [[en, 'en'], [it, 'it'], [zh, 'zh']] as const) {
-      expect(catalog.cloudflaredReady, label).not.toMatch(/temporary|临时|temporaneo/iu)
-      expect(catalog.remoteStartingCloudflared, label).not.toMatch(/temporary|临时|temporaneo/iu)
-    }
-    for (const catalog of [en, it, zh]) {
-      // The badge states the real difference (account optional), not a regional claim.
-      expect(catalog.cloudflaredBadge).not.toMatch(/mainland|国内/u)
+      expect(catalog.cloudflaredDescription, label).toMatch(/named|con nome|命名/u)
+      // The named-tunnel note states the token's real handling, because that is
+      // the part a user cannot verify from the UI.
+      expect(catalog.cloudflaredNamedNote, label).toMatch(/environment|ambiente|环境变量/u)
       for (const key of [
-        'cloudflaredDescription', 'cloudflaredQuickNote', 'cloudflaredNamedNote', 'cloudflaredComponentNote',
+        'prepareCloudflared', 'cloudflaredDescription', 'cloudflaredNamedNote', 'cloudflaredComponentNote',
         'installConfirmCloudflared', 'purgeCloudflared', 'purgeCloudflaredConfirm',
         'resetCloudflaredConfirm', 'reconnectingCloudflared',
         'cloudflaredMissing', 'cloudflaredInvalid', 'cloudflaredPortUnavailable',
         'cloudflaredLaunchFailed', 'cloudflaredTimeout', 'cloudflaredStopped',
         'cloudflaredExited', 'cloudflaredOutputInvalid', 'cloudflaredOriginInvalid',
+        'cloudflaredTunnelSave', 'cloudflaredTunnelForget', 'cloudflaredTunnelForgetConfirm',
+        'cloudflaredTunnelConfigured', 'cloudflaredTunnelHint', 'cloudflaredTunnelMissing',
+        'cloudflaredTunnelHostnameInvalid', 'cloudflaredTunnelPortInvalid', 'cloudflaredTunnelPortReserved',
+        'cloudflaredTunnelTokenInvalid', 'cloudflaredTunnelConfigMissing', 'cloudflaredTunnelInvalid',
+        'cloudflaredTunnelPortUnavailable', 'cloudflaredTunnelSettingsInvalid', 'cloudflaredTunnelTargetInvalid',
+        'cloudflaredTunnelSaving', 'cloudflaredTunnelForgetting',
       ]) {
-        expect(catalog[key]?.length).toBeGreaterThan(0)
+        expect(catalog[key]?.length, `${label}.${key}`).toBeGreaterThan(0)
       }
     }
+    // Deleting a channel means deleting its copy: no stale quick-tunnel key may remain.
+    for (const catalog of [en, it, zh]) {
+      expect(Object.keys(catalog).filter(key => key.startsWith('cloudflaredQuick'))).toEqual([])
+    }
+  })
+
+  it('covers the SakuraFrp channel, its routes, and its failure codes in every locale', () => {
+    const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
+    expect(source).toContain("t('prepareSakurafrp')")
+    expect(source).toContain("t('sakuraTunnelsTitle')")
+    for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
+      const copy = catalog as Record<string, string>
+      for (const key of [
+        'prepareSakurafrp', 'sakuraTunnelsTitle', 'sakuraTokenSaved', 'sakuraTokenLabel', 'sakuraPanelLink',
+        'sakuraTokenMissing', 'sakuraTokenInvalid', 'sakuraApiUnreachable', 'sakuraApiError',
+        'sakuraTunnelMissing', 'sakuraTunnelBanned', 'sakuraTunnelTypeUnsupported', 'sakuraTunnelLocked',
+        'sakuraTunnelPortUnavailable', 'sakuraEntryUnknown', 'sakuraFrpcMissing', 'sakuraFrpcInvalid',
+        'sakuraConfigFetchFailed', 'sakuraLaunchFailed', 'sakuraStartTimeout', 'sakuraStopped',
+        'sakuraExited', 'sakuraInvalidOutput', 'sakuraSettingsInvalid', 'sakuraPortReservationFailed',
+        'sakuraPurge', 'sakuraPurgeConfirm',
+      ]) {
+        expect(copy[key]?.length, key).toBeGreaterThan(0)
+      }
+    }
+    // Failure codes share the same table as status and diagnostics.
+    expect(source).toContain("sakurafrp_token_missing: 'sakuraTokenMissing'")
+    expect(source).toContain("sakurafrp_tunnel_banned: 'sakuraTunnelBanned'")
+    expect(source).toContain("'sakurafrp_tunnel_banned'")
+    // The panel talks to the host over these routes only.
+    expect(source).toContain('/remote/sakurafrp/token')
+    expect(source).toContain('/remote/sakurafrp/tunnels')
+    expect(source).toContain('/remote/sakurafrp/configure')
+    expect(source).toContain('/remote/sakurafrp/component/install')
+    expect(source).toContain('/remote/sakurafrp/component/purge')
   })
 
   it('parses as CSS and maps every provider failure code to copy that exists', () => {
@@ -777,168 +793,6 @@ describe('mobile-control localization', () => {
     expect([...unknown.keys()]).toEqual([])
   })
 
-  it('localizes own-proxy setup without equating a listening backend with public readiness', () => {
-    expect(MOBILE_CONTROL_MESSAGES.en).toMatchObject({
-      originName: 'Own reverse proxy', originSaveStart: 'Save and start backend',
-      originBackendReady: 'Backend listening', originCopyBackend: 'Copy backend address',
-    })
-    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).originReady).toContain('have NOT been verified')
-    expect((MOBILE_CONTROL_MESSAGES.it as Record<string, string>).originReady).toContain('NON sono stati verificati')
-    expect((MOBILE_CONTROL_MESSAGES.zh as Record<string, string>).originReady).toContain('不代表公网连接已成功')
-    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).originWarning).toContain('including its port')
-    expect((MOBILE_CONTROL_MESSAGES.zh as Record<string, string>).originWarning).toContain('绝不能直接暴露公网')
-    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).originPurgeConfirm).toContain('Paired remote devices')
-    expect((MOBILE_CONTROL_MESSAGES.zh as Record<string, string>).originPurgeConfirm).toContain('均保留')
-    for (const messages of Object.values(MOBILE_CONTROL_MESSAGES)) {
-      for (const key of ['originPublicOrigin', 'originListenHost', 'originListenPort', 'originAllowedCidrs', 'originBackendSaved']) {
-        expect((messages as Record<string, string>)[key]?.length).toBeGreaterThan(0)
-      }
-    }
-  })
-
-  it('keeps managed connection copy distinct from external backend and form preview', () => {
-    const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
-    expect(source).toContain("const managedOrigin = origin && data.originMode === 'managed'")
-    expect(source).toContain("t(managedOrigin ? 'caddyName' : 'originName')")
-    expect(source).toContain("ready: origin ? t(managedOrigin ? 'caddyVerified' : 'originReady')")
-    expect(source).toContain("origin && !managedOrigin ? t('originBackendReady') : t('ready')")
-    expect(source).toContain('caddyModeManagedSelected === managedOrigin')
-    // The preview remains a form draft: only clean modes follow controller reads.
-    expect(source).toContain("if (!caddyModePreviewDirty) caddyModeManagedSelected = data.originMode === 'managed'")
-    for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
-      const copy = catalog as Record<string, string>
-      expect(copy.caddyName?.length).toBeGreaterThan(0)
-      expect(copy.caddyModePreviewNote?.length).toBeGreaterThan(0)
-    }
-    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).originDescription).toContain('managed Caddy')
-  })
-
-  it('keeps every origin validation and runtime error translated in all locales', () => {
-    const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
-    const mapping = source.match(/const ORIGIN_ERROR_MESSAGE_KEYS[^=]*= \{([\s\S]*?)\n\}/u)?.[1] ?? ''
-    const keys = [...mapping.matchAll(/origin_[a-z_]+: '([^']+)'/gu)].map(match => match[1]!)
-    expect(keys.length).toBeGreaterThanOrEqual(11)
-    for (const messages of Object.values(MOBILE_CONTROL_MESSAGES)) {
-      for (const key of keys) expect((messages as Record<string, string>)[key]?.length).toBeGreaterThan(0)
-    }
-  })
-
-  it('wires private-origin controls and protects edited forms from stale poll snapshots', () => {
-    const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
-    expect(source).toContain('selfHostedBody.append(frpChoice, originChoice)')
-    expect(source).toContain('/api/mobile-access/remote/origin/configure')
-    expect(source).toContain('/api/mobile-access/remote/origin/purge')
-    expect(source).toContain('if (!originFormDirty && !originFormBusy)')
-    expect(source).toContain('if (remoteLoadInFlight || originFormBusy || caddyFormBusy) return')
-    expect(source).toContain('if (epoch === remoteSnapshotEpoch) renderRemote(data)')
-    expect(source).toContain("originSetup.setAttribute('aria-busy', String(originFormBusy))")
-    expect(source).toContain("input?.setAttribute('aria-invalid', 'true')")
-    expect(source).toContain("originProvider.running === true")
-    expect(source).toContain("window.confirm(t('originPurgeConfirm'))")
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__origin-fields')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__origin-fields input[aria-invalid=true]')
-  })
-
-  it('creates the restricted FRP VPS template entirely in the loopback client', () => {
-    const template = createFrpServerTemplateForClipboard(
-      7000,
-      '0123456789abcdef0123456789abcdef',
-      'https://dsh.example.com',
-    )
-    expect(template).toContain('proxyBindAddr = "127.0.0.1"')
-    expect(template).toContain('reverse_proxy 127.0.0.1:7080')
-    expect(() => createFrpServerTemplateForClipboard(7000, 'short', 'https://dsh.example.com')).toThrow()
-    expect(() => createFrpServerTemplateForClipboard(7000, '0'.repeat(32), 'http://dsh.example.com')).toThrow()
-  })
-
-  it('builds attach runbooks in the loopback client and wires the new panel controls', () => {
-    const selfSignedForm = {
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      entryTls: 'self-signed' as const,
-      publicPort: 33_080,
-    }
-    const selfSigned = createFrpAttachTemplateForClipboard(selfSignedForm)
-    // The token is part of the local half by design; the VPS half never installs frps.
-    expect(selfSigned).toContain('type = "tcp"')
-    expect(selfSigned).toContain('remotePort = 33080')
-    expect(selfSigned).toContain('ufw allow 33080/tcp')
-    expect(selfSigned.split('---- (a)')[1]!.split('---- (b)')[0]).not.toContain('auth.token')
-    const proxyName = 'dsh-mobile-0123456789ab'
-    const namedRunbook = createFrpAttachTemplateForClipboard(selfSignedForm, { proxyName })
-    expect(namedRunbook).toContain(`name = "${proxyName}"`)
-    expect(namedRunbook).not.toContain('name = "dsh-mobile"\n')
-    expect(createFrpAttachFrpcTomlForClipboard(selfSignedForm, { proxyName, revealToken: true }))
-      .toContain(`name = "${proxyName}"`)
-    const http = createFrpAttachTemplateForClipboard({
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      entryTls: 'public-ip-cert',
-      vhostHttpPort: 8080,
-    })
-    expect(http).toContain('reverse_proxy 127.0.0.1:8080')
-    // Attach without the user's real vhost port must report the host's own code.
-    expect(frpAttachFormErrorCode({
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      entryTls: 'public-ip-cert',
-    })).toBe('frp_attach_mode_requires_vhost_port')
-    expect(frpAttachFormErrorCode({
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      entryTls: 'self-signed',
-    })).toBeUndefined()
-
-    const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
-    expect(source).toContain("t('frpModeAttach')")
-    expect(source).toContain('frpModeDraft = true')
-    expect(source).toContain("frpVhostPort.value = ''")
-    expect(source).not.toContain("frpVhostPort.value = '7080'")
-    expect(source).toContain("facts.viaProxy === true")
-    expect(source).toContain("t('frpEntryTlsSelfSigned')")
-    expect(source).toContain("t('frpPublicPortHint')")
-    expect(source).toContain("t('frpAttachPlanCopied')")
-    expect(source).toContain("t('frpAttachSelfCheck')")
-    expect(source).toContain("t('frpAttachTokenReenter')")
-    expect(source).toContain('frpCopyAttachPlan.hidden = true; frpCopyAttachPlan.disabled = true')
-    expect(source).toContain('frpCopyAttachToken.hidden = true; frpCopyAttachToken.disabled = true')
-    expect(source).toContain('frpStep2Text.textContent = attachSelected && configuredFrpProxyName === undefined')
-    expect(source).toContain('frpCopyAttachPlan.disabled = remoteProviderBusy || configuredFrpProxyName === undefined')
-    expect(source).toContain('frpCopyAttachToken.disabled = remoteProviderBusy || configuredFrpProxyName === undefined')
-    expect(source).toContain('createFrpAttachTemplateForClipboard(attachForm, { proxyName })')
-    expect(source).toContain('createFrpAttachFrpcTomlForClipboard(attachForm, {')
-    expect(source.match(/const proxyName = frpClipboardProxyName\(\)/gu)).toHaveLength(2)
-    expect(source.match(/if \(proxyName === undefined\) return/gu)).toHaveLength(2)
-    expect(source).toMatch(/remoteStatus\.textContent = t\('loadingRemoteStatus'\)\r?\n\s+loadRemote\(\)/u)
-    expect(source).not.toContain('body: JSON.stringify({ ...form, revealToken: true })')
-    expect(source).toContain("t(selfSignedSelected ? 'frpAppRequirementSelfSigned' : 'frpAppRequirement')")
-    expect(source).toContain('/api/mobile-access/remote/frp/attach-plan')
-    expect(source).toContain('/api/mobile-access/remote/frp/self-check')
-    // Status, attach validation, and diagnostics use the same code-to-copy table.
-    expect(source.match(/frp_attach_mode_requires_vhost_port: 'frpAttachModeRequiresVhostPort'/gu)).toHaveLength(1)
-    expect(source.match(/frp_attach_cert_unknown: 'frpAttachCertUnknownError'/gu)).toHaveLength(1)
-    expect(source.match(/frp_entry_tls_invalid: 'frpEntryTlsInvalid'/gu)).toHaveLength(1)
-    expect(source.match(/frp_self_signed_requires_public_ipv4: 'frpSelfSignedRequiresPublicIpv4'/gu)).toHaveLength(1)
-    expect(source.match(/frp_ingress_ca_expired: 'frpIngressCaExpired'/gu)).toHaveLength(1)
-    expect(source.match(/frp_ingress_ca_invalid: 'frpIngressCaInvalid'/gu)).toHaveLength(1)
-    expect(source.match(/frp_ingress_ca_changed: 'frpIngressCaChanged'/gu)).toHaveLength(1)
-    expect(source.match(/frp_ingress_renewal_failed: 'frpIngressRenewalFailed'/gu)).toHaveLength(1)
-    expect(source).toContain("t('frpAttachCaExpiring'")
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__frp-hint')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__frp-fields select')
-    const routes = readFileSync(new URL('../src/plugin.ts', import.meta.url), 'utf8')
-    expect(routes).toContain('/remote/frp/attach-plan')
-    expect(routes).toContain('/remote/frp/self-check')
-  })
-
   it('manages admin-approved third-party WebSocket paths from the loopback panel', () => {
     const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
     expect(source).toContain('/api/mobile-access/remote/websocket-paths')
@@ -950,7 +804,7 @@ describe('mobile-control localization', () => {
     const routes = readFileSync(new URL('../src/plugin.ts', import.meta.url), 'utf8')
     expect(routes).toContain('/remote/websocket-paths')
     expect(MOBILE_CONTROL_MESSAGES.en.wsPathsAdd).toBe('Allow path')
-    expect(source).toContain("frpVpsSummary.textContent = t('frpStep2Title')")
+    expect(source).toContain("allowAll.textContent = t('wsPathsAllowAll')")
     expect(source).toContain('wsGroupOf')
     expect(source).toContain('wsPathsAllowAll')
     expect(source).toContain('dsh-mobile-control__ws-dot')

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -41,43 +41,47 @@ class FakeRemoteController implements RemoteProviderController {
 
 describe('remote provider selection', () => {
   it('accepts only one supported provider and no extra fields', () => {
-    expect(parseRemoteProviderState({ version: 1, provider: 'tailscale' })).toEqual({ version: 1, provider: 'tailscale' })
-    expect(parseRemoteProviderState({ version: 1, provider: 'cpolar' })).toEqual({ version: 1, provider: 'cpolar' })
-    expect(parseRemoteProviderState({ version: 1, provider: 'frp' })).toEqual({ version: 1, provider: 'frp' })
     expect(parseRemoteProviderState({ version: 1, provider: 'cloudflared' })).toEqual({ version: 1, provider: 'cloudflared' })
-    expect(parseRemoteProviderState({ version: 1, provider: 'origin' })).toEqual({ version: 1, provider: 'origin' })
+    expect(parseRemoteProviderState({ version: 1, provider: 'sakurafrp' })).toEqual({ version: 1, provider: 'sakurafrp' })
     expect(() => parseRemoteProviderState({ version: 1, provider: 'other' })).toThrow('unsupported format')
-    expect(() => parseRemoteProviderState({ version: 1, provider: 'cpolar', token: 'secret' })).toThrow('unsupported format')
+    expect(() => parseRemoteProviderState({ version: 1, provider: 'sakurafrp', token: 'secret' })).toThrow('unsupported format')
+    // Removed providers are an unsupported format, not a silent selection.
+    expect(() => parseRemoteProviderState({ version: 1, provider: 'frp' })).toThrow('unsupported format')
+    expect(() => parseRemoteProviderState({ version: 1, provider: 'origin' })).toThrow('unsupported format')
   })
 
   it('uses the environment only for the first-run default', async () => {
-    expect(configuredRemoteProvider({})).toBe('tailscale')
-    expect(configuredRemoteProvider({ DSH_MOBILE_REMOTE_PROVIDER: 'cpolar' })).toBe('cpolar')
-    expect(configuredRemoteProvider({ DSH_MOBILE_REMOTE_PROVIDER: 'frp' })).toBe('frp')
+    expect(configuredRemoteProvider({})).toBe('sakurafrp')
+    expect(configuredRemoteProvider({ DSH_MOBILE_REMOTE_PROVIDER: 'sakurafrp' })).toBe('sakurafrp')
     expect(configuredRemoteProvider({ DSH_MOBILE_REMOTE_PROVIDER: 'cloudflared' })).toBe('cloudflared')
-    expect(configuredRemoteProvider({ DSH_MOBILE_REMOTE_PROVIDER: 'origin' })).toBe('origin')
     expect(() => configuredRemoteProvider({ DSH_MOBILE_REMOTE_PROVIDER: 'invalid' }))
-      .toThrow('must be tailscale, cpolar, cloudflared, frp, or origin')
+      .toThrow('must be cloudflared or sakurafrp')
 
     const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-remote-provider-'))
     temporaryDirectories.push(directory)
     const file = join(directory, 'state', 'provider.json')
-    const store = new JsonRemoteProviderStore(file, 'tailscale')
-    expect(await store.load()).toEqual({ version: 1, provider: 'tailscale' })
-    await store.save({ version: 1, provider: 'cpolar' })
-    expect(await new JsonRemoteProviderStore(file, 'tailscale').load()).toEqual({ version: 1, provider: 'cpolar' })
+    const store = new JsonRemoteProviderStore(file, 'cloudflared')
+    expect(await store.load()).toEqual({ version: 1, provider: 'cloudflared' })
+    await store.save({ version: 1, provider: 'sakurafrp' })
+    expect(await new JsonRemoteProviderStore(file, 'cloudflared').load()).toEqual({ version: 1, provider: 'sakurafrp' })
+  })
+
+  it('maps a state written by a removed provider back to the default instead of failing boot', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-remote-provider-'))
+    temporaryDirectories.push(directory)
+    await mkdir(join(directory, 'state'), { recursive: true })
+    await writeFile(join(directory, 'state', 'provider.json'), '{"version":1,"provider":"frp"}\n', 'utf8')
+    const store = new JsonRemoteProviderStore(join(directory, 'state', 'provider.json'), 'cloudflared')
+    expect(await store.load()).toEqual({ version: 1, provider: 'cloudflared' })
   })
 
   it('serializes enable and selection so the previous provider cannot finish late', async () => {
     const controllers = {
-      tailscale: new FakeRemoteController(),
-      cpolar: new FakeRemoteController(),
       cloudflared: new FakeRemoteController(),
-      frp: new FakeRemoteController(),
-      origin: new FakeRemoteController(),
+      sakurafrp: new FakeRemoteController(),
     }
     const saved: string[] = []
-    const coordinator = new RemoteProviderCoordinator('tailscale', controllers, {
+    const coordinator = new RemoteProviderCoordinator('cloudflared', controllers, {
       save: async state => { saved.push(state.provider) },
     })
     let releaseEnable: (() => void) | undefined
@@ -91,67 +95,61 @@ describe('remote provider selection', () => {
       return controller.setEnabled(true)
     })
     await started
-    const selecting = coordinator.select('frp')
+    const selecting = coordinator.select('sakurafrp')
     expect(saved).toEqual([])
     releaseEnable?.()
     await Promise.all([enabling, selecting])
 
-    expect(coordinator.selected).toBe('frp')
-    expect(saved).toEqual(['frp'])
-    expect(controllers.tailscale.enabled).toBe(false)
-    expect(controllers.cpolar.enabled).toBe(false)
+    expect(coordinator.selected).toBe('sakurafrp')
+    expect(saved).toEqual(['sakurafrp'])
+    expect(controllers.cloudflared.enabled).toBe(false)
   })
 
   it('restores the single-provider invariant even when a mutation fails', async () => {
     const controllers = {
-      tailscale: new FakeRemoteController(),
-      cpolar: new FakeRemoteController(),
       cloudflared: new FakeRemoteController(),
-      frp: new FakeRemoteController(),
-      origin: new FakeRemoteController(),
+      sakurafrp: new FakeRemoteController(),
     }
-    controllers.cpolar.enabled = true
-    controllers.origin.enabled = true
-    const coordinator = new RemoteProviderCoordinator('tailscale', controllers, { save: async () => {} })
+    controllers.sakurafrp.enabled = true
+    const coordinator = new RemoteProviderCoordinator('cloudflared', controllers, { save: async () => {} })
     await expect(coordinator.mutate(async () => { throw new Error('operation failed') })).rejects.toThrow('operation failed')
-    expect(controllers.cpolar.enabled).toBe(false)
-    expect(controllers.frp.enabled).toBe(false)
-    expect(controllers.origin.enabled).toBe(false)
+    expect(controllers.sakurafrp.enabled).toBe(false)
+    expect(controllers.cloudflared.enabled).toBe(false)
   })
 
   it('rejects configuration for a provider that another selection already replaced', async () => {
-    const controllers = { tailscale: new FakeRemoteController(), cpolar: new FakeRemoteController(), cloudflared: new FakeRemoteController(), frp: new FakeRemoteController(), origin: new FakeRemoteController() }
-    const coordinator = new RemoteProviderCoordinator('origin', controllers, { save: async () => {} })
+    const controllers = { cloudflared: new FakeRemoteController(), sakurafrp: new FakeRemoteController() }
+    const coordinator = new RemoteProviderCoordinator('sakurafrp', controllers, { save: async () => {} })
     const configure = vi.fn(async controller => controller.setEnabled(true))
-    const selected = coordinator.select('cpolar')
-    const configuring = coordinator.mutateSelected('origin', configure)
+    const selected = coordinator.select('cloudflared')
+    const configuring = coordinator.mutateSelected('sakurafrp', configure)
     const result = configuring.catch(error => error)
     await selected
     expect(await result).toBeInstanceOf(Error)
     expect((await result).message).toBe('remote_provider_changed')
     expect(configure).not.toHaveBeenCalled()
-    expect(controllers.cpolar.enabled).toBe(false)
+    expect(controllers.cloudflared.enabled).toBe(false)
   })
 
   it('keeps configuration and activation in one queue item before a later provider selection', async () => {
-    const controllers = { tailscale: new FakeRemoteController(), cpolar: new FakeRemoteController(), cloudflared: new FakeRemoteController(), frp: new FakeRemoteController(), origin: new FakeRemoteController() }
-    const coordinator = new RemoteProviderCoordinator('origin', controllers, { save: async () => {} })
+    const controllers = { cloudflared: new FakeRemoteController(), sakurafrp: new FakeRemoteController() }
+    const coordinator = new RemoteProviderCoordinator('sakurafrp', controllers, { save: async () => {} })
     let release: (() => void) | undefined
     let enter: (() => void) | undefined
     const ready = new Promise<void>(resolve => { enter = resolve })
     const barrier = new Promise<void>(resolve => { release = resolve })
-    const configuring = coordinator.mutateSelected('origin', async controller => {
+    const configuring = coordinator.mutateSelected('sakurafrp', async controller => {
       enter?.(); await barrier
       return controller.setEnabled(true)
     })
     await ready
-    const selected = coordinator.select('cpolar')
-    expect(coordinator.selected).toBe('origin')
+    const selected = coordinator.select('cloudflared')
+    expect(coordinator.selected).toBe('sakurafrp')
     release?.()
     await Promise.all([configuring, selected])
-    expect(coordinator.selected).toBe('cpolar')
-    expect(controllers.origin.enabled).toBe(false)
-    expect(controllers.cpolar.enabled).toBe(false)
+    expect(coordinator.selected).toBe('cloudflared')
+    expect(controllers.sakurafrp.enabled).toBe(false)
+    expect(controllers.cloudflared.enabled).toBe(false)
   })
 
   it('waits for process close after escalating from TERM to KILL', async () => {

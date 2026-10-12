@@ -1306,7 +1306,16 @@ export class MobileAccessGateway {
           rejectUpgrade(client, mapped.status, mapped.code)
         })
       })
-      server.on('clientError', (_error, socket) => { rejectUpgrade(socket as Socket, 400, 'bad_request') })
+      server.on('clientError', (_error, socket) => {
+        // A plaintext probe against a TLS ingress must receive no HTTP response
+        // at all: SakuraFrp's edge sniffs the local service with a plaintext
+        // request before passing TLS through, and a 400 answer would make it
+        // classify the tunnel as plaintext web and block it. The plaintext LAN
+        // listener keeps the explicit 400, where malformed HTTP is the
+        // caller's own bug.
+        if (this.tlsEnabled) socket.destroy()
+        else rejectUpgrade(socket as Socket, 400, 'bad_request')
+      })
       await new Promise<void>((resolve, reject) => {
         const failed = (error: Error): void => { reject(error) }
         server.once('error', failed)

@@ -30,9 +30,6 @@
     "lib/mobile-layout.js",
     "lib/mobile-compat.js",
     "lib/**/*.map",
-    "bin/dsh-mobile-funnel-win32-x64.exe",
-    "bin/dsh-mobile-funnel-linux-x64",
-    "bin/dsh-mobile-funnel-linux-arm64",
     "packages/question-fixes/package.json",
     "packages/question-fixes/lib/**",
     "packages/question-fixes/LICENSE",
@@ -46,14 +43,6 @@
     "docs/DSH_0.1.5_LAN.md",
     "docs/CLOUDFLARE_TUNNEL.md",
     "docs/CLOUDFLARE_TUNNEL.en.md",
-    "docs/SELF_HOSTED_FRP.md",
-    "docs/SELF_HOSTED_FRP.en.md",
-    "docs/ATTACH_EXISTING_FRPS.md",
-    "docs/ATTACH_EXISTING_FRPS.en.md",
-    "docs/SELF_HOSTED_ORIGIN.md",
-    "docs/SELF_HOSTED_ORIGIN.en.md",
-    "docs/CADDY_MANAGED.md",
-    "docs/CADDY_MANAGED.en.md",
     "docs/CLIENT_MODULES.md",
     "docs/CLIENT_MODULES.en.md",
     "docs/TRUSTED_NETWORKS.md",
@@ -65,7 +54,6 @@
     "docs/MOBILE_COMPOSER_TOOLBAR.md",
     "docs/MOBILE_COMPOSER_TOOLBAR.en.md",
     "LICENSE",
-    "FUNNEL_THIRD_PARTY_LICENSES.txt",
     "SECURITY.md",
     "THIRD_PARTY_NOTICES.md"
   ],
@@ -84,9 +72,6 @@
   },
   "scripts": {
     "build": "tsdown && node ./scripts/check-client-bundle.mjs",
-    "build:funnel-host": "node ./scripts/build-funnel-host.mjs",
-    "check:funnel-licenses": "node ./scripts/funnel-third-party-licenses.mjs",
-    "check:funnel-licenses:full": "node ./scripts/funnel-third-party-licenses.mjs --full-check",
     "check:mobile-release": "node ./scripts/check-mobile-release.mjs",
     "check:dsh-compatibility": "node ./scripts/check-dsh-compatibility.mjs",
     "smoke:dsh-boot": "node ./scripts/smoke-dsh-mobile-boot.mjs",
@@ -102,7 +87,6 @@
     "smoke:composer-overflow": "node ./scripts/smoke-composer-overflow.mjs",
     "smoke:composer-toolbar": "node ./scripts/smoke-composer-toolbar.mjs",
     "smoke:extension-workers": "node ./scripts/smoke-extension-workers.mjs",
-    "smoke:control-state": "node ./scripts/smoke-control-state.mjs",
     "smoke:module-recovery": "node ./scripts/smoke-client-module-recovery.mjs",
     "smoke:browser-auth-cookies": "node ./scripts/smoke-browser-auth-cookies.mjs",
     "capture:screenshots": "node ./scripts/capture-mobile-screenshots.mjs",
@@ -112,13 +96,12 @@
     "check:companion-package": "node ./scripts/check-companion-package.mjs",
     "check:docs": "node ./scripts/check-docs.mjs",
     "clean": "node ./scripts/clean.mjs",
-    "generate:funnel-licenses": "node ./scripts/funnel-third-party-licenses.mjs --write",
     "lint": "tsc --noEmit",
     "test": "vitest run --pool=threads --maxWorkers=1",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "prepack": "npm run check:version && npm run check:docs && npm run check:funnel-licenses && npm run build",
-    "verify": "npm run check:version && npm run check:docs && npm run check:companion-package && npm run check:funnel-licenses && npm run check:mobile-release && npm run typecheck && npm run test && npm run build && npm pack --dry-run"
+    "prepack": "npm run check:version && npm run check:docs && npm run build",
+    "verify": "npm run check:version && npm run check:docs && npm run check:companion-package && npm run check:mobile-release && npm run typecheck && npm run test && npm run build && npm pack --dry-run"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -142,11 +125,8 @@
     "android",
     "lan",
     "remote-access",
-    "tailscale",
-    "cpolar",
-    "frp",
-    "self-hosted",
-    "reverse-proxy",
+    "cloudflared",
+    "sakurafrp",
     "mobile",
     "https"
   ],
@@ -184,6 +164,7 @@
     "bonjour-service": "1.4.4",
     "qrcode": "^1.5.4",
     "selfsigned": "^5.5.0",
+    "undici": "^7.30.0",
     "ws": "8.22.0"
   },
   "devDependencies": {

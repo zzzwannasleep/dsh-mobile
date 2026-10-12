@@ -17,12 +17,12 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage } from 'node:http'
 import { createRequire } from 'node:module'
 import { X509Certificate } from 'node:crypto'
-import { copyFile, lstat, readFile, rm } from 'node:fs/promises'
+import { request as httpRequest } from 'node:https'
+import { lstat, readFile, rm } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { parseControlFile, parseGatewayConfig, type PluginConfig, type ResolvedGatewayConfig } from './config.js'
 import { collectConnectionDiagnostics, hasCompetingRemoteChannelBoot } from './diagnostics.js'
 import { buildMobileGuide, type MobileGuideState } from './mobile-guide.js'
-import { createVpsUninstallScript, deployVps, fetchVpsHostKeys, parseVpsDeploymentInput, uninstallVps } from './vps-deploy.js'
 import { TaskEventHub, watchTaskCompletions } from './task-events.js'
 import {
   FollowingMobileAccessRuntime,
@@ -45,9 +45,6 @@ import {
 } from './http-security.js'
 import { JsonDeviceStore } from './storage.js'
 import { BlockedUpgradePathLog, WebSocketPathStore } from './websocket-paths.js'
-import { FunnelController, funnelExecutable } from './funnel.js'
-import { CpolarController } from './cpolar.js'
-import { CpolarComponentManager, type CpolarComponentStatus } from './cpolar-component.js'
 import { CloudflaredComponentManager, type CloudflaredComponentStatus } from './cloudflared-component.js'
 import { CloudflaredController } from './cloudflared.js'
 import {
@@ -57,30 +54,22 @@ import {
 } from './cloudflared-tunnel.js'
 import { FrpComponentManager, type FrpComponentStatus } from './frp-component.js'
 import {
-  FrpConfigStore,
-  frpProxyName,
-  isFrpSelfSignedIngress,
-  mergeSavedFrpSettings,
-  mergeSavedFrpTarget,
-  resolveFrpPublicPort,
-  resolveFrpEntryProbe,
-  resolveFrpVhostHttpPort,
-  type FrpConfigurationStatus,
-  type FrpSettings,
-} from './frp-config.js'
-import { createFrpAttachTemplate } from './frp-attach.js'
-import { createFrpAttachPlan } from './frp-attach-plan.js'
-import { defaultProbeDiscovery, FrpController } from './frp.js'
-import { ensureFrpIngressCertificate, frpIngressPaths, frpIngressSelfCheck, purgeFrpIngressCertificates, type FrpIngressCertificate } from './frp-ingress.js'
-import { CaddyComponentManager, type CaddyComponentStatus } from './caddy-component.js'
-import { CaddyConfigStore } from './caddy-config.js'
-import { CaddyController } from './caddy.js'
-import { ManagedOriginController, JsonOriginModeStore, createVolatileRemoteControlStore } from './managed-origin.js'
-import { OriginConfigStore, parseOriginSettings, validateOriginListenPort, type OriginConfigurationStatus, type OriginSettings } from './origin-proxy-config.js'
-import { OriginController } from './origin-proxy.js'
+  SakuraFrpController,
+  SakuraFrpSettingsStore,
+  createSakuraFrpApiClient,
+  type SakuraFrpConfiguration,
+  type SakuraFrpTunnel,
+  validateSakuraFrpToken,
+  validateSakuraFrpTunnelId,
+} from './sakurafrp.js'
+import {
+  ensureTlsIngressCertificate,
+  purgeTlsIngressCertificates,
+  tlsIngressPaths,
+  type TlsIngressCertificate,
+} from './tls-ingress.js'
 import { PluginReleaseManager, releaseProfileDirectory } from './release-update.js'
 import { installMobileFileLogger } from './file-logger.js'
-import { loadOrCreateInstallationId } from './installation-id.js'
 import {
   configuredRemoteProvider,
   JsonRemoteProviderStore,
@@ -90,7 +79,7 @@ import {
   type RemoteProviderController,
   type RemoteProviderStatus,
 } from './remote.js'
-import { parseAuthority, parseCidr, probeTcpReachable } from './network.js'
+import { parseAuthority, parseCidr } from './network.js'
 import {
   availableLanNetworks,
   isNetworkSelectionError,
@@ -165,18 +154,12 @@ function mapAdminError(error: unknown): HttpError {
   if (error instanceof MobileExtensionError) return new HttpError(error.status, error.code)
   const code = (error as NodeJS.ErrnoException).code
   if (error instanceof Error && error.message.includes('spawn UNKNOWN')) {
-    return new HttpError(409, 'frp_component_launch_failed')
+    return new HttpError(409, 'remote_component_launch_failed')
   }
   if (code === 'EADDRNOTAVAIL') return new HttpError(409, 'network_address_changed')
   if (code === 'EADDRINUSE') return new HttpError(409, 'listen_port_in_use')
   if (error instanceof Error && error.message.startsWith('saved LAN interface ')) {
     return new HttpError(409, 'network_interface_unavailable')
-  }
-  if (error instanceof Error && error.message === 'cpolar_authtoken_invalid') {
-    return new HttpError(400, 'cpolar_authtoken_invalid')
-  }
-  if (error instanceof Error && error.message.startsWith('cpolar_')) {
-    return new HttpError(409, error.message)
   }
   // Component download and hash failures carry their own stable code, so the panel can show why an
   // install failed instead of a generic server error.
@@ -184,29 +167,17 @@ function mapAdminError(error: unknown): HttpError {
     return new HttpError(409, error.message)
   }
   if (error instanceof Error && [
-    'frp_server_address_invalid',
-    'frp_server_port_invalid',
-    'frp_token_invalid',
-    'frp_public_origin_invalid',
-    'frp_settings_invalid',
+    'sakurafrp_token_invalid',
+    'sakurafrp_tunnel_id_invalid',
+    'sakurafrp_settings_invalid',
   ].includes(error.message)) return new HttpError(400, error.message)
-  // Attach-mode codes are environment/precondition conflicts by design:
-  // `frp_attach_mode_requires_vhost_port` (the user's frps port is unknown),
-  // `frp_attach_cert_unknown` (the ingress certificate is missing or unusable),
-  // and `frp_entry_tls_invalid` (the requested entry mode cannot be provisioned)
-  // all map to 409 here, while a reachable plaintext vhost keeps the upstream
-  // `frp_vhost_publicly_reachable` / `frp_vhost_probe_failed` codes.
+  if (error instanceof Error && error.message.startsWith('sakurafrp_')) {
+    return new HttpError(409, error.message)
+  }
+  // The pinned frpc component is shared with the SakuraFrp provider; its
+  // download/verification failures carry their own stable codes and are
+  // precondition conflicts, not server faults.
   if (error instanceof Error && error.message.startsWith('frp_')) {
-    return new HttpError(409, error.message)
-  }
-  if (error instanceof Error && [
-    'origin_settings_invalid', 'origin_public_origin_invalid', 'origin_listen_host_invalid',
-    'origin_listen_port_invalid', 'origin_listen_port_reserved', 'origin_allowed_cidrs_invalid',
-  ].includes(error.message)) return new HttpError(400, error.message)
-  if (error instanceof Error && error.message.startsWith('origin_')) {
-    return new HttpError(409, error.message)
-  }
-  if (error instanceof Error && error.message.startsWith('vps_')) {
     return new HttpError(409, error.message)
   }
   if (error instanceof Error && error.message === 'plugin_update_failed') {
@@ -343,25 +314,82 @@ export function remoteGatewayConfig(
 }
 
 /**
- * Gateway config for the self-signed FRP ingress.
+ * One bounded HTTPS health probe against the self-signed ingress.
  *
- * Unlike {@link remoteGatewayConfig}, the gateway itself is the TLS endpoint:
- * frps only forwards raw TCP, so the listener speaks HTTPS with the leaf that
+ * The diagnostics default probe validates against the system trust store, which
+ * cannot anchor the pairing CA, so the SakuraFrp entry gets an explicit probe
+ * that carries the same CA the app pins.
+ */
+function probeTlsIngressHealth(origin: string, caPem: string, timeoutMs = 5_500): Promise<number> {
+  return new Promise((resolveStatus, rejectStatus) => {
+    let settled = false
+    const finish = (error?: Error, status?: number): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error !== undefined) rejectStatus(error)
+      else resolveStatus(status ?? 0)
+    }
+    const timer = setTimeout(() => {
+      request.destroy(new Error('tls_ingress_probe_timeout'))
+    }, timeoutMs)
+    timer.unref()
+    const target = new URL(origin)
+    const request = httpRequest(target, {
+      ca: caPem,
+      servername: target.hostname,
+      path: '/mobile-access/health',
+      method: 'GET',
+    }, response => {
+      response.resume()
+      finish(undefined, response.statusCode ?? 0)
+    })
+    request.on('error', error => finish(error instanceof Error ? error : new Error(String(error))))
+    request.end()
+  })
+}
+
+/**
+ * Reconstruct the CA the start-up self-check must pin, read from the ingress
+ * directory. The SakuraFrp gateway presents a leaf signed by this CA, which is
+ * absent from the system trust store; an unreadable CA fails explicitly rather
+ * than hiding a broken pairing identity behind a probe timeout.
+ */
+export async function readTlsIngressTrustAnchor(stateFile: string, ownedRoot: string = dirname(stateFile)): Promise<string | undefined> {
+  try {
+    const file = tlsIngressPaths(stateFile).caCertFile
+    await assertManagedParents(ownedRoot, file, 'tls_ingress')
+    const entry = await lstat(file)
+    if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('tls_ingress_file_invalid')
+    return await readFile(file, 'utf8')
+  } catch (error) {
+    throw new Error('tls_ingress_ca_invalid', { cause: error })
+  }
+}
+
+/**
+ * Gateway config for the self-signed TLS ingress.
+ *
+ * A raw-TCP tunnel forwards the node's traffic untouched, so the gateway itself
+ * is the TLS endpoint: the listener speaks HTTPS with the leaf that
  * `pairingCaFile` signed, and the pairing CA is deliberately retained so the
  * gateway can serve `GET /mobile-access/ca.cer` for the app to pin. The listener
- * stays on loopback because the public entry is the frps TCP proxy, never a
+ * stays on loopback because the public entry is the tunnel's TCP proxy, never a
  * direct bind.
  */
-export function frpIngressGatewayConfig(
+export function tlsIngressGatewayConfig(
   template: ResolvedGatewayConfig,
-  settings: FrpSettings,
+  publicOrigin: string,
   stateFile: string,
-  ingress: Pick<FrpIngressCertificate, 'paths' | 'caFingerprint'>,
+  ingress: Pick<TlsIngressCertificate, 'paths' | 'caFingerprint'>,
   listenPort = 0,
 ): ResolvedGatewayConfig {
-  if (!isFrpSelfSignedIngress(settings)) throw new Error('frp_entry_tls_invalid')
-  const publicHost = new URL(settings.publicOrigin).hostname
-  const publicAuthority = `${publicHost}:${String(resolveFrpPublicPort(settings))}`
+  const url = new URL(publicOrigin)
+  if (url.protocol !== 'https:' || url.username !== '' || url.password !== ''
+    || url.pathname !== '/' || url.search !== '' || url.hash !== '') {
+    throw new Error('tls_ingress_public_origin_invalid')
+  }
+  const publicAuthority = url.port === '' ? `${url.hostname}:443` : url.host
   const { pairingCaFile: _templateCaFile, ...shared } = template
   return Object.freeze({
     ...shared,
@@ -382,59 +410,16 @@ export function frpIngressGatewayConfig(
   })
 }
 
-/**
- * CA the FRP start-up self-check must pin, read from the ingress directory.
- *
- * The self-signed entry presents a leaf signed by this CA, which is absent from
- * the system trust store, so the probe must anchor it exactly as the app does
- * when it pins `pairingCaFile`. The public-CA entry answers with a publicly
- * trusted certificate and therefore returns `undefined` (system trust store).
- * An unreadable self-signed CA fails explicitly: falling back to the system
- * trust store would hide a broken pairing identity behind a start timeout.
- */
-export async function readFrpIngressTrustAnchor(settings: FrpSettings, stateFile: string, ownedRoot: string = dirname(stateFile)): Promise<string | undefined> {
-  if (!isFrpSelfSignedIngress(settings)) return undefined
-  try {
-    const file = frpIngressPaths(stateFile).caCertFile
-    await assertManagedParents(ownedRoot, file, 'frp_ingress')
-    const entry = await lstat(file)
-    if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('frp_ingress_file_invalid')
-    return await readFile(file, 'utf8')
-  } catch (error) {
-    throw new Error('frp_ingress_ca_invalid', { cause: error })
-  }
-}
-
-/** Reuse remote HTTPS policy while binding a separately validated private HTTP origin. */
-export function originGatewayConfig(
-  template: ResolvedGatewayConfig,
-  settings: OriginSettings,
-  stateFile: string,
-  instanceId: string,
-  listenPort = settings.listenPort,
-): ResolvedGatewayConfig {
-  const validated = parseOriginSettings(settings)
-  // Port zero is available only to in-process tests, never to saved settings.
-  if (listenPort !== 0) validateOriginListenPort(listenPort)
-  return Object.freeze({
-    ...remoteGatewayConfig(template, validated.publicOrigin, stateFile, instanceId, listenPort),
-    listenHost: validated.listenHost,
-    allowedCidrs: Object.freeze(validated.allowedCidrs.map(parseCidr)),
-  })
-}
-
 function remoteControlPayload(
   provider: RemoteProvider,
   status: RemoteProviderStatus,
   gateway: MobileAccessGateway | undefined,
-  providerStatuses: Readonly<Record<RemoteProvider, RemoteProviderStatus>>,
-  cpolarComponent: CpolarComponentStatus,
+  cloudflaredStatus: RemoteProviderStatus,
+  sakurafrpStatus: RemoteProviderStatus,
   cloudflaredComponent: CloudflaredComponentStatus,
   cloudflaredConfiguration: CloudflaredTunnelStatus,
   frpComponent: FrpComponentStatus,
-  frpConfiguration: FrpConfigurationStatus,
-  originConfiguration: OriginConfigurationStatus,
-  caddyComponentStatus: CaddyComponentStatus,
+  sakurafrpConfiguration: SakuraFrpConfiguration,
 ): Record<string, unknown> {
   return {
     provider,
@@ -447,33 +432,19 @@ function remoteControlPayload(
     ...(status.errorCode === undefined ? {} : { errorCode: status.errorCode }),
     ...(gateway === undefined ? {} : { extensions: gateway.extensionStatus() }),
     providers: {
-      tailscale: { bundled: true, running: providerStatuses.tailscale.enabled, state: providerStatuses.tailscale.state },
-      cpolar: {
-        bundled: false,
-        running: providerStatuses.cpolar.enabled,
-        state: providerStatuses.cpolar.state,
-        component: cpolarComponent,
-      },
       cloudflared: {
         bundled: false,
-        running: providerStatuses.cloudflared.enabled,
-        state: providerStatuses.cloudflared.state,
+        running: cloudflaredStatus.enabled,
+        state: cloudflaredStatus.state,
         component: cloudflaredComponent,
         configuration: cloudflaredConfiguration,
       },
-      frp: {
+      sakurafrp: {
         bundled: false,
-        running: providerStatuses.frp.enabled,
-        state: providerStatuses.frp.state,
+        running: sakurafrpStatus.enabled,
+        state: sakurafrpStatus.state,
         component: frpComponent,
-        configuration: frpConfiguration,
-      },
-      origin: {
-        bundled: true,
-        running: providerStatuses.origin.enabled,
-        state: providerStatuses.origin.state,
-        configuration: originConfiguration,
-        component: caddyComponentStatus,
+        configuration: sakurafrpConfiguration,
       },
     },
   }
@@ -511,25 +482,16 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     configuredRemoteProvider(process.env),
   )
   const initialRemoteProvider = (await remoteProviderStore.load()).provider
-  const cpolarComponent = new CpolarComponentManager({ stateDirectory })
-  await cpolarComponent.initialize()
   const cloudflaredComponent = new CloudflaredComponentManager({ stateDirectory })
   await cloudflaredComponent.initialize()
+  // The pinned upstream frpc is owned by the SakuraFrp provider; nothing is
+  // downloaded until the user asks for it.
   const frpComponent = new FrpComponentManager({ stateDirectory })
   await frpComponent.initialize()
-  // FRP registration persists across LAN setup changes, while the gateway's
-  // pairing identity may change when an unconfigured setup becomes managed.
-  const frpIdentity = await loadOrCreateInstallationId(join(stateDirectory, 'installation-id'))
-  const frpConfig = new FrpConfigStore(join(remoteDirectory, 'frp', 'config'), frpProxyName(frpIdentity), stateDirectory)
-  await frpConfig.initialize()
-  const originConfig = new OriginConfigStore(join(remoteDirectory, 'origin', 'config'), stateDirectory)
-  await originConfig.initialize()
-  const caddyComponent = new CaddyComponentManager({ stateDirectory })
-  await caddyComponent.initialize()
-  const caddyConfig = new CaddyConfigStore(stateDirectory)
-  await caddyConfig.initialize()
   const cloudflaredTunnel = new CloudflaredTunnelStore(join(remoteDirectory, 'cloudflared'), stateDirectory)
   await cloudflaredTunnel.initialize()
+  const sakurafrpSettings = new SakuraFrpSettingsStore(join(remoteDirectory, 'sakurafrp'), stateDirectory)
+  await sakurafrpSettings.initialize()
   const unregisterBuiltin = mobileAccess.registerExtension({
     schemaVersion: 1,
     id: 'computer-images',
@@ -631,17 +593,6 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
   }
   const lanController = new MobileAccessGatewayController(lanControlStore, startRuntime)
   const remoteDeviceFile = join(remoteDirectory, 'devices.json')
-  const legacyCpolarDeviceFile = join(remoteDirectory, 'cpolar', 'devices.json')
-  if (initialRemoteProvider === 'cpolar') {
-    try {
-      await lstat(remoteDeviceFile)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      try { await copyFile(legacyCpolarDeviceFile, remoteDeviceFile) } catch (copyError) {
-        if ((copyError as NodeJS.ErrnoException).code !== 'ENOENT') throw copyError
-      }
-    }
-  }
   const createRemoteGateway = async (publicOrigin: string, listenPort = 0): Promise<MobileAccessGateway> => {
       const resolved = remoteGatewayConfig(
         template,
@@ -664,17 +615,18 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       return candidate
   }
   /**
-   * Gateway factory for the FRP provider.
+   * Gateway factory for the SakuraFrp provider.
    *
-   * The public-CA entry keeps the ordinary Caddy-fronted remote gateway. The
-   * self-signed entry terminates TLS inside the gateway, so it first materializes
-   * a leaf the pairing CA signed for the public IPv4 and then binds the ingress
-   * configuration that keeps that CA pinned.
+   * The node forwards raw TCP, so the gateway terminates TLS itself: it
+   * materializes a leaf the pairing CA signed for the public entry host (a
+   * node domain such as frp-ski.com, so a DNS SAN) and binds the ingress
+   * configuration that keeps that CA pinned. SakuraFrp's mainland compliance
+   * gate additionally refuses plaintext web access on tunnel ports, which the
+   * TLS-only entry satisfies by construction.
    */
-  const createFrpGateway = async (publicOrigin: string, settings: FrpSettings): Promise<MobileAccessGateway> => {
-    if (!isFrpSelfSignedIngress(settings)) return createRemoteGateway(publicOrigin)
-    const ingress = await ensureFrpIngressCertificate(settings, remoteDeviceFile, Date.now(), undefined, stateDirectory)
-    const resolved = frpIngressGatewayConfig(template, settings, remoteDeviceFile, ingress)
+  const createSakuraFrpGateway = async (publicOrigin: string, listenPort = 0): Promise<MobileAccessGateway> => {
+    const ingress = await ensureTlsIngressCertificate({ publicOrigin }, remoteDeviceFile, Date.now(), undefined, stateDirectory)
+    const resolved = tlsIngressGatewayConfig(template, publicOrigin, remoteDeviceFile, ingress, listenPort)
     const candidate = new MobileAccessGateway(
       resolved,
       new JsonDeviceStore(resolved.stateFile, resolved.maxDevices),
@@ -691,76 +643,21 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     }
     return candidate
   }
-  const createOriginGateway = async (settings: OriginSettings): Promise<MobileAccessGateway> => {
-    const resolved = originGatewayConfig(template, settings, remoteDeviceFile, instanceId)
-    const candidate = new MobileAccessGateway(
-      resolved, new JsonDeviceStore(resolved.stateFile, resolved.maxDevices), mobileAccess,
-      upstreamLoginUrl, webSocketPaths, blockedUpgradePaths, undefined, clientModulePreferences,
-    )
-    try { await candidate.start() } catch (error) {
-      await candidate.close()
-      throw error
-    }
-    return candidate
-  }
-  const tailscaleStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'control.json'), false)
-  const cpolarStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'cpolar', 'control.json'), false)
   const cloudflaredStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'cloudflared', 'control.json'), false)
-  const frpStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'frp', 'control.json'), false)
-  const originStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'origin', 'control.json'), false)
-  const caddyController = new CaddyController({
-    store: createVolatileRemoteControlStore(),
-    component: caddyComponent,
-    config: caddyConfig,
-    instanceId,
-    createGateway: settings => createRemoteGateway(settings.publicOrigin),
-  })
-  const originController = new ManagedOriginController({
-    store: originStore,
-    modeStore: new JsonOriginModeStore(join(remoteDirectory, 'origin', 'upstream.json')),
-    external: new OriginController({ store: createVolatileRemoteControlStore(), config: originConfig, createGateway: createOriginGateway }),
-    managed: caddyController,
-  })
+  const sakurafrpStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'sakurafrp', 'control.json'), false)
   const remoteControllers: Record<RemoteProvider, RemoteProviderController> = {
-    tailscale: new FunnelController({
-      store: tailscaleStore,
-      executable: funnelExecutable(import.meta.url),
-      stateDirectory: join(remoteDirectory, 'tailscale'),
-      ownedRoot: stateDirectory,
-      hostname: `dsh-${instanceId.slice(0, 12)}`,
-      createGateway: createRemoteGateway,
-    }),
-    cpolar: new CpolarController({
-      store: cpolarStore,
-      executable: cpolarComponent.executable,
-      configFile: cpolarComponent.configFile,
-      createGateway: createRemoteGateway,
-    }),
     cloudflared: new CloudflaredController({
       store: cloudflaredStore,
       executable: cloudflaredComponent.executable,
       tunnel: cloudflaredTunnel,
       createGateway: createRemoteGateway,
     }),
-    frp: new FrpController({
-      store: frpStore,
-      executable: frpComponent.executable,
-      config: frpConfig,
-      instanceId,
-      createGateway: createFrpGateway,
-      /**
-       * Hand the start-up self-check the CA the app itself pins.
-       *
-       * Only this module knows where the ingress material lives, so the anchor is
-       * read here from the ingress directory instead of being guessed downstream.
-       */
-      resolveDiscoveryTrustAnchor: settings => readFrpIngressTrustAnchor(settings, remoteDeviceFile, stateDirectory),
-      maintainIngressCertificate: async (settings, gateway) => {
-        await ensureFrpIngressCertificate(settings, remoteDeviceFile, Date.now(), gateway.config.instanceId, stateDirectory)
-        await gateway.refreshProvidedTls()
-      },
+    sakurafrp: new SakuraFrpController({
+      store: sakurafrpStore,
+      settings: sakurafrpSettings,
+      component: { executable: frpComponent.executable },
+      createGateway: createSakuraFrpGateway,
     }),
-    origin: originController,
   }
   const remoteProviders = new RemoteProviderCoordinator(initialRemoteProvider, remoteControllers, remoteProviderStore)
   const remoteController = () => remoteProviders.controller()
@@ -774,21 +671,13 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     remoteProviders.selected,
     remoteController().status(),
     remoteController().gateway(),
-    {
-      tailscale: remoteControllers.tailscale.status(),
-      cpolar: remoteControllers.cpolar.status(),
-      cloudflared: remoteControllers.cloudflared.status(),
-      frp: remoteControllers.frp.status(),
-      origin: remoteControllers.origin.status(),
-    },
-    cpolarComponent.status(),
+    remoteControllers.cloudflared.status(),
+    remoteControllers.sakurafrp.status(),
     cloudflaredComponent.status(),
     cloudflaredTunnel.status(),
     frpComponent.status(),
-    frpConfig.status(),
-    originConfig.status(),
-    caddyComponent.status(),
-  ), originMode: originController.mode(), caddyConfiguration: caddyConfig.status(), caddyState: caddyController.status() })
+    sakurafrpSettings.status(),
+  ) })
   const lanPayload = (): Record<string, unknown> => ({
     ...(loaded.kind === 'unconfigured' ? {
       configured: preparedLanSetup !== undefined,
@@ -836,22 +725,16 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       catch { networkError = 'network_interface_unavailable' }
     }
     const remote = remoteController().status()
-    const frpOrigin = remote.origin
-    const frpSettings = remoteProviders.selected === 'frp' ? frpConfig.settings() : undefined
-    const frpGateway = remoteControllers.frp.gateway()
-    const pinnedFrpProbe = frpSettings !== undefined && isFrpSelfSignedIngress(frpSettings)
-      && frpGateway !== undefined && frpOrigin !== undefined
+    const pinnedSakuraFrpProbe = remoteProviders.selected === 'sakurafrp'
+      && remote.enabled && remote.state === 'ready' && remote.origin !== undefined
+      && remoteControllers.sakurafrp.gateway() !== undefined
       ? async (): Promise<{ state: 'ready' | 'unreachable'; latencyMs?: number }> => {
           try {
-            const trustAnchorPem = await readFrpIngressTrustAnchor(frpSettings, remoteDeviceFile, stateDirectory)
+            const trustAnchorPem = await readTlsIngressTrustAnchor(remoteDeviceFile, stateDirectory)
             if (trustAnchorPem === undefined) return { state: 'unreachable' }
             const started = performance.now()
-            const reachable = await defaultProbeDiscovery(
-              { origin: frpOrigin, trustAnchorPem },
-              frpGateway.config.instanceId,
-              AbortSignal.timeout(5_500),
-            )
-            return reachable
+            const status = await probeTlsIngressHealth(remote.origin as string, trustAnchorPem)
+            return status >= 200 && status < 300
               ? { state: 'ready', latencyMs: Math.max(0, Math.round(performance.now() - started)) }
               : { state: 'unreachable' }
           } catch {
@@ -877,7 +760,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
         ...(remote.origin === undefined ? {} : { origin: remote.origin }),
         ...(remote.errorCode === undefined ? {} : { errorCode: remote.errorCode }),
       },
-    }, pinnedFrpProbe === undefined ? {} : { remote: pinnedFrpProbe }) as unknown as Record<string, unknown>
+    }, pinnedSakuraFrpProbe === undefined ? {} : { remote: pinnedSakuraFrpProbe }) as unknown as Record<string, unknown>
   }
 
   const authenticateDesktopAdmin = (request: IncomingMessage): boolean => {
@@ -1019,62 +902,51 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
         }
         if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/provider`) {
           const body = await readJsonObject(request, 4096)
-          if (body.provider !== 'tailscale' && body.provider !== 'cpolar' && body.provider !== 'cloudflared'
-            && body.provider !== 'frp' && body.provider !== 'origin') {
+          if (body.provider !== 'cloudflared' && body.provider !== 'sakurafrp') {
             throw new HttpError(400, 'bad_request')
           }
           await remoteProviders.select(body.provider)
           sendJson(response, 200, remotePayload(), false)
           return
         }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/origin/configure`) {
-          const body = await readJsonObject(request, 8192)
+        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/token`) {
+          const body = await readJsonObject(request, 4096)
           await remoteProviders.mutate(async () => {
-            await originConfig.configure(body)
-            if (remoteControllers.origin.status().enabled) await remoteControllers.origin.reconnect()
+            await sakurafrpSettings.configure({ token: validateSakuraFrpToken(body.token) })
           })
           sendJson(response, 200, remotePayload(), false)
           return
         }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/origin/purge`) {
+        if (request.method === 'GET' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/tunnels`) {
+          const settings = sakurafrpSettings.settings()
+          if (settings.token === undefined) throw new HttpError(409, 'sakurafrp_token_missing')
+          const tunnels = await remoteProviders.mutate(
+            async () => createSakuraFrpApiClient().listTunnels(settings.token as string),
+          )
+          // Never echo the token; only display-safe tunnel fields leave the route.
+          sendJson(response, 200, {
+            ...sakurafrpSettings.status(),
+            tunnels: tunnels.map(tunnel => ({
+              id: tunnel.id,
+              name: tunnel.name,
+              type: tunnel.type,
+              node: tunnel.node,
+              online: tunnel.online,
+              status: tunnel.status,
+              remote: tunnel.remote,
+              ...(tunnel.localPort === undefined ? {} : { localPort: tunnel.localPort }),
+              ...(tunnel.lockEdit === undefined ? {} : { lockEdit: tunnel.lockEdit }),
+            })),
+          }, false)
+          return
+        }
+        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/configure`) {
           const body = await readJsonObject(request, 4096)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
           await remoteProviders.mutate(async () => {
-            await remoteControllers.origin.setEnabled(false)
-            await originConfig.purge()
-          })
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/cpolar/component/install`) {
-          const body = await readJsonObject(request, 4096)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          logger.info('cpolar component install started')
-          try {
-            await remoteProviders.mutate(async () => cpolarComponent.install())
-            logger.info('cpolar component install completed')
-          } catch (error) {
-            const cause = error instanceof Error && error.cause instanceof Error ? error.cause : undefined
-            logger.error('cpolar component install failed: %s%s',
-              error instanceof Error ? error.stack ?? error.message : String(error),
-              cause === undefined ? '' : `; cause: ${cause.message}`)
-            throw error
-          }
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/cpolar/configure`) {
-          const body = await readJsonObject(request, 4096)
-          await remoteProviders.mutate(async () => cpolarComponent.configure(body.authtoken))
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/cpolar/component/purge`) {
-          const body = await readJsonObject(request, 4096)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          await remoteProviders.mutate(async () => {
-            await remoteControllers.cpolar.setEnabled(false)
-            await cpolarComponent.purge()
+            await sakurafrpSettings.configure({ tunnelId: validateSakuraFrpTunnelId(body.tunnelId) })
+            // A live frpc is bound to the previous tunnel, so the new selection
+            // only takes effect through a restart.
+            if (remoteControllers.sakurafrp.status().enabled) await remoteControllers.sakurafrp.reconnect()
           })
           sendJson(response, 200, remotePayload(), false)
           return
@@ -1103,60 +975,6 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
           sendJson(response, 200, remotePayload(), false)
           return
         }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/caddy/component/install`) {
-          const body = await readJsonObject(request, 4096)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          logger.info('caddy component install started')
-          try {
-            await remoteProviders.mutate(async () => caddyComponent.install())
-            logger.info('caddy component install completed')
-          } catch (error) {
-            logger.error('caddy component install failed: %s', error instanceof Error ? error.stack ?? error.message : String(error))
-            throw error
-          }
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/caddy/settings`) {
-          const body = await readJsonObject(request, 8192)
-          if (body.connect !== undefined && typeof body.connect !== 'boolean') throw new HttpError(400, 'bad_request')
-          const configure = async (): Promise<void> => {
-            if (body.connect === true && !caddyComponent.status().installed) throw new HttpError(409, 'caddy_component_unavailable')
-            await caddyConfig.configure(body.settings, { secretId: body.secretId ?? '', secretKey: body.secretKey ?? '' })
-            if (body.connect === true) {
-              await originController.setEnabled(false)
-              await originController.selectMode('managed')
-              await originController.reconnect()
-            } else if (originController.mode() === 'managed' && originController.status().enabled) await originController.reconnect()
-          }
-          if (body.connect === true) await remoteProviders.mutateSelected('origin', configure)
-          else await remoteProviders.mutate(configure)
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/origin/mode`) {
-          const body = await readJsonObject(request, 4096)
-          if (body.mode !== 'external' && body.mode !== 'managed') throw new HttpError(400, 'bad_request')
-          const mode = body.mode
-          if (mode === 'managed' && !caddyComponent.status().installed) throw new HttpError(409, 'caddy_component_unavailable')
-          await remoteProviders.mutate(async () => { await originController.selectMode(mode) })
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/caddy/component/purge`) {
-          const body = await readJsonObject(request, 4096)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          await remoteProviders.mutate(async () => {
-            if (originController.mode() === 'managed') {
-              await originController.setEnabled(false)
-              await originController.selectMode('external')
-            }
-            await caddyComponent.purge()
-            await caddyConfig.purge()
-          })
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
         if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/cloudflared/tunnel`) {
           const body = await readJsonObject(request, 8192)
           await remoteProviders.mutate(async () => {
@@ -1178,71 +996,18 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
           sendJson(response, 200, remotePayload(), false)
           return
         }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/component/install`) {
+        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/component/install`) {
           const body = await readJsonObject(request, 4096)
           if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          logger.info('frpc component install started')
+          logger.info('sakurafrp frpc component install started')
           try {
             await remoteProviders.mutate(async () => frpComponent.install())
-            logger.info('frpc component install completed')
+            logger.info('sakurafrp frpc component install completed')
           } catch (error) {
-            logger.error('frpc component install failed: %s', error instanceof Error ? error.stack ?? error.message : String(error))
+            logger.error('sakurafrp frpc component install failed: %s', error instanceof Error ? error.stack ?? error.message : String(error))
             throw error
           }
           sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/configure`) {
-          const body = await readJsonObject(request, 4096)
-          await remoteProviders.mutate(async () => {
-            await frpConfig.configure(body)
-            if (remoteControllers.frp.status().enabled) await remoteControllers.frp.reconnect()
-          })
-          sendJson(response, 200, remotePayload(), false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/attach-plan`) {
-          const body = await readJsonObject(request, 8192)
-          // Read-only preview: blank fields keep their saved values, and nothing
-          // on the VPS or the local filesystem is touched.
-          const settings = mergeSavedFrpSettings(body, frpConfig.settings())
-          // This route is callable by any same-origin client script. Never return
-          // the saved token, even if a caller asks for an unmasked preview.
-          // The preview must carry the same proxy name the provider writes, so a
-          // copied frpc.toml registers exactly like the managed one.
-          const options = { configFile: frpConfig.runtimeConfigFile, proxyName: frpConfig.proxyName }
-          logger.info('frp attach plan requested mode=%s entryTls=%s vhostHttpPort=%d',
-            settings.mode ?? 'deploy', settings.entryTls ?? 'public-ip-cert', resolveFrpVhostHttpPort(settings))
-          sendJson(response, 200, {
-            ...remotePayload(),
-            frpAttachPlan: createFrpAttachPlan(settings, options),
-            frpAttachTemplate: createFrpAttachTemplate(settings, options),
-          }, false)
-          return
-        }
-        if (request.method === 'GET' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/self-check`) {
-          const settings = frpConfig.settings()
-          if (settings === undefined) throw new HttpError(409, 'frp_config_missing')
-          const check = await frpIngressSelfCheck(settings, remoteDeviceFile, stateDirectory)
-          // TCP reachability is advisory; only authenticated discovery verifies
-          // that the public tunnel reaches this DSH instance.
-          const entry = resolveFrpEntryProbe(settings)
-          const [frpsReachable, entryReachable] = await Promise.all([
-            probeTcpReachable(settings.serverAddress, settings.serverPort),
-            probeTcpReachable(entry.host, entry.port),
-          ])
-          sendJson(response, 200, {
-            ...remotePayload(),
-            frpSelfCheck: {
-              ...check,
-              // Only stable booleans and the CA fingerprint leave this route: no
-              // token, no key material, and no private file paths.
-              frpsReachable,
-              entryReachable,
-              frpc: remoteController().status(),
-              component: frpComponent.status(),
-            },
-          }, false)
           return
         }
         if (request.method === 'GET' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/websocket-paths`) {
@@ -1261,89 +1026,15 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
           sendJson(response, 200, { paths }, false)
           return
         }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/vps/host-keys`) {
-          const body = await readJsonObject(request, 8192)
-          const serverAddress = typeof body.serverAddress === 'string' ? body.serverAddress : ''
-          logger.info('vps host keys requested host=%s sshUser=%s sshPort=%d',
-            serverAddress, String(body.sshUser), Number(body.sshPort))
-          const hostKeys = await fetchVpsHostKeys(serverAddress, {
-            sshUser: body.sshUser,
-            sshPort: body.sshPort,
-            ...(body.sshKeyPath === undefined || body.sshKeyPath === '' ? {} : { sshKeyPath: body.sshKeyPath }),
-          }, {
-            log(event, fields) { logger.info('vps host keys event=%s fields=%o', event, fields) },
-          })
-          for (const key of hostKeys) logger.info('vps host key host=%s type=%s fingerprint=%s', serverAddress, key.keyType, key.fingerprint)
-          sendJson(response, 200, { ...remotePayload(), vpsHostKeys: hostKeys }, false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/vps/deploy`) {
-          const body = await readJsonObject(request, 8192)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          logger.info('vps deploy requested host=%s port=%d sshUser=%s sshPort=%d keyProvided=%s fingerprints=%s',
-            String(body.serverAddress), Number(body.serverPort), String(body.sshUser), Number(body.sshPort), body.sshKeyPath === undefined ? 'false' : 'true',
-            Array.isArray(body.hostFingerprints) ? String(body.hostFingerprints.length) : 'none')
-          const deployment = await remoteProviders.mutate(async () => {
-            // Blank fields keep their saved values so a saved token can stay empty.
-            const settings = mergeSavedFrpSettings(body, frpConfig.settings())
-            const result = await deployVps(settings, parseVpsDeploymentInput({
-              sshUser: body.sshUser,
-              sshPort: body.sshPort,
-              ...(body.sshKeyPath === undefined ? {} : { sshKeyPath: body.sshKeyPath }),
-              hostFingerprints: body.hostFingerprints,
-            }), {
-              log(event, fields) { logger.info('vps deploy event=%s fields=%o', event, fields) },
-            })
-            await frpConfig.configure(settings)
-            logger.info('vps deploy completed host=%s origin=%s checks=%d', settings.serverAddress, settings.publicOrigin, result.checks.length)
-            return result
-          })
-          sendJson(response, 200, { ...remotePayload(), vpsDeployment: deployment }, false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/vps/uninstall-script`) {
-          const body = await readJsonObject(request, 4096)
-          const savedTarget = mergeSavedFrpTarget(body, frpConfig.settings())
-          const script = createVpsUninstallScript({
-            serverPort: savedTarget.serverPort,
-            ...(body.certName === undefined || body.certName === '' ? {} : { certName: body.certName }),
-          })
-          sendJson(response, 200, { ...remotePayload(), vpsUninstallScript: script }, false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/vps/uninstall`) {
-          const body = await readJsonObject(request, 8192)
-          if (body.confirm !== true) throw new HttpError(400, 'bad_request')
-          logger.info('vps uninstall requested host=%s sshUser=%s sshPort=%d',
-            String(body.serverAddress), String(body.sshUser), Number(body.sshPort))
-          const removal = await remoteProviders.mutate(async () => {
-            const savedTarget = mergeSavedFrpTarget(body, frpConfig.settings())
-            const result = await uninstallVps(savedTarget.serverAddress, {
-              serverPort: savedTarget.serverPort,
-              ...(body.certName === undefined || body.certName === '' ? {} : { certName: body.certName }),
-            }, parseVpsDeploymentInput({
-              sshUser: body.sshUser,
-              sshPort: body.sshPort,
-              ...(body.sshKeyPath === undefined ? {} : { sshKeyPath: body.sshKeyPath }),
-              hostFingerprints: body.hostFingerprints,
-            }), {
-              log(event, fields) { logger.info('vps uninstall event=%s fields=%o', event, fields) },
-            })
-            logger.info('vps uninstall completed host=%s checks=%d', result.serverAddress, result.checks.length)
-            return result
-          })
-          sendJson(response, 200, { ...remotePayload(), vpsUninstall: removal }, false)
-          return
-        }
-        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/frp/component/purge`) {
+        if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/component/purge`) {
           const body = await readJsonObject(request, 4096)
           if (body.confirm !== true) throw new HttpError(400, 'bad_request')
           await remoteProviders.mutate(async () => {
-            await remoteControllers.frp.setEnabled(false)
+            await remoteControllers.sakurafrp.setEnabled(false)
             await settleCleanupSteps([
               () => frpComponent.purge().then(() => undefined),
-              () => frpConfig.purge().then(() => undefined),
-              () => purgeFrpIngressCertificates(remoteDeviceFile, stateDirectory),
+              () => sakurafrpSettings.purge().then(() => undefined),
+              () => purgeTlsIngressCertificates(remoteDeviceFile, stateDirectory),
             ])
           })
           sendJson(response, 200, remotePayload(), false)
@@ -1439,11 +1130,8 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       await mobileAccess.startLocal(template.extensionsDir, ctx, { hostExecution: template.hostExecution })
       await lanController.initialize()
       const stores: Record<RemoteProvider, JsonMobileAccessControlStore> = {
-        tailscale: tailscaleStore,
-        cpolar: cpolarStore,
         cloudflared: cloudflaredStore,
-        frp: frpStore,
-        origin: originStore,
+        sakurafrp: sakurafrpStore,
       }
       await Promise.all((Object.keys(stores) as RemoteProvider[])
         .filter(provider => provider !== remoteProviders.selected)

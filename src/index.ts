@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Authenticated LAN gateway for the existing DSH Web application. The ordinary
  * Web listener remains loopback-only; this package owns pairing and the only
  * listener intended for phones.
@@ -83,7 +83,8 @@ export {
   parseDeviceSnapshot,
 } from './storage.js'
 export type { DeviceSnapshot, DeviceStore, StoredDevice } from './storage.js'
-export { FRP_COMPONENT_RELEASES, FrpComponentManager } from './frp-component.js'
+export { FrpComponentManager, FRP_COMPONENT_RELEASES } from './frp-component.js'
+export type { FrpComponentStatus } from './frp-component.js'
 export {
   BlockedUpgradePathLog,
   MAX_BLOCKED_UPGRADE_PATHS,
@@ -94,81 +95,53 @@ export {
   WebSocketPathStore,
 } from './websocket-paths.js'
 export type { BlockedUpgradePathEntry } from './websocket-paths.js'
-export type { FrpComponentStatus } from './frp-component.js'
-export {
-  DEFAULT_VHOST_HTTP_PORT,
-  FRP_DEFAULT_PROXY_NAME,
-  FRP_DEFAULT_PUBLIC_PORT,
-  FRP_RESERVED_PORTS,
-  FrpConfigStore,
-  createFrpServerTemplate,
-  createFrpcToml,
-  frpProxyName,
-  isFrpSelfSignedIngress,
-  mergeSavedFrpSettings,
-  mergeSavedFrpTarget,
-  parseFrpSettings,
-  resolveFrpEntryTls,
-  resolveFrpMode,
-  resolveFrpPublicPort,
-  resolveFrpVhostHttpPort,
-  validateFrpEntryTls,
-  validateFrpMode,
-  validateFrpProxyName,
-  validateFrpPublicOrigin,
-  validateFrpPublicPort,
-  validateFrpServerAddress,
-  validateFrpServerPort,
-  validateFrpToken,
-  validateFrpVhostHttpPort,
-} from './frp-config.js'
-export {
-  FRP_ATTACH_DISCOVERY_PATH,
-  FRP_ATTACH_LOCAL_DECLARATION,
-  FRP_ATTACH_SELF_SIGNED_DECLARATION,
-  FRP_ATTACH_VPS_DECLARATION,
-  createFrpAttachTemplate,
-  createFrpAttachTemplateParts,
-  frpAttachVpsParts,
-  validateAttachSettings,
-} from './frp-attach.js'
-export { createFrpAttachPlan } from './frp-attach-plan.js'
-export type { FrpAttachOptions, FrpAttachTemplate, FrpAttachVpsParts } from './frp-attach.js'
-export type { FrpAttachPlan, FrpAttachPlanLocal, FrpAttachPlanStep, FrpAttachStepId } from './frp-attach-plan.js'
-export { CERT_EXPIRING_DAYS, evaluateCertificateLifetime, probeOriginCertificate, readCertificateRenewal } from './cert-renewal.js'
-export type { CertRenewalStatus } from './cert-renewal.js'
-export { ensureFrpIngressCertificate, frpIngressPaths, frpIngressSelfCheck } from './frp-ingress.js'
-export type { FrpIngressCertificate, FrpIngressPaths, FrpIngressSelfCheck } from './frp-ingress.js'
-export { issueServerCertificate } from './managed-setup.js'
-export type { ServerCertificateAuthority, ServerCertificateFiles, ServerCertificateTarget } from './managed-setup.js'
-export {
-  FRP_CADDY_IMPORT_LINE,
-  FRP_CADDY_SNIPPET_MARKER,
-  FRP_CADDY_SNIPPET_PATH,
-  createCaddySite,
-  createRestrictedFrpServerTemplate,
-  FRP_VHOST_HTTP_PORT,
-} from './frp-template.js'
-export type { CaddySiteOptions, FrpEntryTls } from './frp-template.js'
-export type { FrpConfigurationStatus, FrpSettings } from './frp-config.js'
-export { FrpController } from './frp.js'
-export type { FrpControllerOptions, FrpState, FrpStatus } from './frp.js'
-export { DEFAULT_ORIGIN_LISTEN_PORT, OriginConfigStore, parseOriginSettings, validateOriginPublicOrigin,
-  validateOriginListenHost, validateOriginListenPort, validateOriginAllowedCidrs } from './origin-proxy-config.js'
-export type { OriginSettings, OriginConfigurationStatus } from './origin-proxy-config.js'
-export { OriginController } from './origin-proxy.js'
-export type { OriginControllerOptions, OriginState, OriginStatus } from './origin-proxy.js'
-export { CLOUDFLARED_COMPONENT_RELEASE, CLOUDFLARED_COMPONENT_RELEASES, CloudflaredComponentManager } from './cloudflared-component.js'
+export { CloudflaredComponentManager, CLOUDFLARED_COMPONENT_RELEASE, CLOUDFLARED_COMPONENT_RELEASES } from './cloudflared-component.js'
 export type { CloudflaredComponentStatus } from './cloudflared-component.js'
-export { CloudflaredController, isCloudflaredRegistration, parseCloudflaredOrigin } from './cloudflared.js'
+export { CloudflaredController, isCloudflaredRegistration } from './cloudflared.js'
 export type { CloudflaredControllerOptions, CloudflaredState, CloudflaredStatus } from './cloudflared.js'
 export {
-  CloudflaredTunnelStore, mergeSavedCloudflaredTunnelSettings, parseCloudflaredTunnelSettings,
-  validateCloudflaredTunnelHostname, validateCloudflaredTunnelPort, validateCloudflaredTunnelToken,
+  CloudflaredTunnelStore,
+  mergeSavedCloudflaredTunnelSettings,
+  parseCloudflaredTunnelSettings,
+  validateCloudflaredTunnelHostname,
+  validateCloudflaredTunnelPort,
+  validateCloudflaredTunnelToken,
 } from './cloudflared-tunnel.js'
+export type { CloudflaredTunnelSettings, CloudflaredTunnelStatus } from './cloudflared-tunnel.js'
+export {
+  ensureTlsIngressCertificate,
+  purgeTlsIngressCertificates,
+  tlsIngressPaths,
+} from './tls-ingress.js'
+export type { TlsIngressCertificate, TlsIngressPaths, TlsIngressSettings } from './tls-ingress.js'
+export {
+  SakuraFrpController,
+  SakuraFrpSettingsStore,
+  SAKURAFRP_API_BASE,
+  SAKURAFRP_FRPC_VERSION,
+  SAKURAFRP_LOGIN_URL,
+  createSakuraFrpApiClient,
+  deriveSakuraFrpEntry,
+  isSakuraFrpRegistration,
+  parseSakuraFrpExportAddress,
+  parseSakuraFrpTunnels,
+  validateSakuraFrpToken,
+  validateSakuraFrpTunnelId,
+} from './sakurafrp.js'
 export type {
-  CloudflaredTunnelMode, CloudflaredTunnelSettings, CloudflaredTunnelStatus,
-} from './cloudflared-tunnel.js'
+  SakuraFrpApiClient,
+  SakuraFrpConfiguration,
+  SakuraFrpControllerOptions,
+  SakuraFrpSettings,
+  SakuraFrpState,
+  SakuraFrpStatus,
+  SakuraFrpTunnel,
+} from './sakurafrp.js'
+
+export { CERT_EXPIRING_DAYS, evaluateCertificateLifetime, probeOriginCertificate, readCertificateRenewal } from './cert-renewal.js'
+export type { CertRenewalStatus } from './cert-renewal.js'
+export { issueServerCertificate } from './managed-setup.js'
+export type { ServerCertificateAuthority, ServerCertificateFiles, ServerCertificateTarget } from './managed-setup.js'
 export { configuredRemoteProvider, JsonRemoteProviderStore, parseRemoteProviderState, REMOTE_PROVIDERS } from './remote.js'
 export type {
   RemoteProvider,
@@ -189,4 +162,4 @@ export type {
   TaskEventWatcherOptions,
   TaskTurnEvent,
 } from './task-events.js'
-export { apply, inject, name, originGatewayConfig } from './plugin.js'
+export { apply, inject, name, remoteGatewayConfig, tlsIngressGatewayConfig } from './plugin.js'

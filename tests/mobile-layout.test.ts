@@ -716,9 +716,18 @@ describe('dedicated mobile layout boot', () => {
     expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer{position:fixed')
     expect(MOBILE_LAYOUT_STYLES).toContain('@media(min-width:900px)')
     expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-shell{grid-template-columns:auto minmax(0,1fr)}')
-    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-main{grid-area:1/2}')
+    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-main{grid-area:1/2;--dsh-chat-content-width:min(1000px,100%)}')
     expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer{position:static')
     expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer[data-open=true]{width:340px')
+  })
+
+  it('hides the stock plugins global-panel entry inside the mobile drawer only', () => {
+    // The plugin manager is a computer-administration surface; the phone shell
+    // drops its drawer row while the settings dialog keeps the built-in
+    // plugins page. Both shipped DSH locales (zh/en) are covered, and a
+    // renamed upstream label only reverts to stock visibility.
+    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer nav[aria-label="全局面板"] button[aria-label="插件"]{display:none}')
+    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer nav[aria-label="Global panels"] button[aria-label="Plugins"]{display:none}')
   })
 
   it('sets a minimum editable font while preserving the content-font preference', () => {

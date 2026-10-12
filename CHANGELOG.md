@@ -2,6 +2,13 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
+## Unreleased
+
+- Remove the Tailscale Funnel, cpolar, self-hosted FRP (deploy/attach/VPS), own reverse proxy and managed Caddy remote channels, including their components, docs, release pipelines and tests; remote access now offers the SakuraFrp channel (default) and the cloudflared named tunnel.
+- Add the SakuraFrp remote channel (natfrp.com v4 API): save the access token privately, pick an existing TCP tunnel, point its local target at the gateway automatically, fetch the official `/tunnel/config` for the pinned upstream frpc 0.70.1 and run it; the gateway terminates TLS with the pairing-CA-signed ingress certificate the app already pins. SakuraFrp is now the first-run default provider (`DSH_MOBILE_REMOTE_PROVIDER` can still pin either channel), and unknown host-reported provider names fall back to it.
+- cloudflared keeps only named tunnels; the quick-tunnel mode, banner parsing and random-port rotation are removed, and legacy provider state files fall back to the default channel instead of failing boot.
+- Mobile UI pass: the dedicated mobile shell no longer shows the stock 插件/Plugins global-panel entry in the workspace drawer (the settings dialog keeps the built-in plugins page); wide viewports let the conversation column use the reclaimed sidebar width (`--dsh-chat-content-width` grows up to 1000px) instead of keeping the desktop 748px cap with large side margins; the Mobile Access panel becomes a full-width bottom sheet below 600px viewports instead of a floating desktop-style card.
+
 ## 0.6.3 - 2026-10-10
 
 - Add opt-in, per-local-extension Worker execution with bounded threads/V8/IPC, cooperative cancellation followed by termination, fair streaming credit and explicit recovery without replay. The default remains in-process; Workers expose a logger-only context and are not a security sandbox. Retain @chintoleung's three original prototype commits from [#189](https://github.com/saya-ch/dsh-mobile/issues/189), with integration and lifecycle corrections. [Guide](docs/EXTENSION_WORKERS.en.md).
@@ -28,7 +35,7 @@ Notable changes are recorded here. GitHub Releases provide the downloadable pack
 - Reorganize the remote HTTPS origin, external proxy and managed Caddy forms with native radio groups, responsive fields, separate actions and matching Chinese, English and Italian labels. Thanks @abworks-dev for [#184](https://github.com/saya-ch/dsh-mobile/pull/184).
 - Add pinned, reproducible Caddy review builds: Go 1.26.6, xcaddy 0.4.7, Caddy 2.11.6 and Tencent Cloud DNS 0.4.3, with locked source/dependency inputs, fresh private caches, two-build byte comparison and complete artifact checks. Isolated native Windows/Linux tests cover installation, restart, rollback, TLS, pairing, API, WebSocket and cleanup. Thanks @abworks-dev for [#185](https://github.com/saya-ch/dsh-mobile/pull/185); original author commits are retained alongside maintainer fixes.
 - Find Windows Git Bash from the active Git installation rather than a fixed path. Keep missing-shell, timeout and signal failures distinct from expected nonzero command exits, and prevent shell startup environment variables from changing test behavior.
-- Keep official managed Caddy installation disabled. Review builds and optional TEST prereleases do not enable the production component table or establish public DNS-01/ACME issuance and public-route readiness. Existing external proxies and remote providers are unchanged. See [Caddy status](docs/CADDY_MANAGED.en.md).
+- Keep official managed Caddy installation disabled. Review builds and optional TEST prereleases do not enable the production component table or establish public DNS-01/ACME issuance and public-route readiness. Existing external proxies and remote providers are unchanged. The managed Caddy mode was removed from the product in a later release.
 - Synchronize Android release metadata to 0.6.1 (build 77). Native features and the pairing/renewal protocol are unchanged from 0.6.0; the official APK uses the established package and signer, preserving pairings on same-signer upgrades.
 
 ## 0.6.0 - 2026-10-07
@@ -64,7 +71,7 @@ Add mobile page module management, Android launcher choices, fixed device orderi
 
 ### Component availability and documentation
 
-- Integrate managed Caddy as an upstream mode of Own reverse proxy, with separate private process/Gateway ownership. External mode remains the default and retains its settings and paired devices. **Managed installation is still disabled**: trusted pinned binaries have not been distributed, despite a fixed build and isolated TLS/authentication/API/WebSocket validation. Thanks @abworks-dev for [#176](https://github.com/saya-ch/dsh-mobile/pull/176). [Status](docs/CADDY_MANAGED.en.md).
+- Integrate managed Caddy as an upstream mode of Own reverse proxy, with separate private process/Gateway ownership. External mode remains the default and retains its settings and paired devices. **Managed installation is still disabled**: trusted pinned binaries have not been distributed, despite a fixed build and isolated TLS/authentication/API/WebSocket validation. Thanks @abworks-dev for [#176](https://github.com/saya-ch/dsh-mobile/pull/176). The managed Caddy mode was removed from the product in a later release.
 - Reorganize setup, connection and developer guides; clarify component availability, cleanup scope and Cloudflare Quick Tunnel notification limits. Add local documentation checks and release guards for stale Android manuals.
 
 ## 0.5.5 - 2026-10-04

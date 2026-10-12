@@ -11,6 +11,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
+import { componentFetch } from './component-download.js'
 import { assertManagedParents, ensureManagedDirectory, removeManagedPaths, removeManagedTree, replaceManagedDirectory } from './managed-files.js'
 
 const FRP_VERSION = '0.70.1'
@@ -167,7 +168,7 @@ async function defaultExtractArtifact(archive: string, destination: string, exec
 }
 
 async function defaultFetchArtifact(artifact: FrpArtifact, signal: AbortSignal): Promise<Uint8Array> {
-  const response = await fetch(artifact.downloadUrl, { redirect: 'follow', signal })
+  const response = await componentFetch(artifact.downloadUrl, { redirect: 'follow', signal })
   if (!response.ok) throw new Error(`frp_download_http_${String(response.status)}`)
   const finalUrl = new URL(response.url)
   const officialHost = finalUrl.hostname === 'github.com' || finalUrl.hostname.endsWith('.githubusercontent.com')

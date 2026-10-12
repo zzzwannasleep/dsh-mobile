@@ -1,4 +1,4 @@
-# 额外可信网段
+﻿# 额外可信网段
 
 [English](TRUSTED_NETWORKS.en.md) · [返回局域网指南](../README.md#局域网访问)
 
@@ -23,4 +23,4 @@ DSH Mobile 的默认 Windows HTTPS / Discovery 入站规则只允许 `LocalSubne
 
 路由网络不一定支持局域网广播发现。发现列表没有电脑时，可使用电脑显示的配对链接或二维码，但路由、防火墙和 HTTPS 入口仍须可达。填写 IPv6 CIDR 也不会自动增加 IPv6 监听。
 
-此设置用于局域网 Gateway 的来源访问范围，不改变外部反向代理的来源 CIDR。自有代理请按[自有 HTTPS 反向代理指南](SELF_HOSTED_ORIGIN.md)配置；不要把局域网 Gateway 或私有 HTTP 后端映射到公网。
+此设置用于局域网 Gateway 的来源访问范围，不改变外部反向代理的来源 CIDR。使用外部反向代理时，代理侧须保留原始 Host（含端口）与 WebSocket，不要把局域网 Gateway 或私有 HTTP 后端直接映射到公网。

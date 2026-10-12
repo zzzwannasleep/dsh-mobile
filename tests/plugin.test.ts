@@ -10,11 +10,17 @@ import { generate } from 'selfsigned'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Config, parseGatewayConfig, type PluginConfig } from '../src/config.js'
 import { parseCidr, RequestTrustPolicy } from '../src/network.js'
-import * as network from '../src/network.js'
-import { apply, inject, originGatewayConfig, remoteGatewayConfig, settleCleanupSteps, upstreamAuthenticatedUrl } from '../src/plugin.js'
-import { parseOriginSettings } from '../src/origin-proxy-config.js'
-import { parseFrpSettings } from '../src/frp-config.js'
-import { ensureFrpIngressCertificate } from '../src/frp-ingress.js'
+import {
+  apply,
+  inject,
+  readTlsIngressTrustAnchor,
+  remoteGatewayConfig,
+  settleCleanupSteps,
+  tlsIngressGatewayConfig,
+  upstreamAuthenticatedUrl,
+} from '../src/plugin.js'
+import { ensureTlsIngressCertificate, tlsIngressPaths } from '../src/tls-ingress.js'
+import { FrpComponentManager } from '../src/frp-component.js'
 import { DSH_MOBILE_VERSION, MINIMUM_ANDROID_APP_VERSION } from '../src/version.js'
 import { DESKTOP_ADMIN_HEADER, DESKTOP_ADMIN_MARKER } from '../src/local-admin-host.js'
 import { buildExtensionWorkerEntry } from './helpers/extension-worker-build.js'
@@ -50,7 +56,7 @@ async function invoke(
         method,
         path,
         // Keep-alive sockets parked in the global agent hold loopback ports from
-        // the same ephemeral range this fixture probes for the origin listener.
+        // the same ephemeral range this fixture probes for the gateway listeners.
         agent: false,
         headers: {
           host: authority,
@@ -78,13 +84,6 @@ async function invoke(
   } finally {
     await new Promise<void>(resolve => { server.close(() => resolve()) })
   }
-}
-
-async function frpProxyNameFromRoute(route: WebRoute): Promise<string> {
-  const result = await invoke(route, 'GET', '/api/mobile-access/remote/control')
-  expect(result.status).toBe(200)
-  const payload = JSON.parse(result.body) as { providers: { frp: { configuration: { proxyName: string } } } }
-  return payload.providers.frp.configuration.proxyName
 }
 
 async function mount(
@@ -135,64 +134,6 @@ async function mount(
   if (route === undefined) throw new Error('plugin did not register its control route')
   if (command === undefined) throw new Error('plugin did not register its /mobile command')
   return { context, route, command, upstreamBase, directory }
-}
-
-async function unusedOriginPort(): Promise<number> {
-  const server = createServer()
-  await new Promise<void>(resolve => { server.listen(0, '127.0.0.1', resolve) })
-  const port = (server.address() as AddressInfo).port
-  await new Promise<void>(resolve => { server.close(() => resolve()) })
-  return port
-}
-
-async function pairOriginBackend(port: number, token: string): Promise<number> {
-  const body = JSON.stringify({ token, label: 'Origin plugin test' })
-  return new Promise((resolve, reject) => {
-    const request = requestHttp({ host: '127.0.0.1',
-      port,
-      path: '/mobile-access/auth/pair',
-      method: 'POST',
-      // Pairing reuses the origin port, so it must not borrow a pooled socket either.
-      agent: false,
-      headers: {
-        host: 'phone.example.com:8815', origin: 'https://phone.example.com:8815',
-        'sec-fetch-site': 'same-origin', 'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
-      } }, response => { response.resume(); response.once('end', () => { resolve(response.statusCode ?? 0) }) })
-    request.once('error', reject)
-    request.end(body)
-  })
-}
-
-/**
- * One initial port probe plus up to two re-probes when the operating system
- * handed the released port to an unrelated loopback socket in the meantime.
- */
-const ORIGIN_PORT_ATTEMPTS = 3
-
-/**
- * Configure and start the private origin listener on a freshly probed port.
- *
- * `unusedOriginPort` has to release its probe socket before the plugin binds the
- * same number, so the port can be taken in between. The plugin then reports the
- * genuine `origin_listen_port_in_use` collision; this fixture re-probes and
- * retries within a bound instead of failing the run on host port churn. Every
- * other outcome is returned untouched so the assertions stay authoritative.
- */
-async function startOriginOnFreePort(route: WebRoute): Promise<{
-  port: number
-  form: { publicOrigin: string; listenPort: number }
-  configured: { status: number; body: string }
-  started: { status: number; body: string }
-}> {
-  for (let attempt = 0; ; attempt += 1) {
-    const port = await unusedOriginPort()
-    const form = { publicOrigin: 'https://phone.example.com:8815', listenPort: port }
-    const configured = await invoke(route, 'POST', '/api/mobile-access/remote/origin/configure', JSON.stringify(form))
-    const started = await invoke(route, 'POST', '/api/mobile-access/remote/control', JSON.stringify({ running: true }))
-    const collided = (JSON.parse(started.body) as { errorCode?: string }).errorCode === 'origin_listen_port_in_use'
-    if (collided && attempt < ORIGIN_PORT_ATTEMPTS - 1) continue
-    return { port, form, configured, started }
-  }
 }
 
 async function managedSetupFile(upstreamOrigin: string): Promise<string> {
@@ -265,7 +206,7 @@ describe('upstream browser authentication', () => {
   })
 })
 
-describe('remote Funnel gateway configuration', () => {
+describe('remote gateway configuration', () => {
   it('keeps public HTTPS on 443 when the private listener uses an ephemeral port', () => {
     const template = parseGatewayConfig({
       listenHost: '127.0.0.1',
@@ -275,7 +216,7 @@ describe('remote Funnel gateway configuration', () => {
       stateFile: join(tmpdir(), 'dsh-mobile-remote-template.json'),
       tls: { mode: 'disabled' },
     })
-    const publicHost = 'dsh-14a71b788377-1.tail775400.ts.net'
+    const publicHost = 'dsh-gateway.example.net'
     const config = remoteGatewayConfig(
       template,
       `https://${publicHost}`,
@@ -309,40 +250,103 @@ describe('remote Funnel gateway configuration', () => {
     })
     const config = remoteGatewayConfig(
       template,
-      'https://example.r8.cpolar.cn',
-      join(tmpdir(), 'dsh-mobile-cpolar-devices.json'),
+      'https://dsh.example.net',
+      join(tmpdir(), 'dsh-mobile-remote-fixed-devices.json'),
       'b'.repeat(64),
       45_321,
     )
 
     expect(config.listenPort).toBe(45_321)
-    expect(config.authorities).toEqual([{ hostname: 'example.r8.cpolar.cn', port: 443 }])
+    expect(config.authorities).toEqual([{ hostname: 'dsh.example.net', port: 443 }])
     expect(config.excludedClientModules).toEqual(['@example/optional-client'])
   })
 })
 
-describe('private HTTP origin gateway configuration', () => {
-  it('preserves a non-default public TLS port without inheriting LAN trust or certificates', () => {
-    const template = parseGatewayConfig({
-      listenHost: '127.0.0.1', listenPort: 3443, publicAuthorities: ['127.0.0.1:3443'],
-      allowedCidrs: ['127.0.0.0/8'], stateFile: join(tmpdir(), 'origin-lan-template.json'), tls: { mode: 'disabled' },
+describe('TLS ingress gateway configuration', () => {
+  const stateFile = join(tmpdir(), 'dsh-mobile-ingress-devices.json')
+  const paths = tlsIngressPaths(stateFile)
+  const ingress = { paths, caFingerprint: 'a'.repeat(64) }
+
+  function ingressTemplate(): ReturnType<typeof parseGatewayConfig> {
+    return parseGatewayConfig({
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      publicAuthorities: ['127.0.0.1'],
+      allowedCidrs: ['127.0.0.0/8'],
+      stateFile: join(tmpdir(), 'dsh-mobile-ingress-template.json'),
+      // The LAN pairing CA must not leak into the remote channel: the gateway
+      // serves the ingress CA the phone pins for this channel.
+      pairingCaFile: join(tmpdir(), 'unused-lan-ca.pem'),
+      tls: { mode: 'disabled' },
     })
-    const settings = parseOriginSettings({
-      publicOrigin: 'https://phone.example.com:8815', listenHost: '192.168.10.20',
-      allowedCidrs: ['192.168.10.1/32'],
-    })
-    const config = originGatewayConfig({ ...template, pairingCaFile: join(tmpdir(), 'unused-lan-ca.pem') }, settings,
-      join(tmpdir(), 'origin-remote-devices.json'), 'c'.repeat(64))
-    expect(config).toMatchObject({ listenHost: '192.168.10.20', listenPort: 3444, tls: { mode: 'disabled' }, publicTls: true, discovery: false })
-    expect(config.pairingCaFile).toBeUndefined()
-    expect(config.allowedCidrs.map(cidr => cidr.source)).toEqual(['192.168.10.1/32'])
-    const policy = new RequestTrustPolicy(config.authorities, 3444, config.allowedCidrs, config.publicTls)
-    expect([...policy.origins]).toEqual(['https://phone.example.com:8815'])
-    expect(policy.acceptsHost('phone.example.com:8815')).toBe(true)
-    expect(policy.acceptsHost('phone.example.com')).toBe(false)
-    expect(policy.acceptsHost('192.168.10.20:3444')).toBe(false)
-    expect(policy.acceptsOrigin('http://phone.example.com:8815')).toBe(false)
-    expect(template.listenPort).toBe(3443)
+  }
+
+  it('terminates TLS with the pairing CA and pins the CA fingerprint as the instance id', () => {
+    const template = ingressTemplate()
+    const config = tlsIngressGatewayConfig(template, 'https://192.0.2.10', stateFile, ingress, 45_321)
+
+    expect(config.listenPort).toBe(45_321)
+    // A bare HTTPS origin keeps the canonical public HTTPS port.
+    expect(config.authorities).toEqual([{ hostname: '192.0.2.10', port: 443 }])
+    // The app validates `instance` against the CA it pins, so this channel uses
+    // the CA fingerprint, not the plugin-wide installation id.
+    expect(config.instanceId).toBe(ingress.caFingerprint)
+    expect(config.pairingCaFile).toBe(paths.caCertFile)
+    expect(config.tls).toEqual({ mode: 'provided', certFile: paths.certFile, keyFile: paths.keyFile })
+    expect(config.publicTls).toBe(true)
+    expect(config.discovery).toBe(false)
+    expect(config.listenHost).toBe('127.0.0.1')
+    expect(config.stateFile).toBe(stateFile)
+    expect(config.allowedCidrs.map(cidr => cidr.source)).toEqual(['127.0.0.0/8'])
+    // The LAN template keeps its own pairing CA and listener port untouched.
+    expect(template.pairingCaFile).toBe(join(tmpdir(), 'unused-lan-ca.pem'))
+    expect(template.listenPort).toBe(0)
+  })
+
+  it('keeps an explicit public TLS port instead of forcing 443', () => {
+    const config = tlsIngressGatewayConfig(ingressTemplate(), 'https://192.0.2.10:8443', stateFile, ingress)
+    expect(config.authorities).toEqual([{ hostname: '192.0.2.10', port: 8443 }])
+    expect(config.listenPort).toBe(0)
+  })
+
+  it.each([
+    'http://192.0.2.10',
+    'https://user:secret@192.0.2.10',
+    'https://192.0.2.10/mobile-access',
+    'https://192.0.2.10/?device=1',
+    'https://192.0.2.10/#pair',
+  ])('rejects a public origin that is not a bare HTTPS origin: %s', origin => {
+    expect(() => tlsIngressGatewayConfig(ingressTemplate(), origin, stateFile, ingress))
+      .toThrow('tls_ingress_public_origin_invalid')
+  })
+})
+
+describe('TLS ingress trust anchor', () => {
+  it('reads the pairing CA the start-up self-check must pin', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-trust-anchor-'))
+    temporaryDirectories.push(root)
+    const stateFile = join(root, 'devices.json')
+    const ingress = await ensureTlsIngressCertificate(
+      { publicOrigin: 'https://192.0.2.10' }, stateFile, Date.now(), undefined, root,
+    )
+    const anchor = await readTlsIngressTrustAnchor(stateFile, root)
+    expect(anchor).toBe(await readFile(ingress.paths.caCertFile, 'utf8'))
+    expect(anchor).toMatch(/^-----BEGIN CERTIFICATE-----/u)
+  })
+
+  it('fails closed when the anchor file is missing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-trust-anchor-'))
+    temporaryDirectories.push(root)
+    await expect(readTlsIngressTrustAnchor(join(root, 'devices.json'), root))
+      .rejects.toThrow('tls_ingress_ca_invalid')
+  })
+
+  it('fails closed when the anchor is not a regular CA file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-trust-anchor-'))
+    temporaryDirectories.push(root)
+    const stateFile = join(root, 'devices.json')
+    await mkdir(tlsIngressPaths(stateFile).caCertFile, { recursive: true })
+    await expect(readTlsIngressTrustAnchor(stateFile, root)).rejects.toThrow('tls_ingress_ca_invalid')
   })
 })
 
@@ -386,23 +390,23 @@ describe('stock DSH lifecycle', () => {
     const remote = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/control')
     expect(remote.status).toBe(200)
     expect(JSON.parse(remote.body)).toMatchObject({
-      provider: 'tailscale',
+      provider: 'sakurafrp',
       running: false,
       state: 'off',
       providers: {
-        tailscale: { bundled: true, running: false, state: 'off' },
-        cpolar: {
+        cloudflared: {
           bundled: false,
           running: false,
           state: 'off',
-          component: { installed: false, configured: false },
+          component: { supported: true, installed: false },
+          configuration: { mode: 'named', configured: false },
         },
-        frp: {
+        sakurafrp: {
           bundled: false,
           running: false,
           state: 'off',
           component: { supported: true, installed: false, version: '0.70.1' },
-          configuration: { configured: false, vhostHttpPort: 7080 },
+          configuration: { tokenSet: false },
         },
       },
     })
@@ -417,15 +421,11 @@ describe('stock DSH lifecycle', () => {
     })
   })
 
-  it('returns a cpolar download-stage error instead of a generic 500', async () => {
+  it('requires confirmation before downloading the frpc component', async () => {
     const mounted = await mount()
-    vi.stubGlobal('fetch', () => Promise.reject(new TypeError('fetch failed')))
-    const failed = await invoke(
-      mounted.route, 'POST', '/api/mobile-access/remote/cpolar/component/install',
-      JSON.stringify({ confirm: true }),
-    )
-    expect(failed.status).toBe(409)
-    expect(JSON.parse(failed.body)).toEqual({ error: 'cpolar_download_failed' })
+    const refused = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/component/install', '{}')
+    expect(refused.status).toBe(400)
+    expect(JSON.parse(refused.body)).toEqual({ error: 'bad_request' })
   })
 
   it('follows the active WebServer port when no setup upstream is configured', async () => {
@@ -455,7 +455,7 @@ describe('stock DSH lifecycle', () => {
     const requestRejection = vi.fn((request: IncomingMessage) => request.headers.cookie === 'dsh-session=valid' ? undefined : 401)
     const mounted = await mount(false, 3080, {}, requestRejection)
     const path = '/api/mobile-access/remote/provider'
-    const body = JSON.stringify({ provider: 'cpolar' })
+    const body = JSON.stringify({ provider: 'cloudflared' })
     const desktopHeaders = { [DESKTOP_ADMIN_HEADER]: DESKTOP_ADMIN_MARKER, cookie: 'dsh-session=valid' }
 
     const unmarked = await invoke(mounted.route, 'POST', path, body, '127.0.0.1', { cookie: 'dsh-session=valid' })
@@ -466,7 +466,7 @@ describe('stock DSH lifecycle', () => {
     expect(browserMetadata.status).toBe(403)
     const allowed = await invoke(mounted.route, 'POST', path, body, '127.0.0.1', desktopHeaders)
     expect(allowed.status).toBe(200)
-    expect(JSON.parse(allowed.body)).toMatchObject({ provider: 'cpolar' })
+    expect(JSON.parse(allowed.body)).toMatchObject({ provider: 'cloudflared' })
     expect(requestRejection).toHaveBeenCalledTimes(2)
   })
 
@@ -503,7 +503,6 @@ describe('stock DSH lifecycle', () => {
     const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-unconfigured-plugin-'))
     temporaryDirectories.push(directory)
     const mounted = await mount(false, 3080, { setupFile: join(directory, 'missing-setup.json') })
-    expect(await readFile(join(mounted.directory, 'installation-id'), 'utf8')).toMatch(/^[a-f0-9]{64}\n$/u)
 
     const status = await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')
     expect(status.status).toBe(200)
@@ -523,7 +522,6 @@ describe('stock DSH lifecycle', () => {
     const setupFile = await managedSetupFile('http://127.0.0.1:3080')
     const mounted = await mount(false, 43120, { setupFile })
     expect(mounted.upstreamBase).toBe('http://127.0.0.1:43120')
-    expect(await readFile(join(mounted.directory, 'installation-id'), 'utf8')).toMatch(/^[a-f0-9]{64}\n$/u)
   })
 
   it('ignores a legacy setup upstream snapshot when DSH selects another port', async () => {
@@ -545,191 +543,6 @@ describe('stock DSH lifecycle', () => {
     expect(JSON.parse(stopped.body)).toEqual({ running: false })
   })
 
-  it('switches remote providers without changing the LAN runtime', async () => {
-    const mounted = await mount()
-    const selected = await invoke(
-      mounted.route,
-      'POST',
-      '/api/mobile-access/remote/provider',
-      JSON.stringify({ provider: 'cpolar' }),
-    )
-    expect(selected.status).toBe(200)
-    expect(JSON.parse(selected.body)).toMatchObject({ provider: 'cpolar', running: false, state: 'off' })
-    const lan = await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')
-    expect(JSON.parse(lan.body)).toEqual({ running: false })
-  })
-
-  it('does not create control files for remote providers that were never enabled', async () => {
-    const mounted = await mount()
-    for (const provider of ['cpolar', 'cloudflared', 'frp', 'origin']) {
-      await expect(lstat(join(mounted.directory, 'remote', provider, 'control.json')))
-        .rejects.toMatchObject({ code: 'ENOENT' })
-    }
-  })
-
-  it.each([
-    { kind: 'enabled', contents: '{"version":1,"enabled":true}' },
-    { kind: 'malformed', contents: 'invalid JSON' },
-    { kind: 'oversized', contents: 'x'.repeat(4097) },
-  ])('disables an existing $kind nonselected provider before initialization', async ({ contents }) => {
-    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-stale-remote-'))
-    temporaryDirectories.push(directory)
-    const file = join(directory, 'remote', 'cpolar', 'control.json')
-    await mkdir(dirname(file), { recursive: true })
-    await writeFile(file, contents)
-    const mounted = await mount(false, 3080, { stateFile: join(directory, 'devices.json') })
-    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ version: 1, enabled: false })
-    const status = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/control')
-    expect(JSON.parse(status.body)).toMatchObject({ provider: 'tailscale', providers: { cpolar: { running: false, state: 'off' } } })
-  })
-
-  it('runs and purges the origin independently of LAN while keeping shared remote pairings', async () => {
-    const mounted = await mount(true)
-    const lanBefore = JSON.parse((await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')).body)
-    const selected = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/provider', JSON.stringify({ provider: 'origin' }))
-    expect(JSON.parse(selected.body)).toMatchObject({ provider: 'origin', running: false, state: 'off' })
-    const { port, form, configured, started } = await startOriginOnFreePort(mounted.route)
-    expect(configured.status).toBe(200)
-    const metadata = JSON.parse(configured.body).providers.origin.configuration as { storagePath: string }
-    expect(JSON.parse(configured.body)).toMatchObject({ providers: { origin: { configuration: {
-      configured: true, publicOrigin: form.publicOrigin, listenHost: '127.0.0.1', listenPort: port,
-      allowedCidrs: ['127.0.0.0/8'], backendOrigin: 'http://127.0.0.1:' + String(port),
-    } } } })
-    expect(JSON.parse(started.body)).toMatchObject({ provider: 'origin', running: true, state: 'ready', origin: form.publicOrigin,
-      backendOrigin: 'http://127.0.0.1:' + String(port) })
-    const pairing = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/pairing/open', '{}')
-    expect(pairing.status).toBe(201)
-    const opened = JSON.parse(pairing.body) as { token: string; appKey: string; pairUrl: string; appPairUrl: string }
-    expect(opened.pairUrl).toMatch(/^https:\/\/phone\.example\.com:8815\/mobile-access\/pair#/u)
-    expect(opened.appKey).toMatch(/^dsh1\.[a-f0-9]{64}\.[A-Za-z0-9_-]{43}$/u)
-    expect(opened.pairUrl).toContain('#instance=')
-    expect(opened.appPairUrl).toBe(opened.pairUrl)
-    expect(await pairOriginBackend(port, opened.token)).toBe(201)
-    const devices = JSON.parse((await invoke(mounted.route, 'GET', '/api/mobile-access/remote/devices')).body).devices
-    expect(devices).toHaveLength(1)
-    const deviceFile = join(metadata.storagePath, '..', '..', 'devices.json')
-    const persistedDevices = JSON.parse(await readFile(deviceFile, 'utf8'))
-    const refused = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/origin/purge', '{}')
-    expect(refused.status).toBe(400)
-    const purged = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/origin/purge', JSON.stringify({ confirm: true }))
-    expect(JSON.parse(purged.body)).toMatchObject({ running: false, state: 'off', providers: { origin: { configuration: { configured: false } } } })
-    expect(JSON.parse(await readFile(deviceFile, 'utf8'))).toEqual(persistedDevices)
-    await expect(readFile(join(metadata.storagePath, 'settings.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
-    await expect(pairOriginBackend(port, opened.token)).rejects.toMatchObject({ code: 'ECONNREFUSED' })
-    const lanAfter = JSON.parse((await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')).body)
-    expect(lanAfter).toEqual(lanBefore)
-    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/origin/configure', JSON.stringify(form))
-    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/control', JSON.stringify({ running: true }))
-    const restored = JSON.parse((await invoke(mounted.route, 'GET', '/api/mobile-access/remote/devices')).body).devices
-    expect(restored).toHaveLength(1)
-  })
-
-  it('reports a real port collision without disturbing the existing LAN listener', async () => {
-    const mounted = await mount(true)
-    const lanBefore = JSON.parse((await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')).body)
-    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/provider', JSON.stringify({ provider: 'origin' }))
-    const occupiedPort = Number(new URL(lanBefore.origin as string).port)
-    expect(occupiedPort).toBeGreaterThan(0)
-    const configured = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/origin/configure', JSON.stringify({
-      publicOrigin: 'https://phone.example.com:8815', listenPort: occupiedPort,
-    }))
-    expect(configured.status).toBe(200)
-    const started = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/control', JSON.stringify({ running: true }))
-    expect(JSON.parse(started.body)).toMatchObject({ running: true, state: 'error', errorCode: 'origin_listen_port_in_use' })
-    const stopped = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/control', JSON.stringify({ running: false }))
-    expect(JSON.parse(stopped.body)).toMatchObject({ running: false, state: 'off' })
-    expect(JSON.parse((await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')).body)).toEqual(lanBefore)
-  })
-
-  it.each([
-    [{ publicOrigin: 'http://phone.example.com' }, 'origin_public_origin_invalid'],
-    [{ listenHost: '0.0.0.0' }, 'origin_listen_host_invalid'],
-    [{ listenHost: '8.8.8.8' }, 'origin_listen_host_invalid'],
-    [{ listenPort: 0 }, 'origin_listen_port_invalid'],
-    [{ listenPort: 3443 }, 'origin_listen_port_reserved'],
-    [{ allowedCidrs: ['0.0.0.0/0'] }, 'origin_allowed_cidrs_invalid'],
-    [{ listenHost: '192.168.10.20' }, 'origin_allowed_cidrs_invalid'],
-  ])('rejects unsafe origin settings at the local API: %j', async (override, error) => {
-    const mounted = await mount()
-    const result = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/origin/configure', JSON.stringify({
-      publicOrigin: 'https://phone.example.com:8815', ...override,
-    }))
-    expect(result.status).toBe(400)
-    expect(JSON.parse(result.body)).toEqual({ error })
-  })
-
-  it('stores restricted FRP settings without returning the token', async () => {
-    const mounted = await mount()
-    const selected = await invoke(
-      mounted.route,
-      'POST',
-      '/api/mobile-access/remote/provider',
-      JSON.stringify({ provider: 'frp' }),
-    )
-    expect(selected.status).toBe(200)
-    const token = '0123456789abcdef0123456789abcdef'
-    const configured = await invoke(
-      mounted.route,
-      'POST',
-      '/api/mobile-access/remote/frp/configure',
-      JSON.stringify({
-        serverAddress: 'frp.example.com',
-        serverPort: 7000,
-        token,
-        publicOrigin: 'https://dsh.example.com',
-      }),
-    )
-    expect(configured.status).toBe(200)
-    expect(configured.body).not.toContain(token)
-    expect(JSON.parse(configured.body)).toMatchObject({
-      provider: 'frp',
-      providers: {
-        frp: {
-          configuration: {
-            configured: true,
-            serverAddress: 'frp.example.com',
-            serverPort: 7000,
-            publicOrigin: 'https://dsh.example.com',
-          },
-        },
-      },
-    })
-  })
-
-  it('keeps distinct FRP proxy names when fixed setups provide the same gateway identity', async () => {
-    const instanceId = 'a'.repeat(64)
-    const first = await mount(false, 3080, { instanceId })
-    const second = await mount(false, 3080, { instanceId })
-    const firstName = await frpProxyNameFromRoute(first.route)
-    const secondName = await frpProxyNameFromRoute(second.route)
-    expect(firstName).toMatch(/^dsh-mobile-[a-f0-9]{12}$/u)
-    expect(secondName).not.toBe(firstName)
-    expect(await readFile(join(first.directory, 'installation-id'), 'utf8')).toMatch(/^[a-f0-9]{64}\n$/u)
-    expect(await readFile(join(second.directory, 'installation-id'), 'utf8')).toMatch(/^[a-f0-9]{64}\n$/u)
-
-    const purged = await invoke(first.route, 'POST', '/api/mobile-access/remote/frp/component/purge', '{"confirm":true}')
-    expect(purged.status).toBe(200)
-    expect(await frpProxyNameFromRoute(first.route)).toBe(firstName)
-    expect(await readFile(join(first.directory, 'installation-id'), 'utf8')).toMatch(/^[a-f0-9]{64}\n$/u)
-  })
-
-  it('keeps the FRP proxy name when an unconfigured setup becomes managed after restart', async () => {
-    const setupDirectory = await mkdtemp(join(tmpdir(), 'dsh-mobile-frp-setup-'))
-    temporaryDirectories.push(setupDirectory)
-    const setupFile = join(setupDirectory, 'setup.json')
-    const before = await mount(false, 3080, { setupFile })
-    const proxyName = await frpProxyNameFromRoute(before.route)
-    const marker = await readFile(join(before.directory, 'installation-id'), 'utf8')
-
-    await before.context.fiber.dispose()
-    contexts.splice(contexts.indexOf(before.context), 1)
-    const managed = await managedSetupFile('http://127.0.0.1:3080')
-    await writeFile(setupFile, await readFile(managed, 'utf8'))
-    const after = await mount(false, 3080, { setupFile, stateFile: join(before.directory, 'devices.json') })
-    expect(await frpProxyNameFromRoute(after.route)).toBe(proxyName)
-    expect(await readFile(join(before.directory, 'installation-id'), 'utf8')).toBe(marker)
-  })
-
   it('registers a /mobile command that steers the agent with the customization guide', async () => {
     const mounted = await mount()
     expect(mounted.command).toMatchObject({
@@ -744,16 +557,16 @@ describe('stock DSH lifecycle', () => {
       },
       whenIdle: async (): Promise<void> => undefined,
     }
-    const invoke = (rawInput: string) => mounted.command.handler({
+    const invokeCommand = (rawInput: string) => mounted.command.handler({
       agent,
       commandId: 'id' as never,
       signal: new AbortController().signal,
       rawInput,
     } as never)
-    const empty = await invoke('  ')
+    const empty = await invokeCommand('  ')
     expect(empty).toMatchObject({ kind: 'error' })
     expect(steered).toEqual([])
-    const result = await invoke(' 把手机端改成深色主题')
+    const result = await invokeCommand(' 把手机端改成深色主题')
     expect(result).toMatchObject({ kind: 'success' })
     expect(steered.length).toBe(1)
     const [steeredMessage] = steered
@@ -766,6 +579,208 @@ describe('stock DSH lifecycle', () => {
       form: 'notice',
       summary: '/mobile 把手机端改成深色主题',
     })
+  })
+})
+
+describe('remote provider selection routes', () => {
+  it('switches remote providers without changing the LAN runtime', async () => {
+    const mounted = await mount()
+    const selected = await invoke(
+      mounted.route,
+      'POST',
+      '/api/mobile-access/remote/provider',
+      JSON.stringify({ provider: 'sakurafrp' }),
+    )
+    expect(selected.status).toBe(200)
+    expect(JSON.parse(selected.body)).toMatchObject({ provider: 'sakurafrp', running: false, state: 'off' })
+    const lan = await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')
+    expect(JSON.parse(lan.body)).toEqual({ running: false })
+  })
+
+  it.each(['tailscale', 'cpolar', 'frp', 'origin'])('rejects removed provider selections with bad_request: %s', async provider => {
+    const mounted = await mount()
+    const rejected = await invoke(
+      mounted.route,
+      'POST',
+      '/api/mobile-access/remote/provider',
+      JSON.stringify({ provider }),
+    )
+    expect(rejected.status).toBe(400)
+    expect(JSON.parse(rejected.body)).toEqual({ error: 'bad_request' })
+  })
+
+  it('does not create control files for remote providers that were never enabled', async () => {
+    const mounted = await mount()
+    for (const provider of ['cloudflared', 'sakurafrp']) {
+      await expect(lstat(join(mounted.directory, 'remote', provider, 'control.json')))
+        .rejects.toMatchObject({ code: 'ENOENT' })
+    }
+  })
+
+  it.each([
+    { kind: 'enabled', contents: '{"version":1,"enabled":true}' },
+    { kind: 'malformed', contents: 'invalid JSON' },
+    { kind: 'oversized', contents: 'x'.repeat(4097) },
+  ])('disables an existing $kind nonselected provider before initialization', async ({ contents }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-stale-remote-'))
+    temporaryDirectories.push(directory)
+    // SakuraFrp is the default selected provider, so the nonselected legacy
+    // surface these cases guard is cloudflared.
+    const file = join(directory, 'remote', 'cloudflared', 'control.json')
+    await mkdir(dirname(file), { recursive: true })
+    await writeFile(file, contents)
+    const mounted = await mount(false, 3080, { stateFile: join(directory, 'devices.json') })
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ version: 1, enabled: false })
+    const status = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/control')
+    expect(JSON.parse(status.body)).toMatchObject({ provider: 'sakurafrp', providers: { cloudflared: { running: false, state: 'off' } } })
+  })
+})
+
+describe('SakuraFrp remote channel routes', () => {
+  const token = 'sk-access-token-01'
+
+  it('stores the access token without ever returning it', async () => {
+    const mounted = await mount()
+    const saved = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/token', JSON.stringify({ token }))
+    expect(saved.status).toBe(200)
+    expect(saved.body).not.toContain(token)
+    const configuration = (JSON.parse(saved.body) as {
+      providers: { sakurafrp: { configuration: Record<string, unknown> } }
+    }).providers.sakurafrp.configuration
+    expect(configuration).toMatchObject({ tokenSet: true })
+    // No tunnel has been selected yet, so the snapshot omits the field entirely.
+    expect(configuration).not.toHaveProperty('tunnelId')
+    const stored = JSON.parse(await readFile(
+      join(mounted.directory, 'remote', 'sakurafrp', 'settings.json'), 'utf8',
+    )) as { token?: string }
+    expect(stored.token).toBe(token)
+  })
+
+  it.each(['short', 'has space', 42, ' padded ', 'a'.repeat(513)])('rejects an invalid access token with 400: %j', async badToken => {
+    const mounted = await mount()
+    const rejected = await invoke(
+      mounted.route,
+      'POST',
+      '/api/mobile-access/remote/sakurafrp/token',
+      JSON.stringify({ token: badToken }),
+    )
+    expect(rejected.status).toBe(400)
+    expect(JSON.parse(rejected.body)).toEqual({ error: 'sakurafrp_token_invalid' })
+  })
+
+  it('stores the selected tunnel id in the control snapshot', async () => {
+    const mounted = await mount()
+    const saved = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/configure', JSON.stringify({ tunnelId: 7 }))
+    expect(saved.status).toBe(200)
+    expect(JSON.parse(saved.body)).toMatchObject({
+      providers: { sakurafrp: { configuration: { tokenSet: false, tunnelId: 7 } } },
+    })
+  })
+
+  it.each([0, -1, '7', 1.5, true])('rejects an invalid tunnel id with 400 sakurafrp_tunnel_id_invalid: %j', async badTunnelId => {
+    const mounted = await mount()
+    const rejected = await invoke(
+      mounted.route,
+      'POST',
+      '/api/mobile-access/remote/sakurafrp/configure',
+      JSON.stringify({ tunnelId: badTunnelId }),
+    )
+    expect(rejected.status).toBe(400)
+    expect(JSON.parse(rejected.body)).toEqual({ error: 'sakurafrp_tunnel_id_invalid' })
+  })
+
+  it('reports a missing token on the tunnel listing with 409', async () => {
+    const mounted = await mount()
+    const refused = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/sakurafrp/tunnels')
+    expect(refused.status).toBe(409)
+    expect(JSON.parse(refused.body)).toEqual({ error: 'sakurafrp_token_missing' })
+  })
+
+  it('lists tunnels without exposing the access token', async () => {
+    const mounted = await mount()
+    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/token', JSON.stringify({ token }))
+    vi.stubGlobal('fetch', () => Promise.resolve(new Response(JSON.stringify([
+      {
+        id: 7, name: 'DSH Mobile', type: 'tcp', node: 12, online: true, status: 1,
+        remote: '33080', local_ip: '127.0.0.1', local_port: 45321, locks: { edit: true },
+      },
+      { id: 8, name: 'UDP tunnel', type: 'udp', node: 12, online: true, status: 1, remote: '33081' },
+    ]), { status: 200 })))
+    const listed = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/sakurafrp/tunnels')
+    expect(listed.status).toBe(200)
+    expect(listed.body).not.toContain(token)
+    expect(JSON.parse(listed.body)).toMatchObject({ tokenSet: true, tunnels: [
+      expect.objectContaining({
+        id: 7, name: 'DSH Mobile', type: 'tcp', node: 12, online: true, status: 1,
+        remote: '33080', localPort: 45321, lockEdit: true,
+      }),
+      expect.objectContaining({ id: 8, type: 'udp' }),
+    ] })
+  })
+
+  it('maps an unreachable SakuraFrp API to a 409 instead of a generic 500', async () => {
+    const mounted = await mount()
+    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/token', JSON.stringify({ token }))
+    vi.stubGlobal('fetch', () => Promise.reject(new TypeError('fetch failed')))
+    const failed = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/sakurafrp/tunnels')
+    expect(failed.status).toBe(409)
+    expect(JSON.parse(failed.body)).toEqual({ error: 'sakurafrp_api_unreachable' })
+  })
+
+  it('maps a rejected SakuraFrp API token to a 400 sakurafrp_token_invalid', async () => {
+    const mounted = await mount()
+    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/token', JSON.stringify({ token }))
+    vi.stubGlobal('fetch', () => Promise.resolve(new Response(JSON.stringify({ code: 401, msg: 'invalid token' }), { status: 401 })))
+    const failed = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/sakurafrp/tunnels')
+    expect(failed.status).toBe(400)
+    expect(JSON.parse(failed.body)).toEqual({ error: 'sakurafrp_token_invalid' })
+  })
+
+  it('maps a frpc component launch failure to a 409 remote_component_launch_failed', async () => {
+    const mounted = await mount()
+    // The route handler only sees the component manager's rejection; a Windows
+    // frpc launch failure surfaces as `spawn UNKNOWN` at that boundary.
+    const install = vi.spyOn(FrpComponentManager.prototype, 'install')
+      .mockRejectedValue(new Error('spawn UNKNOWN'))
+    const failed = await invoke(
+      mounted.route,
+      'POST',
+      '/api/mobile-access/remote/sakurafrp/component/install',
+      JSON.stringify({ confirm: true }),
+    )
+    expect(install).toHaveBeenCalledTimes(1)
+    expect(failed.status).toBe(409)
+    expect(JSON.parse(failed.body)).toEqual({ error: 'remote_component_launch_failed' })
+  })
+
+  it('purges the saved SakuraFrp settings, frpc config and TLS ingress through the control route', async () => {
+    const mounted = await mount()
+    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/token', JSON.stringify({ token }))
+    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/configure', JSON.stringify({ tunnelId: 7 }))
+    const settingsFile = join(mounted.directory, 'remote', 'sakurafrp', 'settings.json')
+    const frpcConfigFile = join(mounted.directory, 'remote', 'sakurafrp', 'frpc.toml')
+    const ingressPaths = tlsIngressPaths(join(mounted.directory, 'remote', 'devices.json'))
+    await mkdir(ingressPaths.directory, { recursive: true })
+    await writeFile(ingressPaths.statusFile, '{"version":1,"caFingerprint":"' + 'a'.repeat(64) + '"}\n')
+
+    const purged = await invoke(
+      mounted.route,
+      'POST',
+      '/api/mobile-access/remote/sakurafrp/component/purge',
+      JSON.stringify({ confirm: true }),
+    )
+    expect(purged.status).toBe(200)
+    expect(JSON.parse(purged.body)).toMatchObject({ providers: { sakurafrp: { configuration: { tokenSet: false } } } })
+    await expect(lstat(settingsFile)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(lstat(frpcConfigFile)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(lstat(ingressPaths.statusFile)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('requires confirmation before purging the frpc component', async () => {
+    const mounted = await mount()
+    const refused = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/component/purge', '{}')
+    expect(refused.status).toBe(400)
+    expect(JSON.parse(refused.body)).toEqual({ error: 'bad_request' })
   })
 })
 
@@ -798,184 +813,5 @@ describe('local worker recovery control routes', () => {
     expect(recovered.status).toBe(200)
     expect(JSON.parse(recovered.body)).toMatchObject({hosts:[{id:'recoverable',state:'ready'}]})
     expect(parseUnavailableExtensionHosts(JSON.parse(recovered.body))).toEqual([])
-  })
-})
-
-describe('attach-mode control routes', () => {
-  it('previews the attach runbook over loopback without installing anything', async () => {
-    const mounted = await mount()
-    const planRequest = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/attach-plan', JSON.stringify({
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      mode: 'attach',
-      entryTls: 'self-signed',
-      publicPort: 33_080,
-    }))
-    expect(planRequest.status).toBe(200)
-    const parsed = JSON.parse(planRequest.body) as { frpAttachPlan: Record<string, unknown>; frpAttachTemplate: string }
-    expect(parsed.frpAttachPlan).toMatchObject({ mode: 'attach', entryTls: 'self-signed', publicPort: 33_080 })
-    expect(parsed.frpAttachPlan.vps as unknown[]).toHaveLength(3)
-    expect(parsed.frpAttachTemplate).toContain('type = "tcp"')
-    expect(parsed.frpAttachTemplate).toContain('remotePort = 33080')
-    expect(parsed.frpAttachTemplate).toContain('ufw allow 33080/tcp')
-    // A preview must not persist anything.
-    const status = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/control')
-    expect(status.body).not.toContain('0123456789abcdef0123456789abcdef')
-  })
-
-  it('reports the documented error codes for attach-mode misconfiguration', async () => {
-    const mounted = await mount()
-    const missingVhost = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify({
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      mode: 'attach',
-    }))
-    expect(missingVhost.status).toBe(409)
-    expect(missingVhost.body).toContain('frp_attach_mode_requires_vhost_port')
-    const badEntryTls = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify({
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4',
-      mode: 'deploy',
-      entryTls: 'self-signed',
-    }))
-    expect(badEntryTls.status).toBe(409)
-    expect(badEntryTls.body).toContain('frp_entry_tls_invalid')
-  })
-
-  it('exposes the self-signed certificate state and reachability on demand', async () => {
-    const probe = vi.spyOn(network, 'probeTcpReachable').mockResolvedValue(false)
-    const mounted = await mount()
-    const configured = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify({
-      serverAddress: '127.0.0.1',
-      serverPort: 1,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://8.8.8.8',
-      mode: 'attach',
-      entryTls: 'self-signed',
-      publicPort: 33_080,
-    }))
-    expect(configured.status).toBe(200)
-    expect(configured.body).not.toContain('0123456789abcdef0123456789abcdef')
-    const check = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/frp/self-check')
-    expect(check.status).toBe(200)
-    const parsed = JSON.parse(check.body) as { frpSelfCheck: Record<string, unknown> }
-    expect(parsed.frpSelfCheck).toMatchObject({
-      mode: 'attach',
-      entryTls: 'self-signed',
-      publicPort: 33_080,
-      // Nothing is listening and the certificate does not exist until the channel
-      // starts: both facts are reported instead of throwing.
-      frpsReachable: false,
-      entryReachable: false,
-      inbound: { listenHost: '127.0.0.1', allowedCidrs: ['127.0.0.0/8'] },
-    })
-    expect((parsed.frpSelfCheck.certificate as Record<string, unknown>).state).toBe('unknown')
-    expect(probe).toHaveBeenCalledWith('127.0.0.1', 1)
-    expect(probe).toHaveBeenCalledWith('8.8.8.8', 33_080)
-    // Never leak the token, key material, or private paths through the self-check.
-    expect(check.body).not.toContain('0123456789abcdef0123456789abcdef')
-    expect(check.body).not.toContain('ca-key.pem')
-  })
-
-  it('checks the public-certificate HTTPS entry instead of the self-signed port', async () => {
-    const probe = vi.spyOn(network, 'probeTcpReachable').mockImplementation(async (host, port) => host === '8.8.8.8' && port === 443)
-    const mounted = await mount()
-    const configured = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify({
-      serverAddress: '127.0.0.1', serverPort: 1, token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://8.8.8.8', mode: 'attach', entryTls: 'public-ip-cert', vhostHttpPort: 7080,
-    }))
-    expect(configured.status).toBe(200)
-    const check = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/frp/self-check')
-    expect(check.status).toBe(200)
-    expect(JSON.parse(check.body).frpSelfCheck).toMatchObject({ frpsReachable: false, entryReachable: true })
-    expect(probe).toHaveBeenCalledWith('8.8.8.8', 443)
-    expect(probe).not.toHaveBeenCalledWith('127.0.0.1', 33_080)
-  })
-
-  it('purges the FRP-owned CA key, leaf key, and identity marker through the control route', async () => {
-    const mounted = await mount()
-    const settings = parseFrpSettings({
-      serverAddress: '1.2.3.4', serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://1.2.3.4', mode: 'attach', entryTls: 'self-signed',
-    })
-    const stateFile = join(mounted.directory, 'remote', 'devices.json')
-    const ingress = await ensureFrpIngressCertificate(settings, stateFile)
-    const configured = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify(settings))
-    expect(configured.status).toBe(200)
-    const purged = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/component/purge', '{"confirm":true}')
-    expect(purged.status).toBe(200)
-    for (const file of [ingress.paths.caCertFile, ingress.paths.caKeyFile, ingress.paths.certFile, ingress.paths.keyFile, ingress.paths.statusFile]) {
-      await expect(lstat(file)).rejects.toMatchObject({ code: 'ENOENT' })
-    }
-  })
-
-  it('keeps the managed deploy routes untouched for the default mode', async () => {
-    const mounted = await mount()
-    const configured = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify({
-      serverAddress: 'frp.example.com',
-      serverPort: 7000,
-      token: '0123456789abcdef0123456789abcdef',
-      publicOrigin: 'https://dsh.example.com',
-    }))
-    expect(configured.status).toBe(200)
-    const parsed = JSON.parse(configured.body) as { providers: { frp: { configuration: Record<string, unknown> } } }
-    // A legacy configuration must not gain the new keys in the status payload.
-    expect(parsed.providers.frp.configuration).toMatchObject({
-      configured: true,
-      vhostHttpPort: 7080,
-    })
-    expect(parsed.providers.frp.configuration).not.toHaveProperty('mode')
-    expect(parsed.providers.frp.configuration).not.toHaveProperty('entryTls')
-    expect(parsed.providers.frp.configuration).not.toHaveProperty('publicPort')
-  })
-
-  it('never returns a saved FRP token from the attach preview, even on a reveal request', async () => {
-    const mounted = await mount()
-    const token = '0123456789abcdef0123456789abcdef'
-    const request = {
-      serverAddress: '1.2.3.4',
-      serverPort: 7000,
-      token,
-      publicOrigin: 'https://1.2.3.4',
-      mode: 'attach',
-      entryTls: 'self-signed',
-      publicPort: 33_080,
-    }
-    const masked = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/attach-plan', JSON.stringify(request))
-    expect(masked.status).toBe(200)
-    const maskedParsed = JSON.parse(masked.body) as {
-      frpAttachPlan: { local: { frpcToml: string; tokenMasked: boolean } }
-      frpAttachTemplate: string
-    }
-    // The default preview is masked in both artefacts the panel can copy.
-    expect(maskedParsed.frpAttachPlan.local.frpcToml).toContain('auth.token = "***"')
-    expect(maskedParsed.frpAttachPlan.local.tokenMasked).toBe(true)
-    expect(maskedParsed.frpAttachTemplate).not.toContain(token)
-    expect(masked.body).not.toContain(token)
-    const configured = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/configure', JSON.stringify(request))
-    expect(configured.status).toBe(200)
-    // A same-origin script can send this body without a user gesture. The
-    // saved token must remain unreadable even when the request asks to reveal it.
-    const requestedReveal = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/frp/attach-plan',
-      JSON.stringify({ ...request, token: '', revealToken: true }))
-    expect(requestedReveal.status).toBe(200)
-    const revealedParsed = JSON.parse(requestedReveal.body) as {
-      frpAttachPlan: { local: { frpcToml: string; tokenMasked: boolean } }
-      frpAttachTemplate: string
-    }
-    expect(revealedParsed.frpAttachPlan.local.frpcToml).toContain('auth.token = "***"')
-    expect(revealedParsed.frpAttachPlan.local.tokenMasked).toBe(true)
-    expect(revealedParsed.frpAttachTemplate).not.toContain(token)
-    expect(requestedReveal.body).not.toContain(token)
-    // The control snapshot also keeps the saved token private.
-    const status = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/control')
-    expect(status.body).not.toContain(token)
   })
 })

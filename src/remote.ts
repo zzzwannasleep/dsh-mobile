@@ -6,7 +6,7 @@ import type { MobileAccessGateway } from './gateway.js'
 import { restrictPrivateFile } from './private-file.js'
 
 /** Remote transports supported by the desktop plugin and Android client. */
-export type RemoteProvider = 'tailscale' | 'cpolar' | 'cloudflared' | 'frp' | 'origin'
+export type RemoteProvider = 'cloudflared' | 'sakurafrp'
 
 /** Common safe status returned by every remote provider controller. */
 export interface RemoteProviderStatus {
@@ -36,7 +36,7 @@ export interface RemoteProviderState {
   readonly provider: RemoteProvider
 }
 
-export const REMOTE_PROVIDERS: readonly RemoteProvider[] = Object.freeze(['tailscale', 'cpolar', 'cloudflared', 'frp', 'origin'])
+export const REMOTE_PROVIDERS: readonly RemoteProvider[] = Object.freeze(['cloudflared', 'sakurafrp'])
 
 /** Persist only the selected remote provider. */
 export interface RemoteProviderStore {
@@ -197,15 +197,20 @@ export async function terminateRemoteProcess(
   })
 }
 
-/** Validate the provider selection loaded across the filesystem boundary. */
+/**
+ * Validate the provider selection loaded across the filesystem boundary.
+ *
+ * Older installations may still carry a removed provider (`tailscale`, `cpolar`,
+ * `frp`, `origin`); that state is an unsupported format, and the store maps it
+ * back to the default instead of failing DSH boot.
+ */
 export function parseRemoteProviderState(value: unknown): RemoteProviderState {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('remote provider state must be an object')
   }
   const record = value as Record<string, unknown>
   if (record.version !== 1
-    || (record.provider !== 'tailscale' && record.provider !== 'cpolar' && record.provider !== 'cloudflared'
-      && record.provider !== 'frp' && record.provider !== 'origin')
+    || (record.provider !== 'cloudflared' && record.provider !== 'sakurafrp')
     || Reflect.ownKeys(record).some(key => key !== 'version' && key !== 'provider')) {
     throw new Error('remote provider state has an unsupported format')
   }
@@ -234,7 +239,13 @@ export class JsonRemoteProviderStore {
     try { parsed = JSON.parse(await readFile(this.file, 'utf8')) as unknown } catch (error) {
       throw new Error('remote provider state is not valid JSON', { cause: error })
     }
-    return parseRemoteProviderState(parsed)
+    try {
+      return parseRemoteProviderState(parsed)
+    } catch {
+      // A state written by a removed provider must not take DSH down: fall back
+      // to the default selection; the next explicit choice rewrites the file.
+      return Object.freeze({ version: 1, provider: this.defaultProvider })
+    }
   }
 
   async save(state: RemoteProviderState): Promise<void> {
@@ -261,11 +272,11 @@ export class JsonRemoteProviderStore {
   }
 }
 
-/** Resolve the first-run provider without letting environment values bypass validation. */
+/** Resolve the first-run provider without letting environment values bypass validation. SakuraFrp is the primary channel. */
 export function configuredRemoteProvider(environment: NodeJS.ProcessEnv): RemoteProvider {
-  const value = environment.DSH_MOBILE_REMOTE_PROVIDER ?? 'tailscale'
-  if (value !== 'tailscale' && value !== 'cpolar' && value !== 'cloudflared' && value !== 'frp' && value !== 'origin') {
-    throw new Error('DSH_MOBILE_REMOTE_PROVIDER must be tailscale, cpolar, cloudflared, frp, or origin')
+  const value = environment.DSH_MOBILE_REMOTE_PROVIDER ?? 'sakurafrp'
+  if (value !== 'cloudflared' && value !== 'sakurafrp') {
+    throw new Error('DSH_MOBILE_REMOTE_PROVIDER must be cloudflared or sakurafrp')
   }
   return value
 }

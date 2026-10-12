@@ -2,12 +2,10 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { CpolarComponentManager } from '../src/cpolar-component.js'
 import { CloudflaredComponentManager } from '../src/cloudflared-component.js'
 import { FrpComponentManager } from '../src/frp-component.js'
-import { FrpConfigStore } from '../src/frp-config.js'
 import { CloudflaredTunnelStore } from '../src/cloudflared-tunnel.js'
-import { OriginConfigStore } from '../src/origin-proxy-config.js'
+import { SakuraFrpSettingsStore } from '../src/sakurafrp.js'
 import { ensureManagedDirectory, removeManagedTree, replaceManagedDirectory, writeManagedPrivateFile } from '../src/managed-files.js'
 
 const roots: string[] = []
@@ -30,19 +28,17 @@ async function linkDirectory(target: string, path: string): Promise<void> {
 
 describe('managed component path ownership', () => {
   it('rejects relative component roots rather than rebasing them into the working directory', () => {
-    expect(() => new CpolarComponentManager({ stateDirectory: 'relative-state' })).toThrow('cpolar state directory must be absolute')
     expect(() => new CloudflaredComponentManager({ stateDirectory: 'relative-state' })).toThrow('cloudflared state directory must be absolute')
     expect(() => new FrpComponentManager({ stateDirectory: 'relative-state' })).toThrow('frp state directory must be absolute')
   })
-  it.each(['cpolar', 'cloudflared', 'frp'] as const)('refuses linked ancestors for %s without reading or deleting the external component', async provider => {
+  it.each(['cloudflared', 'frp'] as const)('refuses linked ancestors for %s without reading or deleting the external component', async provider => {
     const { state, outside, sentinel } = await fixture()
     await mkdir(join(outside, provider)); await writeFile(join(outside, provider, 'keep'), 'external component')
     await linkDirectory(outside, join(state, 'components'))
     const fetchArtifact = vi.fn(async () => new Uint8Array())
     const inspectExecutable = vi.fn(async () => '0.70.1')
-    const manager = provider === 'cpolar' ? new CpolarComponentManager({ stateDirectory: state, fetchArtifact })
-      : provider === 'cloudflared' ? new CloudflaredComponentManager({ stateDirectory: state, fetchArtifact })
-        : new FrpComponentManager({ stateDirectory: state, fetchArtifact, inspectExecutable })
+    const manager = provider === 'cloudflared' ? new CloudflaredComponentManager({ stateDirectory: state, fetchArtifact })
+      : new FrpComponentManager({ stateDirectory: state, fetchArtifact, inspectExecutable })
     await expect(manager.initialize()).resolves.toBeUndefined()
     expect(manager.status()).toMatchObject({ installed: false, errorCode: `${provider}_component_invalid` })
     await expect(manager.install()).rejects.toThrow(`${provider}_path_invalid`)
@@ -52,52 +48,39 @@ describe('managed component path ownership', () => {
     expect(await readFile(join(outside, provider, 'keep'), 'utf8')).toBe('external component')
   })
 
-  it.each(['cpolar', 'cloudflared', 'frp'] as const)('unlinks a %s component-root junction itself when explicitly purging', async provider => {
+  it.each(['cloudflared', 'frp'] as const)('unlinks a %s component-root junction itself when explicitly purging', async provider => {
     const { state, outside, sentinel } = await fixture()
     await mkdir(join(state, 'components')); await linkDirectory(outside, join(state, 'components', provider))
-    const manager = provider === 'cpolar' ? new CpolarComponentManager({ stateDirectory: state })
-      : provider === 'cloudflared' ? new CloudflaredComponentManager({ stateDirectory: state })
-        : new FrpComponentManager({ stateDirectory: state })
+    const manager = provider === 'cloudflared' ? new CloudflaredComponentManager({ stateDirectory: state })
+      : new FrpComponentManager({ stateDirectory: state })
     await manager.purge()
     await expect(lstat(manager.componentRoot)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(await readFile(sentinel, 'utf8')).toBe('outside must survive')
   })
 
-  it.each(['cpolar', 'cloudflared', 'frp'] as const)('refuses a linked %s staging ancestor before downloading', async provider => {
+  it.each(['cloudflared', 'frp'] as const)('refuses a linked %s staging ancestor before downloading', async provider => {
     const { state, outside, sentinel } = await fixture()
     await linkDirectory(outside, join(state, 'staging'))
     const fetchArtifact = vi.fn(async () => new Uint8Array())
-    const manager = provider === 'cpolar' ? new CpolarComponentManager({ stateDirectory: state, fetchArtifact })
-      : provider === 'cloudflared' ? new CloudflaredComponentManager({ stateDirectory: state, fetchArtifact })
-        : new FrpComponentManager({ stateDirectory: state, fetchArtifact })
+    const manager = provider === 'cloudflared' ? new CloudflaredComponentManager({ stateDirectory: state, fetchArtifact })
+      : new FrpComponentManager({ stateDirectory: state, fetchArtifact })
     await expect(manager.install()).rejects.toThrow(`${provider}_path_invalid`)
     expect(fetchArtifact).not.toHaveBeenCalled()
     expect(await readFile(sentinel, 'utf8')).toBe('outside must survive')
     expect(await readdir(outside)).toEqual(['sentinel.txt'])
   })
 
-  it('refuses writing a cpolar credential beneath a linked state ancestor', async () => {
-    const { state, outside, sentinel } = await fixture()
-    await linkDirectory(outside, join(state, 'state'))
-    const manager = new CpolarComponentManager({ stateDirectory: state })
-    await expect(manager.configure('valid-token-value-long-enough')).rejects.toThrow('cpolar_path_invalid')
-    expect(await readdir(outside)).toEqual(['sentinel.txt'])
-    expect(await readFile(sentinel, 'utf8')).toBe('outside must survive')
-  })
-
-  it.each(['frp', 'cloudflared', 'origin'] as const)('refuses %s configuration reads, writes and purge across an owned ancestor link', async provider => {
+  it.each(['cloudflared', 'sakurafrp'] as const)('refuses %s configuration reads, writes and purge across an owned ancestor link', async provider => {
     const { state, outside, sentinel } = await fixture()
     await mkdir(join(outside, provider)); await linkDirectory(outside, join(state, 'remote'))
     const directory = join(state, 'remote', provider)
-    const store = provider === 'frp' ? new FrpConfigStore(directory, 'test-proxy', state)
-      : provider === 'cloudflared' ? new CloudflaredTunnelStore(directory, state)
-        : new OriginConfigStore(directory, state)
+    const store = provider === 'cloudflared' ? new CloudflaredTunnelStore(directory, state)
+      : new SakuraFrpSettingsStore(directory, state)
     await store.initialize()
-    expect(store.status().configured).toBe(false)
-    const input = provider === 'frp'
-      ? { serverAddress: '1.2.3.4', serverPort: 7000, token: 'high-entropy-test-token-1234567890', publicOrigin: 'https://dsh.example.com' }
-      : provider === 'cloudflared' ? { mode: 'named', token: 'a'.repeat(64), hostname: 'dsh.example.com', port: 3444 }
-        : { publicOrigin: 'https://dsh.example.com' }
+    expect('configured' in store.status()).toBe(provider === 'cloudflared')
+    const input = provider === 'cloudflared'
+      ? { token: 'a'.repeat(64), hostname: 'dsh.example.com', port: 3444 }
+      : { token: 'sk-access-token-01', tunnelId: 114514 }
     await expect(store.configure(input)).rejects.toThrow(`${provider}_path_invalid`)
     await expect(store.purge()).rejects.toThrow(`${provider}_path_invalid`)
     expect(await readFile(sentinel, 'utf8')).toBe('outside must survive')
@@ -114,14 +97,6 @@ describe('managed component path ownership', () => {
     await expect(writeManagedPrivateFile(state, file, 'secret', 'managed')).rejects.toThrow('managed_config_target_invalid')
     expect(await readFile(sentinel, 'utf8')).toBe('outside must survive')
     await expect(ensureManagedDirectory(state, join(outside, 'created'), 'managed')).rejects.toThrow('managed_path_invalid')
-  })
-
-  it('FRP purge removes only its two owned configuration files', async () => {
-    const { state } = await fixture(); const store = new FrpConfigStore(state)
-    await writeFile(store.settingsFile, 'fixture'); await writeFile(store.runtimeConfigFile, 'fixture')
-    await writeFile(join(state, 'unrelated.txt'), 'keep')
-    await store.purge()
-    expect(await readdir(state)).toEqual(['unrelated.txt'])
   })
 })
 

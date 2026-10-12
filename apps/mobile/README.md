@@ -1,4 +1,4 @@
-# DeepSeek Harness Android App
+﻿# DeepSeek Harness Android App
 
 [简体中文](README.zh-CN.md) · [Back to the project](../../README.en.md)
 
@@ -42,9 +42,9 @@ Startup options are under the list's **Settings → Startup behavior**. Deleting
 
 ### Connection recovery and certificates
 
-The managed self-hosted FRP path uses a public-CA HTTPS domain or IPv4 origin and requires Android app 0.3.3 or later. The existing-frps path, introduced in 0.4.6, can use the same public-CA pairing or a public-IPv4 self-signed entry that requires app 0.4.6 or later. See the [attachment guide](../../docs/ATTACH_EXISTING_FRPS.en.md); older supported apps continue to work with LAN, cpolar, and Tailscale Funnel.
+Remote channels pair like LAN: the SakuraFrp channel terminates TLS on the computer with the plugin's private CA, so the app pins that CA during pairing. Older supported apps continue to work with LAN and cloudflared named tunnels.
 
-See the [self-hosted FRP guide](../../docs/SELF_HOSTED_FRP.en.md) for manual and automatic VPS deployment, host-key verification, cleanup, and troubleshooting.
+Pinned CA material and paired-device records stay in Android Keystore; removing a device from the computer's Mobile Access panel revokes its tokens.
 
 After the first pairing, the app encrypts its device records, including revocable long-lived tokens and any pinned CA, with Android Keystore. On a later launch it sends a stored token only to its exact saved Origin to renew a short Web session before opening DSH. If the computer receives another LAN address, the app scans the default port, matches the stable DSH installation identifier, and updates the saved origin automatically. A rotating remote address such as a free cpolar URL cannot be discovered through its expired predecessor; scan the computer's current remote QR code to validate the new Origin with a one-time pairing token. The app never sends the stored device token to that new Origin, and discovery never exposes device or Session credentials.
 

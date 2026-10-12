@@ -5,18 +5,14 @@ import { restrictPrivateFile } from './private-file.js'
 import { assertManagedParents, removeManagedTree, writeManagedPrivateFile } from './managed-files.js'
 
 const MAX_CONFIG_BYTES = 8 * 1024
-const QUICK_TUNNEL_SUFFIX = '.trycloudflare.com'
 /** Cloudflare's own tunnel-routing domain; it can never be a public hostname. */
 const TUNNEL_ROUTING_SUFFIX = '.cfargotunnel.com'
 /**
  * The bare registrable names behind those suffixes. A suffix test alone accepts
- * them, yet Cloudflare owns both apexes outright, so neither can ever be routed to
- * a customer tunnel.
+ * them, yet Cloudflare owns both apexes outright, so neither can ever be routed
+ * to a customer tunnel.
  */
-const RESERVED_APEX_NAMES: readonly string[] = Object.freeze([
-  QUICK_TUNNEL_SUFFIX.slice(1),
-  TUNNEL_ROUTING_SUFFIX.slice(1),
-])
+const RESERVED_APEX_NAMES: readonly string[] = Object.freeze(['trycloudflare.com', TUNNEL_ROUTING_SUFFIX.slice(1)])
 /** Ports below this need privileges on every supported platform. */
 const MIN_PORT = 1024
 const MAX_PORT = 65_535
@@ -28,30 +24,24 @@ const MAX_PORT = 65_535
 const RESERVED_LAN_GATEWAY_PORT = 3443
 const MAX_TOKEN_LENGTH = 4096
 
-/** Which tunnel flavour the cloudflared provider runs. */
-export type CloudflaredTunnelMode = 'quick' | 'named'
-
 /**
  * Cloudflared provider configuration.
  *
- * A quick tunnel owns nothing durable: cloudflared allocates a random hostname
- * and a random forward port every start. A named tunnel instead runs with an
- * account token, and its public hostname is routed by Cloudflare to the local
- * port recorded here, so that port must stay stable across restarts.
+ * Only named tunnels remain: they run with an account token and a stable public
+ * hostname routed by Cloudflare to the local port recorded here, so that port
+ * must stay stable across restarts. Quick tunnels (random hostname and port per
+ * start) are no longer part of this plugin.
  */
-export type CloudflaredTunnelSettings =
-  | { readonly version: 1; readonly mode: 'quick' }
-  | {
-    readonly version: 1
-    readonly mode: 'named'
-    readonly token: string
-    readonly hostname: string
-    readonly port: number
-  }
+export interface CloudflaredTunnelSettings {
+  readonly version: 1
+  readonly token: string
+  readonly hostname: string
+  readonly port: number
+}
 
 /** Configuration metadata safe to hand to the desktop panel; never the token. */
 export interface CloudflaredTunnelStatus {
-  readonly mode: CloudflaredTunnelMode
+  readonly mode: 'named'
   readonly configured: boolean
   readonly hostname?: string
   readonly port?: number
@@ -70,8 +60,8 @@ function hostname(value: string): boolean {
  *
  * The name must be a real DNS name, not an IP literal or a wildcard, and it
  * cannot sit under Cloudflare's own control-plane suffixes: `trycloudflare.com`
- * belongs to quick tunnels, and a `cfargotunnel.com` name is the routing target
- * rather than a routable public address.
+ * belongs to retired quick tunnels, and a `cfargotunnel.com` name is the routing
+ * target rather than a routable public address.
  */
 export function validateCloudflaredTunnelHostname(value: unknown): string {
   if (typeof value !== 'string' || value !== value.trim() || value.length === 0 || value.length > 253) {
@@ -82,7 +72,7 @@ export function validateCloudflaredTunnelHostname(value: unknown): string {
   // grammar, but Cloudflare never routes a tunnel hostname to an address.
   if (isIP(normalized) !== 0 || !hostname(normalized) || normalized.includes('*')
     || RESERVED_APEX_NAMES.includes(normalized)
-    || normalized.endsWith(QUICK_TUNNEL_SUFFIX) || normalized.endsWith(TUNNEL_ROUTING_SUFFIX)) {
+    || normalized.endsWith(TUNNEL_ROUTING_SUFFIX) || normalized.endsWith('.trycloudflare.com')) {
     throw new Error('cloudflared_tunnel_hostname_invalid')
   }
   return normalized
@@ -128,17 +118,14 @@ export function parseCloudflaredTunnelSettings(value: unknown): CloudflaredTunne
   if (record.version !== undefined && record.version !== 1) {
     throw new Error('cloudflared_tunnel_settings_invalid')
   }
-  const mode = record.mode ?? 'quick'
-  if (mode === 'quick') {
-    if (record.token !== undefined || record.hostname !== undefined || record.port !== undefined) {
-      throw new Error('cloudflared_tunnel_settings_invalid')
-    }
-    return Object.freeze({ version: 1, mode: 'quick' })
+  // Legacy quick-mode files (and any file that still names a mode other than
+  // `named`) are an unsupported format: the caller maps that to "unconfigured"
+  // instead of failing DSH boot.
+  if (record.mode !== 'named' && record.mode !== undefined) {
+    throw new Error('cloudflared_tunnel_settings_invalid')
   }
-  if (mode !== 'named') throw new Error('cloudflared_tunnel_settings_invalid')
   return Object.freeze({
-    version: 1,
-    mode: 'named',
+    version: 1 as const,
     token: validateCloudflaredTunnelToken(record.token),
     hostname: validateCloudflaredTunnelHostname(record.hostname),
     port: validateCloudflaredTunnelPort(record.port),
@@ -154,18 +141,11 @@ export function mergeSavedCloudflaredTunnelSettings(
   partial: Readonly<Record<string, unknown>>,
   saved: CloudflaredTunnelSettings | undefined,
 ): CloudflaredTunnelSettings {
-  const requested = partial.mode ?? saved?.mode ?? 'quick'
-  // The named branch below hardcodes its mode, so an unrecognized value would be
-  // silently rewritten into a named tunnel. Validate here as strictly as the
-  // parser does, rather than letting this layer launder it.
-  if (requested !== 'quick' && requested !== 'named') {
-    throw new Error('cloudflared_tunnel_settings_invalid')
-  }
-  if (requested === 'quick') return parseCloudflaredTunnelSettings({ version: 1, mode: 'quick' })
-  const previous = saved?.mode === 'named' ? saved : undefined
-  const token = partial.token === '' || partial.token === undefined ? previous?.token : partial.token
-  const hostname = partial.hostname === '' || partial.hostname === undefined ? previous?.hostname : partial.hostname
-  const port = partial.port === undefined || partial.port === '' ? previous?.port : partial.port
+  const requested = partial.mode ?? 'named'
+  if (requested !== 'named') throw new Error('cloudflared_tunnel_settings_invalid')
+  const token = partial.token === '' || partial.token === undefined ? saved?.token : partial.token
+  const hostname = partial.hostname === '' || partial.hostname === undefined ? saved?.hostname : partial.hostname
+  const port = partial.port === undefined || partial.port === '' ? saved?.port : partial.port
   if (token === undefined || hostname === undefined || port === undefined) {
     throw new Error('cloudflared_tunnel_config_missing')
   }
@@ -176,7 +156,7 @@ export function mergeSavedCloudflaredTunnelSettings(
 export class CloudflaredTunnelStore {
   readonly stateRoot: string
   readonly settingsFile: string
-  private settingsValue: CloudflaredTunnelSettings = Object.freeze({ version: 1, mode: 'quick' })
+  private settingsValue: CloudflaredTunnelSettings | undefined
   private errorCode: string | undefined
 
   constructor(stateDirectory: string, private readonly ownedRoot = stateDirectory) {
@@ -187,7 +167,7 @@ export class CloudflaredTunnelStore {
 
   /** Load private settings while rejecting links, oversized files and unknown fields. */
   async initialize(): Promise<void> {
-    this.settingsValue = Object.freeze({ version: 1, mode: 'quick' })
+    this.settingsValue = undefined
     this.errorCode = undefined
     try { await assertManagedParents(this.ownedRoot, this.settingsFile, 'cloudflared') } catch (_error) {
       this.errorCode = 'cloudflared_tunnel_config_invalid'
@@ -207,7 +187,7 @@ export class CloudflaredTunnelStore {
       this.settingsValue = parseCloudflaredTunnelSettings(JSON.parse(await readFile(this.settingsFile, 'utf8')) as unknown)
       this.errorCode = undefined
     } catch {
-      this.settingsValue = Object.freeze({ version: 1, mode: 'quick' })
+      this.settingsValue = undefined
       this.errorCode = 'cloudflared_tunnel_config_invalid'
     }
   }
@@ -216,31 +196,28 @@ export class CloudflaredTunnelStore {
   status(): CloudflaredTunnelStatus {
     const settings = this.settingsValue
     return Object.freeze({
-      mode: settings.mode,
-      configured: settings.mode === 'named',
-      ...(settings.mode === 'named' ? { hostname: settings.hostname, port: settings.port } : {}),
+      mode: 'named' as const,
+      configured: settings !== undefined,
+      ...(settings === undefined ? {} : { hostname: settings.hostname, port: settings.port }),
       storagePath: this.stateRoot,
       ...(this.errorCode === undefined ? {} : { errorCode: this.errorCode }),
     })
   }
 
   /** Return private settings only to the provider lifecycle. */
-  settings(): CloudflaredTunnelSettings {
+  settings(): CloudflaredTunnelSettings | undefined {
     return this.settingsValue
   }
 
   /** Atomically replace the tunnel configuration. */
   async configure(value: unknown): Promise<CloudflaredTunnelStatus> {
     const settings = parseCloudflaredTunnelSettings(value)
-    if (settings.mode === 'quick') await removeManagedTree(this.ownedRoot, this.settingsFile, 'cloudflared')
-    else {
-      try { await writeManagedPrivateFile(this.ownedRoot, this.settingsFile, `${JSON.stringify(settings)}\n`, 'cloudflared') }
-      catch (error) {
-        if (error instanceof Error && error.message === 'cloudflared_config_target_invalid') {
-          throw new Error('cloudflared_tunnel_target_invalid', { cause: error })
-        }
-        throw error
+    try { await writeManagedPrivateFile(this.ownedRoot, this.settingsFile, `${JSON.stringify(settings)}\n`, 'cloudflared') }
+    catch (error) {
+      if (error instanceof Error && error.message === 'cloudflared_config_target_invalid') {
+        throw new Error('cloudflared_tunnel_target_invalid', { cause: error })
       }
+      throw error
     }
     this.settingsValue = settings
     this.errorCode = undefined
@@ -250,7 +227,7 @@ export class CloudflaredTunnelStore {
   /** Forget a named tunnel and its connector token. */
   async purge(): Promise<CloudflaredTunnelStatus> {
     await removeManagedTree(this.ownedRoot, this.settingsFile, 'cloudflared')
-    this.settingsValue = Object.freeze({ version: 1, mode: 'quick' })
+    this.settingsValue = undefined
     this.errorCode = undefined
     return this.status()
   }

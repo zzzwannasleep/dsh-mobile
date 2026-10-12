@@ -8,10 +8,32 @@
  * install. Following one validated hop keeps the origin restriction while allowing the shape
  * every GitHub release download uses.
  */
+import { EnvHttpProxyAgent, type Dispatcher } from 'undici'
+
 const RELEASE_ASSET_HOSTS: readonly string[] = Object.freeze([
   'release-assets.githubusercontent.com',
   'objects.githubusercontent.com',
 ])
+
+let proxyAgent: EnvHttpProxyAgent | undefined
+/**
+ * Component downloads (GitHub releases) often need the machine's configured HTTP
+ * proxy: Node's global fetch ignores proxy environment variables unless a
+ * dispatcher is supplied. The agent reads HTTPS_PROXY/HTTP_PROXY/ALL_PROXY and
+ * NO_PROXY exactly like curl does, and is created lazily at most once.
+ */
+function proxyDispatcher(): Dispatcher | undefined {
+  const names = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']
+  if (!names.some(name => (process.env[name] ?? '') !== '')) return undefined
+  proxyAgent ??= new EnvHttpProxyAgent()
+  return proxyAgent
+}
+
+/** Fetch with the environment's proxy dispatcher attached when one is configured. */
+export function componentFetch(url: string, init: Omit<RequestInit, 'dispatcher'> & { dispatcher?: Dispatcher } = {}): Promise<Response> {
+  const dispatcher = init.dispatcher ?? proxyDispatcher()
+  return fetch(url, (dispatcher === undefined ? init : { ...init, dispatcher }) as RequestInit)
+}
 
 /** Input for {@link downloadPinnedArtifact}. */
 export interface PinnedDownloadRequest {
@@ -40,7 +62,7 @@ async function followValidatedRedirect(response: Response, request: PinnedDownlo
   if (target.protocol !== 'https:' || !hosts.includes(target.hostname)) {
     throw new Error(`${request.errorPrefix}_download_redirect_rejected`)
   }
-  return fetch(target, { redirect: 'error', signal: request.signal })
+  return componentFetch(target.href, { redirect: 'error', signal: request.signal })
 }
 
 /** Attempts per install. A 55 MB transfer through a TUN proxy can reset mid-stream: the first
@@ -62,7 +84,7 @@ function delay(ms: number): Promise<void> {
 }
 
 async function attemptDownload(request: PinnedDownloadRequest): Promise<Uint8Array> {
-  const first = await fetch(request.url, { redirect: 'manual', signal: request.signal })
+  const first = await componentFetch(request.url, { redirect: 'manual', signal: request.signal })
   const redirected = first.status >= 300 && first.status < 400
   const response = redirected ? await followValidatedRedirect(first, request) : first
   if (!response.ok) throw new Error(`${request.errorPrefix}_download_http_${String(response.status)}`)

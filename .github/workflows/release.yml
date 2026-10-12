@@ -28,27 +28,13 @@ jobs:
         with:
           node-version: 24.x
           cache: npm
-      - uses: actions/setup-go@v7
-        with:
-          go-version: 1.26.6
-          cache-dependency-path: native/funnel-host/go.sum
       - run: npm ci
-      - name: Test Funnel host
-        run: |
-          go test ./...
-          go vet ./...
-        working-directory: native/funnel-host
-      - run: npm run build:funnel-host
-      - run: npm run check:funnel-licenses:full
       - run: npm run verify
       - name: Pack plugin and release metadata
         run: |
           npm pack
           sha256sum dsh-mobile-*.tgz > dsh-mobile-plugin.sha256
           npm sbom --sbom-format cyclonedx > dsh-mobile-npm-sbom.cdx.json
-          go version -m bin/dsh-mobile-funnel-win32-x64.exe > dsh-mobile-funnel-go-modules.txt
-          go version -m bin/dsh-mobile-funnel-linux-x64 >> dsh-mobile-funnel-go-modules.txt
-          go version -m bin/dsh-mobile-funnel-linux-arm64 >> dsh-mobile-funnel-go-modules.txt
           cp apps/mobile/release.json dsh-mobile-android-release.json
       - uses: actions/upload-artifact@v7
         with:
@@ -57,7 +43,6 @@ jobs:
             dsh-mobile-*.tgz
             dsh-mobile-plugin.sha256
             dsh-mobile-npm-sbom.cdx.json
-            dsh-mobile-funnel-go-modules.txt
             dsh-mobile-android-release.json
           if-no-files-found: error
 

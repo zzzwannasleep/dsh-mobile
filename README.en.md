@@ -41,7 +41,6 @@
   <sub><a href="https://github.com/saya-ch/dsh-mobile/releases/tag/android-v0.6.2">Release notes and checksums</a></sub>
 </p>
 
-DSH Mobile is a DeepSeek Harness plugin that lets a mobile browser or the Android app connect over a protected LAN or an optional Tailscale Funnel, cpolar, cloudflared, self-hosted FRP, or own reverse-proxy remote path. Both routes reach the same sessions, Workspaces, messages, and tools. The computer manages their switches and pairing authorizations separately; the Android app lists paired computers together. The plugin does not modify DeepSeek Harness source.
 
 Mobile access uses a dedicated HTTPS origin and device pairing. The Android app pins the private LAN CA; public remote paths use platform-trusted certificates. The self-signed FRP entry additionally requires the 0.4.6 app to pin a remote CA during pairing.
 
@@ -52,11 +51,11 @@ It also lets you customize the phone from a DSH conversation: `/mobile <what you
 - **Continue DSH work from a phone**: the same sessions, Workspaces, messages, and tools, in real time.
 - **Customize the phone UI by talking to DSH**: request layout, interaction, or feature changes in a conversation; open pages usually refresh after the files have been changed.
 - **A dedicated touch layout**: session drawer, tool details, settings, question cards, and composer reorganized for phones; the app follows the system locale (Chinese/English/Italian), plugin UI follows DSH's locale.
-- **Several remote options**: Tailscale, cpolar, cloudflared quick/named tunnels, self-hosted FRP, or your own reverse proxy.
+- **Several remote options**: SakuraFrp (mainland TCP tunnel nodes, the default channel) or a cloudflared named tunnel (fixed hostname); `DSH_MOBILE_REMOTE_PROVIDER` can pin either explicitly.
 - **Pairing and multi-device**: pair once via QR code, link, or key; Wi-Fi, hotspot, or IP changes normally recover automatically; the app lists LAN and remote paired computers together, checks their reachability periodically, and lets you switch, re-pair, or delete a local record.
 - **One-click diagnostics and approval**: check versions, gateway, network interface, firewall, and the remote path with a redacted report; approve blocked third-party plugin connections per exact path.
 - **Task system notifications**: completion and pending-input alerts via Android system notifications, enabled from DSH General settings inside the app, with redacted lock-screen text.
-- **Defense in depth**: a private CA pinned for LAN, trusted HTTPS for public remote paths, and a remote CA pinned by the 0.4.6 app for the self-signed FRP entry. Credentials are Keystore-backed, device tokens go only to their exact Origin, and third-party WebSockets are blocked by default.
+- **Defense in depth**: a private CA pinned for LAN, Cloudflare edge certificates for the named tunnel, and a computer-side private CA pinned by the app during SakuraFrp pairing. Credentials are Keystore-backed, device tokens go only to their exact Origin, and third-party WebSockets are blocked by default.
 
 A paired device can operate DSH on the computer and must be treated as fully trusted. Enable LAN access only on trusted networks, and use a reliable HTTPS channel for remote access. Revoke a lost phone from the computer immediately.
 
@@ -144,27 +143,22 @@ Browser pairing and reauthentication pages use the browser's `Accept-Language` t
 
 ### Remote access
 
-Use this after the phone leaves the computer's network. Remote access is disabled by default, and the phone needs no separate Tailscale, cpolar, cloudflared, or FRP app.
+Use this after the phone leaves the computer's network. Remote access is disabled by default, and the phone needs no separate cloudflared or frpc app.
 
-Remote providers may impose bandwidth and connection limits: the [cpolar Free plan](https://svip.cpolar.com/pricing) currently lists 1 Mbps, while [Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel#requirements-and-limitations) has non-configurable bandwidth limits, and a cloudflared quick tunnel is a free Cloudflare address with randomized hostnames and rate limiting. DSH Mobile uses gzip for static assets, persistent WebSockets, and load-on-scroll history to improve loading; DSH controls the Session history window and page sizes, and the plugin cannot raise provider quotas.
 
 If the page opens but stays on “Reconnecting,” distinguish WebSocket upgrade failures, slow synchronization, and heartbeat deadlines using the [slow-link and reconnection guide](docs/SLOW_CONNECTIONS.en.md). Version 0.5.4 also offers opt-in WebSocket compression per exact path, disabled by default; for long Sessions or metered links, follow the guide and compare actual transfer volume.
 
 | Channel | Prerequisites | Address and limitation |
 | --- | --- | --- |
-| cpolar | Account and Authtoken | An option to try on mainland networks; free temporary URLs may change |
-| cloudflared quick tunnel | No account or domain | Random temporary URL; no SSE, with [notification limits](docs/CLOUDFLARE_TUNNEL.en.md#quick-tunnel-feature-limits) |
+| SakuraFrp (default) | SakuraFrp account and access token, one TCP tunnel | Entry is node domain/IP + remote port; the app pins the plugin's private CA during pairing |
 | cloudflared named tunnel | Cloudflare account and domain | Fixed hostname; [setup guide](docs/CLOUDFLARE_TUNNEL.en.md) |
-| Tailscale Funnel | Sign-in and Funnel authorization | May be unreliable on mainland-China networks |
-| Self-hosted FRP | VPS and domain or real public IPv4 | Server maintenance required; [deploy](docs/SELF_HOSTED_FRP.en.md) or [attach to existing frps](docs/ATTACH_EXISTING_FRPS.en.md) |
-| Own reverse proxy | Existing public HTTPS proxy | The plugin provides only its private authenticated backend; [guide](docs/SELF_HOSTED_ORIGIN.en.md) |
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/saya-ch/dsh-mobile/main/assets/screenshots/remote-access-en.png" width="82%" alt="DSH Mobile remote access and provider selection">
 </p>
 
 1. Open **Mobile Access → Remote** in the lower-left corner of DeepSeek Harness, choose a channel and complete its sign-in or configuration.
-2. Once ready, select **Create remote pairing QR code**. Own reverse proxy reports only **Backend listening**, so verify public HTTPS and WebSocket access as well.
+2. Once ready, select **Create remote pairing QR code**.
 3. Select **Remote access** in the Android app and scan the current QR code. A publicly trusted certificate also permits pairing from a mobile browser.
 4. Later launches reconnect using the saved address and credential. If a temporary address changes, scan the current computer QR code to verify it. Do not clear app data; the stored device token never goes to a new Origin.
 
@@ -172,11 +166,7 @@ If the page opens but stays on “Reconnecting,” distinguish WebSocket upgrade
 <summary>Installation and sign-in for each channel</summary>
 
 After selecting the channel in the panel:
-   - **Tailscale Funnel**: select **Enable remote access**, complete the one-time Tailscale sign-in on the official page, follow the panel prompt to allow Funnel, then return to DSH and wait until the connection is ready.
-   - **cpolar**: select **Install official component**, sign in to the cpolar dashboard and obtain an Authtoken, paste it, then select **Save and connect**. The component is downloaded into the plugin's private directory only after confirmation; free temporary addresses may change after DSH or cpolar restarts.
-   - **Self-hosted FRP (advanced)**: if you have a VPS, expand **Self-hosted connection** and enter its frps details and a public HTTPS domain or real public IPv4 address. Apply the restricted frps + Caddy template manually, or deploy with an SSH key on Ubuntu/Debian with systemd. Password login is unsupported, and the plugin does not overwrite Caddy configuration it does not manage. Verify the VPS host keys against its console before deployment or cleanup. The local `frpc` is downloaded and verified on demand; VPS cleanup is separate. Android app 0.3.3 or later is required. The [self-hosted FRP guide](docs/SELF_HOSTED_FRP.en.md) covers certificates, ports, and the complete procedure.
-   - **Own reverse proxy**: open **Self-hosted connection → Own reverse proxy**, enter the public HTTPS origin (custom ports supported), private listen IPv4, separate HTTP backend port (default 3444), and allowed proxy source CIDRs, then select **Save and start backend**. This uses your existing Lucky/Nginx/Caddy without a tunnel component and requires Android app 0.4.0 or later. See the [own reverse proxy guide](docs/SELF_HOSTED_ORIGIN.en.md).
-   - **cloudflared quick tunnel**: select **Install official component**. After you confirm, the plugin downloads a pinned build from the official release page into its private directory and requests a temporary public address (a quick tunnel) with **no sign-up or sign-in**. Choose this when you would rather not create an account. The quick-tunnel hostname changes on every reconnect, and Cloudflare positions quick tunnels for testing: they are rate-limited and carry no uptime guarantee, so do not rely on one for production access that must stay reachable; it suits temporary or verification use.
+   - **SakuraFrp**: create a **TCP** tunnel in the [SakuraFrp user panel](https://www.natfrp.com/user/) (leave the local target unset; the plugin points the tunnel at the local DSH gateway port automatically), paste the access token from the panel and save it, then pick the tunnel from the list and connect. The pinned upstream frpc is downloaded and verified into the plugin's private directory only on demand. The remote entry is the node domain and remote port (for example `https://frp-ski.com:58789`); the app pins the plugin's private CA during pairing, and a browser will show the expected untrusted-certificate warning. Mainland nodes only allow HTTPS access by platform policy; if the tunnel has visitor authentication enabled, turn it off in the SakuraFrp panel or the phone will need re-authorization after its IP changes.
    - **cloudflared named tunnel**: with a Cloudflare account and domain, switch **Tunnel type** to **Named**, then supply a connector token, a public hostname and a local forward port to get an address that survives restarts. The token is stored only in the private directory and reaches cloudflared through the environment rather than the command line; see [Cloudflare named tunnel](docs/CLOUDFLARE_TUNNEL.en.md).
 
 </details>
@@ -186,13 +176,11 @@ After selecting the channel in the panel:
 
 > **Remote notifications**: browser `Notification` permission is granted per Origin, and a web-page system toast appears only on the device running that page. Android task reminders are a separate 0.4.0 feature: enable them under DSH **Settings → General** in the app, and keep the WebView page alive; they are not a general background push service. For reliable background delivery, use a server-side webhook or bot channel you have configured.
 
-Tailscale Funnel has broad reach but may be unreliable from mainland China. Its runtime ties the public listener to the parent process and a bounded control channel; parent exit, channel closure, or an explicit stop ends the current generation and cleans up its resources. cpolar is better suited to mainland networks, while self-hosted FRP fits users who already have a VPS and want to avoid public-provider bandwidth quotas. cloudflared runs in two modes: a quick tunnel needs no account or sign-in, but its hostname is random, changes on every reconnect, and is [intended by Cloudflare for testing](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/) without an uptime guarantee, so it suits temporary or verification use rather than a permanent channel; a named tunnel uses a Cloudflare account token and keeps one fixed public hostname across restarts. An unregistered domain on a mainland-China VPS may be intercepted by the cloud provider; public IPv4 mode avoids that dependency. The plugin validates pinned on-demand components; locally managed configuration and binaries live under `$DSH_HOME/mobile-access/` and can be cleaned up from the panel. VPS files require separate cleanup through the self-hosted connection guide.
+A cloudflared named tunnel uses a Cloudflare account token and keeps one fixed public hostname across restarts, with rate limiting and a dependency on the Cloudflare network. SakuraFrp suits users who need mainland nodes and fixed ports; only TCP tunnels are supported, the remote entry is the node IP and port, and the SakuraFrp terms of service apply (public game servers have dedicated restrictions). The plugin validates pinned on-demand components; locally managed configuration and binaries live under `$DSH_HOME/mobile-access/` and can be cleaned up from the panel.
 
-Managed self-hosted FRP uses an HTTP vhost to the DSH loopback gateway. Its plaintext VPS listener must be loopback-only, with Caddy providing public HTTPS. Version 0.4.6 adds existing-frps attachment without installing or changing the server: its public-CA mode still needs a restricted HTTP vhost and Caddy, while its self-signed mode forwards raw TCP to a computer-side HTTPS gateway whose CA the 0.4.6 Android app pins during pairing. The self-signed mode currently uses public IPv4 and is unavailable to older apps. Neither mode exposes arbitrary FRP configuration. Because frps `proxyBindAddr` governs proxy listeners globally, do not change it for the new TCP entry without checking existing plaintext vhosts. See the [attachment guide](docs/ATTACH_EXISTING_FRPS.en.md).
 
-The own-proxy HTTP backend must remain on a trusted private network: **never port-forward it publicly or bypass it by proxying to DSH or the existing LAN 3443 gateway**. CIDRs match the proxy's direct TCP peer, not forwarded headers. Preserve the external Host (including port), Origin, cookies and WebSocket. Clearing proxy settings keeps paired remote devices.
 
-See [Compatibility](#compatibility) for the supported components and platforms. Locally managed programs, credentials and settings can be removed from the panel; VPS files require separate cleanup through the corresponding guide.
+See [Compatibility](#compatibility) for the supported components and platforms. Locally managed programs, credentials and settings can be removed from the panel.
 
 </details>
 
@@ -344,9 +332,9 @@ Three layers: the Host face for discovery, pairing, HTTPS, loopback proxying, an
 
 - Use the LAN listener only on a trusted home, office, or hotspot network; do not add your own port forwarding.
 - A remote origin is publicly reachable, but unpaired requests cannot enter DSH; turn the remote switch off when it is not needed.
-- cpolar downloads a pinned official build only after confirmation and verifies its size and SHA-256. It installs no system service, PATH entry, or startup task, and plugin cleanup removes its managed files.
-- cloudflared likewise downloads a pinned build from the official GitHub Release only after confirmation and verifies the exact size and SHA-256, and it launches the client with automatic updates disabled so the running binary is always the verified one. A quick tunnel needs no account, token, or DNS record; a named tunnel token is stored only in the plugin private directory and reaches cloudflared through the environment, and cleanup deletes every file it manages.
-- Self-hosted FRP downloads pinned official `frpc` only after confirmation and verifies the origin, exact size, SHA-256, archive paths, and executable version. The shared token never appears in status, diagnostics, or attachment-plan responses. Copying a server template, or explicitly copying a token-bearing attach config after re-entering its token, places it on the system clipboard; clear it after use. Local cleanup removes only plugin-managed files. Managed VPS deployments require separate uninstall-script or one-click cleanup; attaching to an existing frps neither changes nor cleans up that VPS. Automatic deployment and server cleanup require SSH host-key verification against the VPS console.
+- The cpolar and Tailscale Funnel channels were removed; their historical configuration stays on disk but is no longer read.
+- cloudflared likewise downloads a pinned build from the official GitHub Release only after confirmation and verifies the exact size and SHA-256, and it launches the client with automatic updates disabled so the running binary is always the verified one. A named tunnel token is stored only in the plugin private directory and reaches cloudflared through the environment, and cleanup deletes every file it manages.
+- SakuraFrp downloads pinned official `frpc` only after confirmation and verifies the origin, exact size, and SHA-256. The SakuraFrp access token is stored only in the plugin private directory and never appears in status, diagnostics, or tunnel-list responses. The generated frpc config lives in the same private directory and is deleted by cleanup.
 - A paired device is a fully trusted DeepSeek Harness operator and can run tools on the computer; revoke lost devices from the computer.
 - The mobile gateway proxies requests as a local DSH operator and supports `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, and `DELETE` on ordinary plugin routes; writes still require a paired Session, exact Origin, and CSRF validation. Third-party plugins must not treat the upstream loopback Host as proof that the client is physically local to the computer.
 - The LAN gateway listens only while Mobile Access is enabled; with it off, DSH keeps running normally on the computer.
@@ -375,13 +363,10 @@ Version 0.5.2 keeps the DSH host peer names but does not block installation by D
 | Channel | Windows x64 | Linux x64 | Linux arm64 | macOS |
 | --- | --- | --- | --- | --- |
 | Local network | Yes (firewall automated) | Yes (open the firewall yourself) | Yes | Yes |
-| Tailscale Funnel | Yes (bundled) | Yes (bundled) | Yes (bundled) | No |
-| cpolar | Yes (on-demand) | Yes (on-demand) | Yes (on-demand) | No |
-| cloudflared quick/named tunnel | Yes (on-demand) | Yes (on-demand) | Yes (on-demand) | Yes, x64/arm64 (on-demand) |
-| Self-hosted FRP | Yes (on-demand) | Yes (on-demand) | Yes (on-demand) | Yes (on-demand) |
-| Own reverse proxy | Yes (config only) | Yes (config only) | Yes (config only) | Yes (config only) |
+| cloudflared named tunnel | Yes (on-demand) | Yes (on-demand) | Yes (on-demand) | Yes, x64/arm64 (on-demand) |
+| SakuraFrp | Yes (on-demand frpc) | Yes (on-demand frpc) | Yes (on-demand frpc) | Yes (on-demand frpc) |
 
-On macOS, local network, cloudflared, self-hosted FRP and the own reverse proxy work; Funnel and cpolar have no managed macOS component yet. The diagnostics firewall check currently covers Windows only and reports “not applicable” elsewhere.
+On macOS, local network, cloudflared and SakuraFrp all work. The diagnostics firewall check currently covers Windows only and reports “not applicable” elsewhere.
 
 | DSH Mobile plugin | Verified DeepSeek Harness version |
 | --- | --- |
@@ -417,7 +402,7 @@ On macOS, local network, cloudflared, self-hosted FRP and the own reverse proxy 
 
 </details>
 
-Existing apps (0.3.3 and later) do not need re-pairing. cpolar users should use app 0.3.15 or later because earlier apps may time out before a slow first load over the free route finishes; earlier apps also use a different status-bar strategy. The 0.4.0 app adds the multi-device list, startup behavior, and computer-side revocation status; older apps continue to connect to their saved single device. App 0.1.3 or earlier requires reinstalling and pairing again.
+Existing apps (0.3.3 and later) do not need re-pairing; earlier apps use a different status-bar strategy. The 0.4.0 app adds the multi-device list, startup behavior, and computer-side revocation status; older apps continue to connect to their saved single device. App 0.1.3 or earlier requires reinstalling and pairing again.
 
 The current stable Android app is 0.6.2 (build 78), adding page zoom and improving system-area handling and encrypted-record reliability. Package identity, signing and the pairing/renewal protocol remain compatible without requiring re-pairing. Plugin and app version numbers do not need to match; connections check protocol and minimum-version requirements. Features with additional native requirements state the app version they need.
 

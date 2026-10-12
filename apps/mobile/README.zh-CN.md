@@ -1,4 +1,4 @@
-# DeepSeek Harness Android App
+﻿# DeepSeek Harness Android App
 
 [English](README.md) · [返回项目首页](../../README.md)
 
@@ -42,9 +42,9 @@ App 同步版本并重新构建，原生功能、包名及配对／续期协议�
 
 ### 连接恢复与证书
 
-托管部署的自建 FRP 使用公开 CA 的 HTTPS 域名或公网 IPv4 地址，需要 Android App 0.3.3 或更新版本。0.4.6 起提供的“接入既有 frps”可沿用公开 CA 配对，也可选公网 IPv4 自签入口；后者需要 0.4.6 或更新的 App。详见[接入指南](../../docs/ATTACH_EXISTING_FRPS.md)；受支持的旧 App 仍可使用局域网、cpolar 和 Tailscale Funnel。
+远程通道与局域网一样配对：SakuraFrp 通道由电脑端使用插件私有 CA 终结 TLS，App 会在配对时固定该 CA。受支持的旧 App 仍可使用局域网和 cloudflared 命名隧道。
 
-手动或自动部署 VPS、核对主机指纹、清理和排障请见[自建 FRP 使用指南](../../docs/SELF_HOSTED_FRP.md)。
+固定的 CA 材料与配对设备记录保存在 Android Keystore；在电脑端移动访问面板删除设备即撤销其令牌。
 
 首次配对后，App 使用 Android Keystore 加密保存设备记录，包括可随时撤销的长期设备 token 和固定的 CA。以后只向原先保存的精确 Origin 发送设备 token，以换取短期 Web 会话。电脑的局域网 IP 变化后，App 会扫描默认端口，用稳定的 DSH 安装标识找回同一台电脑并更新地址。cpolar 免费地址等远程 Origin 失效后无法从旧地址发现新地址，需要扫描电脑端当前远程二维码，用一次性配对 token 验证新 Origin；App 不会把旧设备 token 发送给该新地址。发现过程不会暴露设备 token 或 Session 凭据。
 

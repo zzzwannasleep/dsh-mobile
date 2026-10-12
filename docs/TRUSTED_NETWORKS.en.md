@@ -1,4 +1,4 @@
-# Additional trusted networks
+﻿# Additional trusted networks
 
 [中文](TRUSTED_NETWORKS.md) · [Back to the LAN guide](../README.en.md#local-network)
 
@@ -23,4 +23,4 @@ DSH Mobile's default Windows HTTPS / Discovery inbound rules allow only `LocalSu
 
 A routed network may not support LAN broadcast discovery. If the computer is not discovered, use its displayed pairing link or QR code; routing, firewall access, and the HTTPS entry must still work. Adding an IPv6 CIDR does not create an IPv6 listener.
 
-This setting controls source access to the LAN Gateway, not source CIDRs for an external reverse proxy. Configure that separately with the [own HTTPS reverse proxy guide](SELF_HOSTED_ORIGIN.en.md). Do not expose the LAN Gateway or private HTTP backend directly to the public internet.
+This setting controls source access to the LAN Gateway, not source CIDRs for an external reverse proxy. With your own reverse proxy, keep the original Host (including port) and WebSocket intact, and never expose the LAN Gateway or private HTTP backend directly to the public internet.

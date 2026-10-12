@@ -579,9 +579,19 @@ body:has(.dshm-shell) :is(input,textarea,[contenteditable=true],[contenteditable
 .dshm-shell [data-plan-review-key]>section>div:last-child>div:last-child>button:first-child{grid-column:1/-1}
 .dshm-shell [data-plan-review-key]>section>div:last-child button{width:100%;min-height:44px}
 }
+/* The drawer renders the stock sidebar's global panel rows; the plugin
+   manager is a computer-administration surface (its panel row is the only
+   place the main UI links to it) and stays off the phone shell. Labels are
+   locale-owned by DSH's sidebar dictionary (zh/en are the shipped locales);
+   a renamed label only reverts to stock visibility, it never breaks layout. */
+.dshm-drawer nav[aria-label="全局面板"] button[aria-label="插件"]{display:none}
+.dshm-drawer nav[aria-label="Global panels"] button[aria-label="Plugins"]{display:none}
+/* Wide viewports dock the sidebar; the conversation column should use the
+   reclaimed width instead of keeping the desktop's fixed 748px cap with
+   large blank margins on both sides. */
 @media(min-width:900px){
 .dshm-shell{grid-template-columns:auto minmax(0,1fr)}
-.dshm-main{grid-area:1/2}
+.dshm-main{grid-area:1/2;--dsh-chat-content-width:min(1000px,100%)}
 .dshm-drawer{position:static;grid-area:1/1;box-shadow:none}
 .dshm-drawer[data-open=true]{width:340px;box-shadow:none}
 .dshm-drawer[data-open=false]{width:56px}

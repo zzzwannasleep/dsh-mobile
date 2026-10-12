@@ -15,8 +15,8 @@ export type DiagnosticReason =
   | 'lan-setup-required' | 'network-unavailable' | 'network-interface' | 'network-fixed'
   | 'lan-ready' | 'lan-off'
   | 'firewall-ready' | 'firewall-missing' | 'firewall-unknown'
-  | 'remote-off' | 'remote-ready' | 'remote-origin-ready' | 'remote-rate-limited' | 'remote-fake-ip' | 'remote-unreachable'
-  | 'remote-needs-login' | 'remote-connecting' | 'remote-controller-error'
+  | 'remote-off' | 'remote-ready' | 'remote-rate-limited' | 'remote-unreachable'
+  | 'remote-connecting' | 'remote-controller-error'
   | 'competing-remote-channel'
   | 'phone-network-unknown'
 
@@ -103,51 +103,37 @@ export function hasCompetingRemoteChannelBoot(rows: readonly { readonly kind: st
 
 const REMOTE_ERROR_GUIDANCE: Readonly<Record<string, string>> = Object.freeze({
   component_missing: '重新安装完整插件包。',
-  funnel_permission_required: '继续完成 Tailscale Funnel 授权。',
-  funnel_https_required: '继续完成 Tailscale HTTPS 授权。',
-  funnel_start_failed: '重新打开授权页并允许 Funnel。',
-  funnel_start_timeout: '检查网络后点击“重新连接”。',
-  tailscale_dns_missing: '确认 Tailscale 登录仍有效后重新连接。',
   sidecar_launch_failed: '重新安装完整插件包后重试。',
   sidecar_stopped: '点击“重新连接”。',
   sidecar_exited: '点击“重新连接”；仍失败时复制诊断报告。',
   control_channel_failed: '点击“重新连接”。',
-  cpolar_component_missing: '先安装 cpolar 官方组件。',
-  cpolar_component_invalid: '彻底移除 cpolar 组件后重新安装。',
-  cpolar_config_missing: '保存 cpolar Authtoken 后重试。',
-  cpolar_config_invalid: '重新保存 cpolar Authtoken。',
-  cpolar_start_timeout: '检查网络后点击“重新连接”。',
-  cpolar_stopped: '点击“重新连接”。',
-  cpolar_exited: '点击“重新连接”；仍失败时复制诊断报告。',
   cloudflared_component_missing: '先安装 cloudflared 官方组件。',
   cloudflared_component_invalid: '彻底移除 cloudflared 组件后重新安装。',
   cloudflared_port_unavailable: '无法分配本机远程网关端口，请重试。',
+  cloudflared_tunnel_config_missing: '先填写命名隧道的令牌、主机名和端口。',
+  cloudflared_tunnel_port_unavailable: '本机网关端口被占用；换一个隧道端口或停用占用它的程序。',
   cloudflared_launch_failed: '重新安装 cloudflared 官方组件后重试。',
   cloudflared_start_timeout: '检查网络后点击“重新连接”。',
   cloudflared_stopped: '点击“重新连接”。',
   cloudflared_exited: '点击“重新连接”；仍失败时复制诊断报告。',
   cloudflared_invalid_output: 'cloudflared 返回了无法识别的状态。',
-  cloudflared_invalid_origin: 'cloudflared 返回的公网地址未通过校验。',
-  origin_config_missing: '先保存自有反向代理配置。',
-  origin_config_invalid: '重新保存自有反向代理配置。',
-  origin_listen_port_in_use: '更换 HTTP 后端端口；不要使用局域网的 3443、DSH 自身的 3080，或已被 cloudflared 隧道占用的 3444。',
-  origin_listen_address_unavailable: '监听地址不属于当前电脑，请重新选择本机的私网 IPv4 地址。',
-  origin_gateway_start_failed: '检查 HTTP 后端监听地址和端口后重新连接。',
-  frp_component_missing: '先安装 FRP 官方组件。',
-  frp_component_invalid: '彻底清理 FRP 组件后重新安装。',
-  frp_config_missing: '先保存自建 FRP 连接配置。',
-  frp_config_verify_failed: '检查服务器地址、端口、Token 和公开域名。',
-  frp_vhost_publicly_reachable: '将 frps 的 HTTP vhost 监听限制到 127.0.0.1。',
-  frp_vhost_probe_failed: '确认 VPS 地址可解析后重新连接。',
-  frp_launch_failed: '重新安装 FRP 官方组件后重试。',
-  frp_start_timeout: '确认 frps、Caddy 和域名解析正常后重新连接。',
-  frp_proxy_name_in_use: '该 frps 上已有同名代理：在另一台 DSH 电脑上关闭自建 FRP，或在 frps 上清掉该代理后重新连接。',
-  frp_remote_port_in_use: '公网入口端口被其他代理占用：改用其他入口端口后重新连接。',
-  frp_proxy_start_failed: '查看 frps 日志与 allowPorts，确认它能接受该代理名和入口端口。',
-  frp_discovery_mismatch: '公开域名连接到了另一台电脑，请核对 Caddy 与 frps 配置。',
-  frp_discovery_invalid: '公开域名返回了非 DSH Mobile 响应。',
-  frp_stopped: '点击“重新连接”。',
-  frp_exited: '检查 VPS 配置后重新连接；仍失败时复制诊断报告。',
+  sakurafrp_token_missing: '先保存 SakuraFrp 访问密钥。',
+  sakurafrp_token_invalid: '访问密钥无效或已失效，请重新保存。',
+  sakurafrp_api_unreachable: '无法连接 api.natfrp.com，请检查网络后重试。',
+  sakurafrp_api_error: 'SakuraFrp 接口返回错误，稍后重试；仍失败时复制诊断报告。',
+  sakurafrp_tunnel_missing: '所选隧道不存在或已被删除，请重新选择隧道。',
+  sakurafrp_tunnel_banned: '该隧道已被封禁，请在 SakuraFrp 面板处理后重新选择。',
+  sakurafrp_tunnel_type_unsupported: '当前仅支持 TCP 类型隧道，请在 SakuraFrp 创建 TCP 隧道。',
+  sakurafrp_tunnel_locked: '该隧道已锁定编辑，请在 SakuraFrp 面板解除编辑锁定。',
+  sakurafrp_tunnel_port_unavailable: '隧道指向的本机端口被占用；停用占用它的程序或修改隧道本地端口。',
+  sakurafrp_entry_unknown: '无法确定隧道公网入口，请在 SakuraFrp 面板确认隧道已分配远程端口。',
+  sakurafrp_component_missing: '先安装官方 frpc 组件。',
+  sakurafrp_component_invalid: '彻底清理 frpc 组件后重新安装。',
+  sakurafrp_config_fetch_failed: '获取隧道配置失败，请稍后重新连接。',
+  sakurafrp_launch_failed: '重新安装 frpc 官方组件后重试。',
+  sakurafrp_start_timeout: '确认隧道在线、节点可用后点击“重新连接”。',
+  sakurafrp_stopped: '点击“重新连接”。',
+  sakurafrp_exited: '确认 SakuraFrp 隧道状态后重新连接；仍失败时复制诊断报告。',
   gateway_start_failed: '确认 DSH 正在运行后重新连接。',
 })
 
@@ -179,11 +165,8 @@ function remoteSuffix(origin: string | undefined): string {
   if (origin === undefined) return '未分配'
   try {
     const hostname = new URL(origin).hostname
-    if (hostname.endsWith('.ts.net')) return '*.ts.net'
     if (hostname.endsWith('.trycloudflare.com')) return '*.trycloudflare.com'
-    for (const suffix of ['.cpolar.cn', '.cpolar.io', '.cpolar.top', '.cpolar.com']) {
-      if (hostname.endsWith(suffix)) return `*${suffix}`
-    }
+    if (hostname.endsWith('.natfrp.io') || hostname.endsWith('.nyat.app')) return `*.${hostname.split('.').slice(-2).join('.')}`
     return '公共 HTTPS 地址'
   } catch {
     return '地址格式无效'
@@ -502,7 +485,7 @@ export async function collectConnectionDiagnostics(
   probes: DiagnosticProbes = {},
 ): Promise<ConnectionDiagnostics> {
   const checks: DiagnosticCheck[] = []
-  const remoteProbe = snapshot.remote.provider !== 'origin' && snapshot.remote.running && snapshot.remote.state === 'ready' && snapshot.remote.origin !== undefined
+  const remoteProbe = snapshot.remote.running && snapshot.remote.state === 'ready' && snapshot.remote.origin !== undefined
     ? (probes.remote ?? defaultRemoteProbe)(snapshot.remote.origin)
     : Promise.resolve<RemoteObservation>({ state: 'not-applicable' })
   const [firewall, remoteObservation] = await Promise.all([
@@ -561,11 +544,6 @@ export async function collectConnectionDiagnostics(
 
   if (!snapshot.remote.running || snapshot.remote.state === 'off') {
     checks.push(check('remote', 'info', 'remote-off', '远程通道', '当前未启用。', undefined, { provider: snapshot.remote.provider }))
-  } else if (snapshot.remote.provider === 'origin' && snapshot.remote.state === 'ready') {
-    checks.push(check('remote', 'info', 'remote-origin-ready', '远程通道',
-      '私网 HTTP 后端已就绪；未检测公网 HTTPS、证书或 WebSocket 连通性。',
-      '在手机上经反向代理验证连接；代理须保留原始 Host（含端口）并支持 WebSocket。',
-      { provider: 'origin' }))
   } else if (snapshot.remote.state === 'ready' && snapshot.remote.origin !== undefined) {
     const endpointSuffix = remoteSuffix(snapshot.remote.origin)
     const facts = {
@@ -594,28 +572,17 @@ export async function collectConnectionDiagnostics(
           : '公共地址可达，但本次检查观察到服务限流。',
         '稍后重试；旧会话会按需加载以减少流量。', facts,
       ))
-    } else if (snapshot.remote.provider === 'tailscale' && remoteObservation.fakeIp === true) {
-      checks.push(check(
-        'remote',
-        'error',
-        'remote-fake-ip',
-        '远程通道',
-        'Tailscale 地址被当前 VPN 或 DNS 代理接管，但 TLS 链路未建立。',
-        '切换 VPN 节点或代理模式；仍失败时改用 cpolar。',
-        facts,
-      ))
     } else {
       checks.push(check('remote', 'error', 'remote-unreachable', '远程通道', '提供方显示已就绪，但公共地址暂不可达。', '点击“重新连接”；仍失败时检查提供方状态。', facts))
     }
-  } else if (snapshot.remote.state === 'starting' || snapshot.remote.state === 'connecting' || snapshot.remote.state === 'needs-login') {
-    const needsLogin = snapshot.remote.state === 'needs-login'
+  } else if (snapshot.remote.state === 'starting' || snapshot.remote.state === 'connecting') {
     checks.push(check(
       'remote',
       'warning',
-      needsLogin ? 'remote-needs-login' : 'remote-connecting',
+      'remote-connecting',
       '远程通道',
-      needsLogin ? '等待完成 Tailscale 登录。' : '仍在建立连接。',
-      needsLogin ? '返回远程页继续登录。' : '等待片刻后重新检查。',
+      '仍在建立连接。',
+      '等待片刻后重新检查。',
       { provider: snapshot.remote.provider },
     ))
   } else {

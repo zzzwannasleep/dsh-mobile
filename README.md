@@ -41,9 +41,9 @@
   <sub><a href="https://github.com/saya-ch/dsh-mobile/releases/tag/android-v0.6.2">版本说明与校验文件</a></sub>
 </p>
 
-DSH Mobile 是一个 DeepSeek Harness 插件，让手机浏览器或 Android App 通过局域网，或可选的 Tailscale Funnel、cpolar、cloudflared、自建 FRP 或自有反向代理远程通道连接电脑，继续使用同一份会话、工作区、消息和工具。电脑端分别启停局域网与远程访问、分别管理配对授权；Android App 统一显示已配对电脑。插件不修改 DeepSeek Harness 源码。
+DSH Mobile 是一个 DeepSeek Harness 插件，让手机浏览器或 Android App 通过局域网，或可选的 cloudflared 命名隧道、SakuraFrp 远程通道连接电脑，继续使用同一份会话、工作区、消息和工具。电脑端分别启停局域网与远程访问、分别管理配对授权；Android App 统一显示已配对电脑。插件不修改 DeepSeek Harness 源码。
 
-移动访问使用独立 HTTPS 与设备配对；Android App 固定局域网私有 CA，公开远程通道使用系统信任的证书；自签 FRP 入口还需由 0.4.6 App 在配对时固定远程 CA。
+移动访问使用独立 HTTPS 与设备配对；Android App 固定局域网私有 CA；cloudflared 命名隧道使用 Cloudflare 边缘证书，SakuraFrp 通道由电脑端以配对私有 CA 终结 TLS，App 在配对时固定该 CA。
 
 它还能在 DSH 对话里用 `/mobile <需求>` 定制手机端。
 
@@ -52,7 +52,7 @@ DSH Mobile 是一个 DeepSeek Harness 插件，让手机浏览器或 Android App
 - **在手机上继续电脑端的工作**：同一份会话、工作区、消息和工具，实时同步。
 - **用对话定制手机端**：在 DSH 对话里提出布局、交互或功能需求；文件修改完成后，手机页面通常会自动刷新。
 - **专属触屏布局**：会话抽屉、工具详情、设置、提问卡片和输入栏都按手机重新组织；App 跟随系统语言（简/英/意），插件界面跟随 DSH 语言。
-- **多种远程通道**：Tailscale、cpolar、cloudflared 快速/命名隧道、自建 FRP、自有反向代理，按网络任选。
+- **多种远程通道**：SakuraFrp（国内节点 TCP 隧道，默认通道）或 cloudflared 命名隧道（固定域名），按网络任选；`DSH_MOBILE_REMOTE_PROVIDER` 可显式固定其一。
 - **配对与多设备**：扫码、链接或密钥配对一次；切换 Wi-Fi、热点或 IP 后通常自动恢复；App 在一个列表中显示局域网和远程配对的电脑，定期检测可达状态，并支持切换、重新配对或删除本地记录。
 - **一键诊断与放行**：检查版本、网关、网卡、防火墙和远程通道，生成脱敏报告；被拦截的第三方插件连接按确切路径一键放行。
 - **任务系统通知**：任务完成与待输入以 Android 系统通知提醒，可在 App 内的 DSH“通用设置”中开启，锁屏文本脱敏。
@@ -144,27 +144,23 @@ dsh plugin --profile web add dshmarket
 
 ### 远程访问
 
-适合手机离开电脑所在网络后使用。远程访问默认关闭，手机不需要另外安装 Tailscale、cpolar、cloudflared 或 FRP。
+适合手机离开电脑所在网络后使用。远程访问默认关闭，手机不需要另外安装 cloudflared 或 frpc。
 
-远程服务可能受带宽和连接限额影响：[cpolar 免费方案](https://svip.cpolar.com/pricing) 当前为 1 Mbps，[Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel#requirements-and-limitations) 也存在不可配置的带宽限制，cloudflared 的 quick tunnel 由 Cloudflare 免费提供、地址随机且有限流。DSH Mobile 使用静态资源 gzip、WebSocket 长连接和顶部按需加载改善体验；会话的历史窗口与分页大小由 DSH 决定，插件无法提高服务商限额。
+远程服务可能受带宽和连接限额影响：cloudflared 命名隧道由 Cloudflare 免费提供且有限流；SakuraFrp 隧道按其套餐与节点规则计费限速。DSH Mobile 使用静态资源 gzip、WebSocket 长连接和顶部按需加载改善体验；会话的历史窗口与分页大小由 DSH 决定，插件无法提高服务商限额。
 
 页面能打开但一直“重连中”，应先区分 WebSocket 升级失败、慢速数据同步和心跳超时，操作见[慢链路与反复重连指南](docs/SLOW_CONNECTIONS.md)。0.5.4 还提供按确切路径启用的 WebSocket 压缩，默认关闭；长会话或计量网络可按指南尝试，并对比实际传输量。
 
 | 连接方式 | 需要准备 | 地址特点与注意事项 |
 | --- | --- | --- |
-| cpolar | cpolar 账号与 Authtoken | 国内网络可优先尝试；免费临时地址可能变化 |
-| cloudflared 快速隧道 | 无需账号或域名 | 临时随机地址；不支持 SSE，[即时通知存在限制](docs/CLOUDFLARE_TUNNEL.md#快速隧道的功能限制) |
+| SakuraFrp（默认） | SakuraFrp 账号与访问密钥，创建一条 TCP 隧道 | 入口为节点域名/IP + 远程端口；App 配对时固定插件私有 CA |
 | cloudflared 命名隧道 | Cloudflare 账号与域名 | 固定域名；[配置指南](docs/CLOUDFLARE_TUNNEL.md) |
-| Tailscale Funnel | Tailscale 登录与 Funnel 授权 | 中国大陆网络可能不稳定 |
-| 自建 FRP | 已有 VPS，域名或真实公网 IPv4 | 需管理服务器；[部署](docs/SELF_HOSTED_FRP.md)或[接入既有 frps](docs/ATTACH_EXISTING_FRPS.md) |
-| 自有反向代理 | 已有公开 HTTPS 代理 | 插件只提供私有认证后端；[配置指南](docs/SELF_HOSTED_ORIGIN.md) |
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/saya-ch/dsh-mobile/main/assets/screenshots/remote-access.png" width="82%" alt="DSH Mobile 远程访问与通道选择">
 </p>
 
 1. 在 DeepSeek Harness 左下角打开 **移动访问 → 远程**，按上表选择通道，完成登录或配置。
-2. 状态变为“远程访问已就绪”后，点击 **生成远程配对二维码**。自有反向代理仅显示“后端已监听”，仍需确认公网 HTTPS 与 WebSocket 可用。
+2. 状态变为“远程访问已就绪”后，点击 **生成远程配对二维码**。
 3. 在 Android App 中选择 **远程访问**，扫描当前二维码完成配对；公开证书入口也可用手机浏览器打开配对链接。
 4. 以后 App 使用保存的地址与凭据自动重连。临时地址改变时，重新扫描电脑端当前二维码验证新地址，不需要清除 App 数据；旧设备 token 不会发送给新 Origin。
 
@@ -172,12 +168,8 @@ dsh plugin --profile web add dshmarket
 <summary>各通道的安装与登录步骤</summary>
 
 在面板选择对应通道后：
-   - **Tailscale Funnel**：点击 **启用远程访问**，在打开的官方页面完成一次 Tailscale 登录；按面板提示继续允许 Funnel，然后返回 DSH 等待连接就绪。
-   - **cpolar**：点击 **安装官方组件**，登录 cpolar 控制台取得 Authtoken，粘贴后点击 **保存并连接**。组件只会在确认后下载到插件私有目录；免费临时地址可能在 DSH 或 cpolar 重启后变化。
-   - **自建 FRP（高级）**：已有 VPS 时，展开 **自建连接**，填写 frps 信息和公开 HTTPS 域名或真实公网 IPv4。可以复制受限的 frps + Caddy 模板手动部署，也可以在 Ubuntu/Debian + systemd 上用 SSH 密钥一键部署；不支持密码登录，也不会覆盖非 DSH Mobile 管理的 Caddy 配置。部署或清理前须到 VPS 控制台核对主机指纹。本机 `frpc` 按需下载校验，VPS 需单独清理。需要 Android App 0.3.3 或更新版本；证书、端口和操作步骤见 [自建 FRP 使用指南](docs/SELF_HOSTED_FRP.md)。
-   - **自有反向代理**：展开 **自建连接 → 自有反向代理**，填写公网 HTTPS 地址（支持自定义端口）、私有监听 IPv4、独立 HTTP 后端端口（默认 3444）和代理来源 CIDR，再点击 **保存并启动后端**。适合已有 Lucky/Nginx/Caddy 的用户，无需隧道组件；需要 Android App 0.4.0 或更高版本。详见 [自有反向代理指南](docs/SELF_HOSTED_ORIGIN.md)。
-   - **cloudflared 快速隧道**：点击 **安装官方组件**，插件在确认后从官方发布页下载固定版本到插件私有目录，随后自动申请一个临时公网地址（quick tunnel），**无需注册或登录**。适合不想注册账号的用户；quick tunnel 地址每次重连都会变化，官方定位为测试用途、有限流且无可用性保证，请勿用于必须长期可达的生产访问，只适合临时或验证场景。
-   - **cloudflared 命名隧道**：已有 Cloudflare 账号和域名时，把隧道类型切到 **命名隧道**，填入连接器令牌、公网域名与本机转发端口，即可获得重启后不变的固定地址（令牌只存私有目录、只经环境变量传给 cloudflared）。步骤见 [Cloudflare 命名隧道](docs/CLOUDFLARE_TUNNEL.md)。
+   - **cloudflared 命名隧道**：已有 Cloudflare 账号和域名时，填入连接器令牌、公网域名与本机转发端口，即可获得重启后不变的固定地址（令牌只存私有目录、只经环境变量传给 cloudflared）。步骤见 [Cloudflare 命名隧道](docs/CLOUDFLARE_TUNNEL.md)。
+   - **SakuraFrp**：在 [SakuraFrp 用户面板](https://www.natfrp.com/user/) 创建一条 **TCP 类型** 隧道（本地目标可留空，插件会自动把本地指向设为本机 DSH 网关端口），复制「访问密钥」粘贴到面板并保存，然后在隧道列表里选择该隧道并连接。frpc 官方组件按需下载校验到插件私有目录；远程入口是节点域名与远程端口（如 `https://frp-ski.com:58789`），App 配对时会固定插件私有 CA（浏览器直接访问会提示证书不受信任，属预期）。注意：内地节点按平台合规要求仅允许 HTTPS 访问；若隧道开启了「访问认证」，请在 SakuraFrp 面板关闭，否则手机 IP 变化后需要重新授权。
 
 </details>
 
@@ -186,13 +178,9 @@ dsh plugin --profile web add dshmarket
 
 > **远程通知说明**：浏览器的 `Notification` 权限按 Origin 分别授权，网页系统通知只显示在运行该网页的设备上。Android App 的任务提醒是独立的 0.4.0 功能，需要在 App 内 DSH 的 **设置 → 通用设置** 中主动开启，且依赖 WebView 页面仍存活；它不是通用的后台推送。需要可靠的后台推送时，请使用你已配置的服务端 webhook 或机器人通道。
 
-Tailscale Funnel 覆盖范围广，但在中国大陆网络下可能不稳定。其运行组件把公开监听生命周期绑定到父进程和受限控制通道；父进程退出、控制通道关闭或显式停止时会结束当前代次并清理资源。cpolar 更适合国内网络；自建 FRP 适合已有 VPS、希望避开公共服务带宽限制的用户。cloudflared 有两种模式：快速隧道不需要账号或登录，但地址随机、每次重连都会变化，[官方定位为测试用途](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)且无可用性保证，因此只适合临时或验证场景；命名隧道使用 Cloudflare 账号令牌，能保留重启后不变的固定公网域名。中国大陆 VPS 上的未备案域名可能被云厂商拦截，此时可使用公网 IPv4 模式。插件会校验按需下载的固定版本组件；本机托管的配置与程序保存在 `$DSH_HOME/mobile-access/`，可在面板中清理。VPS 侧的文件须按自建连接指南单独清理。
+cloudflared 命名隧道使用 Cloudflare 账号令牌，能保留重启后不变的固定公网域名，但有限流且依赖 Cloudflare 网络。SakuraFrp 适合需要国内节点与固定端口的用户；仅支持 TCP 类型隧道，远程入口是节点的 IP 与端口，请遵守 SakuraFrp 的服务条款（公开游戏服务器等用途有专门限制）。插件会校验按需下载的固定版本组件；本机托管的配置与程序保存在 `$DSH_HOME/mobile-access/`，可在面板中清理。
 
-自建 FRP 的托管部署使用指向 DSH 回环网关的 HTTP vhost：VPS 上的明文 vhost 只允许回环访问，由 Caddy 提供公网 HTTPS。0.4.6 新增“接入既有 frps”，不会安装或改动服务器；公开 CA 档仍需受限 HTTP vhost 与 Caddy，自签档则用 frps TCP 透传至电脑端 HTTPS 网关，须由 0.4.6 Android App 在配对时固定 CA。自签档目前面向公网 IPv4，旧版 App 不支持；两档都不开放任意 FRP 配置。frps 的 `proxyBindAddr` 是全局代理监听设置，不能只为新增 TCP 入口调整而忽略已有明文 vhost。[接入指南](docs/ATTACH_EXISTING_FRPS.md)。
-
-自有反向代理的 HTTP 后端只允许留在可信私网；**不要把它映射到公网，也不要绕过它直连 DSH 或现有 LAN 3443**。来源 CIDR 匹配代理的直接 TCP 来源，不信任转发头；反代须保留外部 Host（含端口）、Origin、Cookie 和 WebSocket。清除代理配置不会删除已配对远程设备。
-
-各通道的系统和组件支持范围见[兼容性](#兼容性)。本机托管的程序、凭据与配置可从面板清理；VPS 上的文件必须按对应指南单独清理。
+各通道的系统和组件支持范围见[兼容性](#兼容性)。本机托管的程序、凭据与配置可从面板清理。
 
 </details>
 
@@ -345,9 +333,9 @@ flowchart LR
 
 - 局域网监听只用于可信家庭、办公网络或可信热点；不要自行做端口转发。
 - 远程地址可从公网到达，但未配对请求无法进入 DSH；不使用时应关闭远程开关。
-- cpolar 仅在用户确认后下载固定官方版本并校验大小和 SHA-256；不会安装系统服务、写入 PATH 或设置开机启动，插件清理会删除其托管文件。
-- cloudflared 同样仅在用户确认后从官方 GitHub Release 下载固定版本并校验精确大小和 SHA-256，且启动时关闭自动更新，以保证运行的始终是已校验的那份二进制；快速隧道不需要账号、Token 或 DNS 记录；命名隧道令牌只存插件私有目录、只经环境变量传给 cloudflared，清理时删除插件托管的全部文件。
-- 自建 FRP 仅在用户确认后从官方 Release 下载固定版本 `frpc`，校验来源、精确大小、SHA-256、压缩包路径和可执行文件版本；共享 Token 不会出现在状态、诊断或接入清单响应中。复制服务器模板，或重新输入 Token 后显式复制含 Token 的接入配置时，它会进入系统剪贴板，请粘贴后及时清除。本机清理只删除插件管理的文件；托管部署的 VPS 需用面板卸载脚本或一键清理单独清除，接入既有 frps 则不会改动或清理你的 VPS。自动部署与一键清理前都需核对 SSH 主机指纹。
+- cpolar 与 Tailscale Funnel 通道已移除；已删除通道的历史配置保留在磁盘上但不再被读取。
+- cloudflared 仅在用户确认后从官方 GitHub Release 下载固定版本并校验精确大小和 SHA-256，且启动时关闭自动更新，以保证运行的始终是已校验的那份二进制；命名隧道令牌只存插件私有目录、只经环境变量传给 cloudflared，清理时删除插件托管的全部文件。
+- SakuraFrp 仅在用户确认后从官方 Release 下载固定版本 `frpc` 并校验来源、精确大小和 SHA-256；SakuraFrp 访问密钥只保存在插件私有目录，不会出现在状态、诊断或隧道列表响应中。生成的 frpc 配置文件与隧道令牌保存在同一私有目录，清理时一并删除。
 - 配对设备拥有控制电脑端 DeepSeek Harness 的能力，应视为完全可信设备；丢失手机后应在电脑端撤销设备。
 - 移动网关以 DSH 本机操作者身份代理请求，支持普通插件路由的 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`；写请求仍校验配对 Session、精确 Origin 与 CSRF。第三方插件不能把上游回环 Host 当成请求来自电脑物理本机的证明。
 - 移动网关开启时才监听局域网；关闭后 DeepSeek Harness 仍正常在电脑本机运行。
@@ -376,13 +364,10 @@ flowchart LR
 | 通道 | Windows x64 | Linux x64 | Linux arm64 | macOS |
 | --- | --- | --- | --- | --- |
 | 局域网 | 支持（自动配防火墙） | 支持（防火墙自理） | 支持 | 支持 |
-| Tailscale Funnel | 支持（随包提供） | 支持（随包提供） | 支持（随包提供） | 不支持 |
-| cpolar | 支持（按需下载） | 支持（按需下载） | 支持（按需下载） | 不支持 |
-| cloudflared 快速/命名隧道 | 支持（按需下载） | 支持（按需下载） | 支持（按需下载） | 支持 x64/arm64（按需下载） |
-| 自建 FRP | 支持（按需下载） | 支持（按需下载） | 支持（按需下载） | 支持（按需下载） |
-| 自有反向代理 | 支持（纯配置） | 支持（纯配置） | 支持（纯配置） | 支持（纯配置） |
+| cloudflared 命名隧道 | 支持（按需下载） | 支持（按需下载） | 支持（按需下载） | 支持 x64/arm64（按需下载） |
+| SakuraFrp | 支持（按需下载 frpc） | 支持（按需下载 frpc） | 支持（按需下载 frpc） | 支持（按需下载 frpc） |
 
-macOS 上局域网、cloudflared、自建 FRP 与自有反向代理可用；Funnel 与 cpolar 暂未提供 macOS 组件。诊断页的防火墙检查目前仅覆盖 Windows，其他系统显示“不适用”。
+macOS 上局域网、cloudflared 与 SakuraFrp 均可用。诊断页的防火墙检查目前仅覆盖 Windows，其他系统显示“不适用”。
 
 | DSH Mobile 插件                         | 验证支持的 DeepSeek Harness 版本                             |
 | ----------------------------------------- | -------------------------------------------------------------- |
@@ -418,7 +403,7 @@ macOS 上局域网、cloudflared、自建 FRP 与自有反向代理可用；Funn
 
 </details>
 
-现有 App（0.3.3 及更新）无需重新配对；cpolar 用户应使用 0.3.15 或更新 App，较早版本可能在免费线路的慢速首次加载完成前超时；更早的 App 还使用不同的状态栏策略。App 0.4.0 才支持多设备列表、启动行为设置和电脑端撤销状态同步；旧版 App 仍可连接已保存的单台设备。App 0.1.3 及更早版本需卸载重装并重新配对。
+现有 App（0.3.3 及更新）无需重新配对；更早的 App 使用不同的状态栏策略。App 0.4.0 才支持多设备列表、启动行为设置和电脑端撤销状态同步；旧版 App 仍可连接已保存的单台设备。App 0.1.3 及更早版本需卸载重装并重新配对。
 
 Android App 当前正式版为 0.6.2（build 78），新增页面缩放，改善系统区域处理与加密设备记录的可靠性；包名、签名及配对／续期协议保持兼容，已有配对无需重建。插件和 App 的版本号不要求相同；连接按协议及最低版本要求检查，具体原生功能另有要求时会说明所需 App 版本。
 

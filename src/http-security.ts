@@ -33,11 +33,22 @@ export interface RequestTarget {
   readonly search: string
 }
 
-/** Parse only origin-form request targets and reject ambiguous slash encodings. */
+/**
+ * Parse only origin-form request targets and reject ambiguous slash encodings.
+ *
+ * SakuraFrp's TLS edge forwards request lines with a protocol-relative target
+ * (`//path`), so one leading double slash is normalized before the strict
+ * rejection. Everything else — backslashes, control characters, and any deeper
+ * `//` sequence that could smuggle an authority — stays refused.
+ */
 export function parseRequestTarget(raw: string | undefined): RequestTarget {
-  if (raw === undefined || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\') || /[\u0000-\u001f\u007f]/u.test(raw)) {
+  if (raw === undefined || !raw.startsWith('/') || raw.includes('\\') || /[\u0000-\u001f\u007f]/u.test(raw)) {
     throw new HttpError(400, 'bad_request')
   }
+  // `//path` from the SakuraFrp edge means `/path`; a longer leading run
+  // collapses the same way. The Host/Origin/CIDR checks that follow still gate
+  // every request exactly as before.
+  if (raw.startsWith('//')) raw = raw.replace(/^\/+/u, '/')
   let parsed: URL
   let decodedPathname: string
   try {
@@ -46,7 +57,7 @@ export function parseRequestTarget(raw: string | undefined): RequestTarget {
   } catch {
     throw new HttpError(400, 'bad_request')
   }
-  if (decodedPathname.includes('\\') || decodedPathname.startsWith('//') || /[\u0000-\u001f\u007f]/u.test(decodedPathname)) {
+  if (decodedPathname.includes('\\') || /[\u0000-\u001f\u007f]/u.test(decodedPathname)) {
     throw new HttpError(400, 'bad_request')
   }
   return Object.freeze({ raw, pathname: parsed.pathname, decodedPathname, search: parsed.search })

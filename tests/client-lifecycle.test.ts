@@ -487,12 +487,14 @@ describe('mobile-control localization', () => {
     expect(CONTROL_STYLES).toContain('dsh-mobile-control__qr img{border-radius:12px;background:#fff')
   })
 
-  it('renders the Mobile Access panel as a bottom sheet on phone viewports', () => {
-    // Below 600px the floating desktop card becomes a full-width sheet docked
-    // to the viewport bottom, clearing the home indicator on the last edge.
+  it('renders the Mobile Access settings as a centered window on desktop and a bottom sheet on phones', () => {
+    // The settings surface is a modal window over a dimmed backdrop instead of a
+    // sidebar-anchored card; below 600px it docks to the viewport bottom and
+    // clears the home indicator on the last edge.
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__backdrop{')
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel{box-sizing:border-box;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)')
     expect(CONTROL_STYLES).toContain('@media(max-width:599px){')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control{left:0;right:0;bottom:0}')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel{width:100%;max-height:min(86dvh,calc(100dvh - 64px));border-radius:18px 18px 0 0;border-bottom:0;padding-bottom:calc(16px + env(safe-area-inset-bottom))}')
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel{left:0;right:0;top:auto;bottom:0;transform:none;width:100%;max-height:min(86dvh,calc(100dvh - 64px));border-radius:18px 18px 0 0;border-bottom:0;padding-bottom:calc(16px + env(safe-area-inset-bottom))')
   })
 
   it('keeps the named-tunnel form masked and never persists the token in the DOM', () => {

@@ -645,18 +645,25 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
   }
   const cloudflaredStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'cloudflared', 'control.json'), false)
   const sakurafrpStore = new JsonMobileAccessControlStore(join(remoteDirectory, 'sakurafrp', 'control.json'), false)
+  // Controller state transitions are otherwise silent, so a tunnel that never
+  // registers leaves no trace. Publish every change to the plugin log.
+  const remoteStatusLogger = (provider: string) => (status: RemoteProviderStatus): void => {
+    logger.info('remote %s state=%s%s', provider, status.state, status.errorCode === undefined ? '' : ` errorCode=${status.errorCode}`)
+  }
   const remoteControllers: Record<RemoteProvider, RemoteProviderController> = {
     cloudflared: new CloudflaredController({
       store: cloudflaredStore,
       executable: cloudflaredComponent.executable,
       tunnel: cloudflaredTunnel,
       createGateway: createRemoteGateway,
+      onStatus: remoteStatusLogger('cloudflared'),
     }),
     sakurafrp: new SakuraFrpController({
       store: sakurafrpStore,
       settings: sakurafrpSettings,
       component: { executable: frpComponent.executable },
       createGateway: createSakuraFrpGateway,
+      onStatus: remoteStatusLogger('sakurafrp'),
     }),
   }
   const remoteProviders = new RemoteProviderCoordinator(initialRemoteProvider, remoteControllers, remoteProviderStore)
@@ -944,9 +951,11 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
           const body = await readJsonObject(request, 4096)
           await remoteProviders.mutate(async () => {
             await sakurafrpSettings.configure({ tunnelId: validateSakuraFrpTunnelId(body.tunnelId) })
-            // A live frpc is bound to the previous tunnel, so the new selection
-            // only takes effect through a restart.
-            if (remoteControllers.sakurafrp.status().enabled) await remoteControllers.sakurafrp.reconnect()
+            // "Save and connect" is the whole flow: reconnect() starts a disabled
+            // provider with the saved tunnel and restarts a live frpc so the new
+            // selection takes effect. Failures land in the published state, not
+            // in this request, so the UI renders the controller's own error.
+            await remoteControllers.sakurafrp.reconnect()
           })
           sendJson(response, 200, remotePayload(), false)
           return
@@ -979,9 +988,9 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
           const body = await readJsonObject(request, 8192)
           await remoteProviders.mutate(async () => {
             await cloudflaredTunnel.configure(mergeSavedCloudflaredTunnelSettings(body, cloudflaredTunnel.settings()))
-            // A live connector is bound to the previous hostname, port and token, so
-            // the new configuration only takes effect through a restart.
-            if (remoteControllers.cloudflared.status().enabled) await remoteControllers.cloudflared.reconnect()
+            // "Save and connect" mirrors the SakuraFrp route: reconnect() starts a
+            // disabled provider and restarts a live connector for the new settings.
+            await remoteControllers.cloudflared.reconnect()
           })
           sendJson(response, 200, remotePayload(), false)
           return

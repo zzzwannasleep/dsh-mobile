@@ -2,6 +2,13 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
+## Unreleased
+
+- Make "Save and connect" actually connect: saving the SakuraFrp tunnel or the cloudflared named tunnel now enables the saved channel (a disabled provider starts with the saved configuration; a live component restarts to apply the new selection) instead of leaving the switch off after saving.
+- Keep a connecting action's status message on screen: the control panel's 1.5 s status poll no longer overwrites an in-flight action's message with the slower provider state, which made every save look like a no-op flash.
+- Rebuild the Mobile Access settings surface as a centered modal window over a dimmed backdrop on desktop (dialog semantics, Escape/backdrop dismissal, focus restore, sticky title bar, two-column provider cards on wide windows); the phone shell keeps the full-width bottom sheet.
+- Log remote provider state transitions (state and error code) to the plugin log so a tunnel that never registers leaves an inspectable trail.
+
 ## 0.7.0 - 2026-10-12
 
 - Remove the Tailscale Funnel, cpolar, self-hosted FRP (deploy/attach/VPS), own reverse proxy and managed Caddy remote channels, including their components, docs, release pipelines and tests; remote access now offers the SakuraFrp channel (default) and the cloudflared named tunnel.

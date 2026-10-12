@@ -677,6 +677,28 @@ describe('SakuraFrp remote channel routes', () => {
     })
   })
 
+  it('starts the saved tunnel through "save and connect" even when the provider was disabled', async () => {
+    // The button promises a connection, so configure must enable the provider:
+    // a disabled controller used to stay off after saving, and the user saw
+    // every click land as a no-op. The absent frpc component ends the attempt
+    // here with a published state instead of a thrown route error.
+    const mounted = await mount()
+    await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/token', JSON.stringify({ token }))
+    vi.stubGlobal('fetch', () => Promise.resolve(new Response(JSON.stringify([
+      { id: 7, name: 'DSH Mobile', type: 'tcp', node: 12, online: true, status: 1, remote: '33080' },
+    ]), { status: 200 })))
+    const saved = await invoke(mounted.route, 'POST', '/api/mobile-access/remote/sakurafrp/configure', JSON.stringify({ tunnelId: 7 }))
+    expect(saved.status).toBe(200)
+    expect(JSON.parse(saved.body)).toMatchObject({
+      running: true,
+      state: 'unavailable',
+      errorCode: 'sakurafrp_component_missing',
+    })
+    expect(JSON.parse(await readFile(
+      join(mounted.directory, 'remote', 'sakurafrp', 'control.json'), 'utf8',
+    ))).toEqual({ version: 1, enabled: true })
+  })
+
   it.each([0, -1, '7', 1.5, true])('rejects an invalid tunnel id with 400 sakurafrp_tunnel_id_invalid: %j', async badTunnelId => {
     const mounted = await mount()
     const rejected = await invoke(

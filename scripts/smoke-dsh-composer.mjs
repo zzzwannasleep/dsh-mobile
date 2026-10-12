@@ -202,7 +202,9 @@ try {
     await phone.setViewportSize(viewport)
     await drawer.locator('button[data-dsh-mobile-toggle]').click()
     await phone.waitForFunction(() => document.querySelector('.dshm-drawer')?.getAttribute('data-open') === 'true')
-    await drawer.getByRole('button', { name: 'Plugins', exact: true }).click()
+    // The Plugins panel entry is hidden in the mobile drawer; the Schedules
+    // panel ("Automation tasks") is the retained representative main panel.
+    await drawer.getByRole('button', { name: 'Automation tasks', exact: true }).click()
     await phone.waitForFunction(() => document.querySelector('.dshm-drawer')?.getAttribute('data-open') === 'false')
     const back = phone.getByRole('button', { name: 'Back to conversation', exact: true })
     await back.waitFor({ state: 'visible', timeout: CLIENT_TIMEOUT_MS })
@@ -246,7 +248,7 @@ try {
   await frames(phone)
   if (await drawer.getAttribute('data-open') !== 'true') await drawer.locator('button[data-dsh-mobile-toggle]').click()
   await phone.waitForFunction(() => document.querySelector('.dshm-drawer')?.getAttribute('data-open') === 'true', undefined, { timeout: CLIENT_TIMEOUT_MS })
-  await drawer.getByRole('button', { name: 'Plugins', exact: true }).click()
+  await drawer.getByRole('button', { name: 'Automation tasks', exact: true }).click()
   await frames(phone)
   const widePanelState = await phone.evaluate(() => ({
     width: window.innerWidth,

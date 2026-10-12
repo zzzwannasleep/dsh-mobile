@@ -31,7 +31,7 @@
 
 > DSH Mobile is a DeepSeek Harness community plugin; the native app supports Android only.
 >
-> **Current stable release: 0.7.1**. "Save and connect" now establishes the remote channel after saving; the Mobile Access settings open as a centered window and the phone drawer hides every plugin entry; remote channels remain SakuraFrp (default) and the cloudflared named tunnel. [Release notes](https://github.com/saya-ch/dsh-mobile/releases/tag/v0.7.1).
+> **Current stable release: 0.7.2**. "Save and connect" establishes the remote channel after saving; the Mobile Access settings open as a two-column centered window, the phone drawer hides every plugin entry, and third-party plugin modules stay off the phone by default. [Release notes](https://github.com/saya-ch/dsh-mobile/releases/tag/v0.7.2).
 >
 > **Version policy**: since plugin **0.6.2**, the Android app and plugin use independent version numbers and releases. Their numbers do not need to match, and a plugin update does not imply an app update. [Compatibility notes](#compatibility).
 
@@ -376,6 +376,7 @@ On macOS, local network, cloudflared and SakuraFrp all work. The diagnostics fir
 | `0.6.3` | `0.2.0-rc.2` and `0.2.1-alpha.2` (packed installation, isolated pairing, mobile boot and WebSocket Workspace reads); additional checks cover the composer, settings and extension Worker timeout, streaming and explicit recovery |
 | `0.7.0` | `0.2.0-rc.2` and `0.2.1-alpha.2` (packed installation, isolated pairing, panel navigation, composer and module-settings smokes; the SakuraFrp live-tunnel end-to-end ran on `0.2.1-alpha.2`); the release CI matrix passed all boot checks |
 | `0.7.1` | `0.2.0-rc.2` (composer smoke) and `0.2.1-alpha.2` (real-browser settings-window probe: backdrop, Escape, phone bottom sheet; full unit suite and packing); the SakuraFrp live-tunnel end-to-end was not re-run for this release and carries over the `0.2.1-alpha.2` record from 0.7.0 |
+| `0.7.2` | `0.2.0-rc.2` (composer smoke) and `0.2.1-alpha.2` (full unit suite and packing); remote-channel startup and probes carry over the 0.7.1 records, not re-run |
 
 <details>
 <summary>Historical version checks</summary>

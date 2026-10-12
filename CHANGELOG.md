@@ -2,6 +2,12 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
+## 0.7.2 - 2026-10-13
+
+- The Mobile Access window becomes a real rectangle: desktop widths open a two-column remote setup (channel choice and live channel side by side) instead of a narrow strip; the phone keeps its single column.
+- Shorten the crowded setup copy: the access-key note, security summary, WebSocket-path intro and component details drop to one line each in every locale.
+- Fix the duplicated "Save and connect" labels: the access-key button says "Save key", leaving the tunnel action as the only "Save and connect".
+
 ## 0.7.1 - 2026-10-13
 
 - Clean mobile frontend: the dedicated phone page no longer loads optional third-party plugin client modules by default (`cleanMobileFrontend`, on by default), so community plugins written for the desktop layout stop leaking their sidebars, toolbars and dialogs into the mobile shell; DSH's own modules and this plugin always load, and a third-party module a remaining module depends on stays loaded automatically. The device module catalog marks hidden third-party modules as clean-mode-hidden instead of pretending they are configurable.

@@ -1,11 +1,13 @@
-import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
 const helperUrl = new URL('../scripts/packed-profile.mjs', import.meta.url)
 const { assertProfileComponents }: { assertProfileComponents: (installed: string) => Promise<void> } = await import(helperUrl.href)
+/** Track the real plugin version so fixtures never drift from package.json on release bumps. */
+const pluginVersion = (JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
 const temporaryRoots: string[] = []
 
 afterEach(async () => {
@@ -15,10 +17,10 @@ afterEach(async () => {
 async function packageFiles(directory: string, component = false): Promise<void> {
   await mkdir(join(directory, 'lib'), { recursive: true })
   await writeFile(join(directory, 'package.json'), JSON.stringify(component ? {
-    name: 'dsh-mobile-question-fixes', version: '0.6.3', type: 'module',
+    name: 'dsh-mobile-question-fixes', version: pluginVersion, type: 'module',
     exports: { '.': './lib/index.mjs', './client': './lib/client.js', './package.json': './package.json' },
   } : {
-    name: 'dsh-mobile', version: '0.6.3', type: 'module',
+    name: 'dsh-mobile', version: pluginVersion, type: 'module',
   }))
   if (component) {
     await writeFile(join(directory, 'lib', 'index.mjs'), 'export function apply() {}\n')
@@ -65,7 +67,7 @@ describe('packed question-card component ownership', () => {
     const { installed, component } = await fixture()
     await packageFiles(component, true)
     await writeFile(join(component, 'package.json'), JSON.stringify({
-      name: 'dsh-mobile-question-fixes', version: '0.6.3', type: 'module',
+      name: 'dsh-mobile-question-fixes', version: pluginVersion, type: 'module',
       exports: { '.': './lib/index.mjs', './client': '../unpacked-client.js', './package.json': './package.json' },
     }))
     await expect(assertProfileComponents(installed)).rejects.toThrow('Invalid "exports" target')
@@ -74,7 +76,7 @@ describe('packed question-card component ownership', () => {
   it('rejects an embedded component from a different Mobile version', async () => {
     const { installed, component } = await fixture()
     await packageFiles(component, true)
-    await writeFile(join(component, 'package.json'), JSON.stringify({ name: 'dsh-mobile-question-fixes', version: '0.6.2', exports: { '.': './lib/index.mjs', './client': './lib/client.js', './package.json': './package.json' } }))
+    await writeFile(join(component, 'package.json'), JSON.stringify({ name: 'dsh-mobile-question-fixes', version: pluginVersion === '0.6.2' ? '0.6.3' : '0.6.2', exports: { '.': './lib/index.mjs', './client': './lib/client.js', './package.json': './package.json' } }))
     await expect(assertProfileComponents(installed)).rejects.toThrow('version does not match')
   })
 })

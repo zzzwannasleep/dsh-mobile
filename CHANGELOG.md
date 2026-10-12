@@ -2,7 +2,7 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
-## Unreleased
+## 0.7.0 - 2026-10-12
 
 - Remove the Tailscale Funnel, cpolar, self-hosted FRP (deploy/attach/VPS), own reverse proxy and managed Caddy remote channels, including their components, docs, release pipelines and tests; remote access now offers the SakuraFrp channel (default) and the cloudflared named tunnel.
 - Add the SakuraFrp remote channel (natfrp.com v4 API): save the access token privately, pick an existing TCP tunnel, point its local target at the gateway automatically, fetch the official `/tunnel/config` for the pinned upstream frpc 0.70.1 and run it; the gateway terminates TLS with the pairing-CA-signed ingress certificate the app already pins. SakuraFrp is now the first-run default provider (`DSH_MOBILE_REMOTE_PROVIDER` can still pin either channel), and unknown host-reported provider names fall back to it.

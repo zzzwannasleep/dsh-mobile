@@ -31,7 +31,7 @@
 
 > DSH Mobile is a DeepSeek Harness community plugin; the native app supports Android only.
 >
-> **Current stable release: 0.6.3**. Improve plugin installation, the mobile composer and current DSH compatibility, add optional extension Workers, and strengthen connection and data reliability. [Release notes](https://github.com/saya-ch/dsh-mobile/releases/tag/v0.6.3).
+> **Current stable release: 0.7.0**. Remote channels are reworked to SakuraFrp (default) and the cloudflared named tunnel, removing Funnel, cpolar, self-hosted FRP, the own reverse proxy and managed Caddy; the mobile UI hides the drawer plugin entry, adapts the conversation column to wide screens, and docks the Mobile Access panel as a bottom sheet. [Release notes](https://github.com/saya-ch/dsh-mobile/releases/tag/v0.7.0).
 >
 > **Version policy**: since plugin **0.6.2**, the Android app and plugin use independent version numbers and releases. Their numbers do not need to match, and a plugin update does not imply an app update. [Compatibility notes](#compatibility).
 
@@ -374,6 +374,7 @@ On macOS, local network, cloudflared and SakuraFrp all work. The diagnostics fir
 | `0.6.0` | `0.1.7-alpha.2`, `0.1.7-rc.1`, `0.1.7-rc.2`, `0.2.0-rc.1` and `0.2.0-rc.2` (packed installation, pairing, mobile-page boot and WebSocket Workspace reads); additional checks cover the mobile composer, module settings and component loading after a normal official Desktop restart |
 | `0.6.2` | Packed legacy-WebView boot, touch scrolling and missing-API/viewport negative controls passed on `0.2.0-rc.2`, with release CI passing. The reporter's physical old devices in #187 were not claimed as accepted |
 | `0.6.3` | `0.2.0-rc.2` and `0.2.1-alpha.2` (packed installation, isolated pairing, mobile boot and WebSocket Workspace reads); additional checks cover the composer, settings and extension Worker timeout, streaming and explicit recovery |
+| `0.7.0` | `0.2.0-rc.2` and `0.2.1-alpha.2` (packed installation, isolated pairing, panel navigation, composer and module-settings smokes; the SakuraFrp live-tunnel end-to-end ran on `0.2.1-alpha.2`); the release CI matrix passed all boot checks |
 
 <details>
 <summary>Historical version checks</summary>

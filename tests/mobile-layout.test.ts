@@ -721,13 +721,15 @@ describe('dedicated mobile layout boot', () => {
     expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer[data-open=true]{width:340px')
   })
 
-  it('hides the stock plugins global-panel entry inside the mobile drawer only', () => {
-    // The plugin manager is a computer-administration surface; the phone shell
-    // drops its drawer row while the settings dialog keeps the built-in
-    // plugins page. Both shipped DSH locales (zh/en) are covered, and a
-    // renamed upstream label only reverts to stock visibility.
-    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer nav[aria-label="全局面板"] button[aria-label="插件"]{display:none}')
-    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer nav[aria-label="Global panels"] button[aria-label="Plugins"]{display:none}')
+  it('hides every plugin global-panel entry inside the mobile drawer', () => {
+    // Every row in 全局面板/Global panels is a plugin-registered surface (the
+    // plugin manager among them); the phone shell drops the whole section so
+    // no computer-administration entry can appear on the phone. Both shipped
+    // DSH locales (zh/en) are covered, and a renamed upstream label only
+    // reverts to stock visibility.
+    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer nav[aria-label="全局面板"],')
+    expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer nav[aria-label="Global panels"]{display:none}')
+    expect(MOBILE_LAYOUT_STYLES).not.toContain('button[aria-label="插件"]')
   })
 
   it('sets a minimum editable font while preserving the content-font preference', () => {

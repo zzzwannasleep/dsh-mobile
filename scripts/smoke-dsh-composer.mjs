@@ -63,7 +63,7 @@ async function openMainPanel(drawer, phone) {
     if (document.getElementById('composer-smoke-panel-override') !== null) return
     const style = document.createElement('style')
     style.id = 'composer-smoke-panel-override'
-    style.textContent = '.dshm-drawer nav[aria-label="Global panels"] button[aria-label="Plugins"],.dshm-drawer nav[aria-label="全局面板"] button[aria-label="插件"]{display:inline-flex!important}'
+    style.textContent = '.dshm-drawer nav[aria-label="Global panels"],.dshm-drawer nav[aria-label="全局面板"]{display:block!important}'
     document.head.append(style)
   })
   await drawer.getByRole('button', { name: 'Plugins', exact: true }).click()

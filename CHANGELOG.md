@@ -2,11 +2,12 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
-## Unreleased
+## 0.7.1 - 2026-10-13
 
 - Make "Save and connect" actually connect: saving the SakuraFrp tunnel or the cloudflared named tunnel now enables the saved channel (a disabled provider starts with the saved configuration; a live component restarts to apply the new selection) instead of leaving the switch off after saving.
 - Keep a connecting action's status message on screen: the control panel's 1.5 s status poll no longer overwrites an in-flight action's message with the slower provider state, which made every save look like a no-op flash.
 - Rebuild the Mobile Access settings surface as a centered modal window over a dimmed backdrop on desktop (dialog semantics, Escape/backdrop dismissal, focus restore, sticky title bar, two-column provider cards on wide windows); the phone shell keeps the full-width bottom sheet.
+- Hide the phone shell's entire 全局面板/Global panels drawer section: every row there is a plugin-registered surface, so no plugin entry (the plugin manager among them) reaches the phone, regardless of upstream label changes.
 - Log remote provider state transitions (state and error code) to the plugin log so a tunnel that never registers leaves an inspectable trail.
 
 ## 0.7.0 - 2026-10-12

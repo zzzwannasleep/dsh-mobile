@@ -4,6 +4,7 @@ Notable changes are recorded here. GitHub Releases provide the downloadable pack
 
 ## 0.7.1 - 2026-10-13
 
+- Clean mobile frontend: the dedicated phone page no longer loads optional third-party plugin client modules by default (`cleanMobileFrontend`, on by default), so community plugins written for the desktop layout stop leaking their sidebars, toolbars and dialogs into the mobile shell; DSH's own modules and this plugin always load, and a third-party module a remaining module depends on stays loaded automatically. The device module catalog marks hidden third-party modules as clean-mode-hidden instead of pretending they are configurable.
 - Make "Save and connect" actually connect: saving the SakuraFrp tunnel or the cloudflared named tunnel now enables the saved channel (a disabled provider starts with the saved configuration; a live component restarts to apply the new selection) instead of leaving the switch off after saving.
 - Keep a connecting action's status message on screen: the control panel's 1.5 s status poll no longer overwrites an in-flight action's message with the slower provider state, which made every save look like a no-op flash.
 - Rebuild the Mobile Access settings surface as a centered modal window over a dimmed backdrop on desktop (dialog semantics, Escape/backdrop dismissal, focus restore, sticky title bar, two-column provider cards on wide windows); the phone shell keeps the full-width bottom sheet.

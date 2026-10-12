@@ -32,6 +32,7 @@ import {
 } from './access.js'
 import type { ResolvedGatewayConfig } from './config.js'
 import { ClientModulePreferenceStore, parseExcludedClientModules, type ClientModuleEntry, type ClientModulePreferenceView } from './client-module-preferences.js'
+import { cleanFrontendExclusions } from './client-module-clean.js'
 import { renderClientModuleRecoveryPage } from './client-module-recovery.js'
 import { ensureMobileCompatibility, MOBILE_COMPAT_PATH } from './mobile-compat-bootstrap.js'
 import {
@@ -2299,10 +2300,19 @@ export class MobileAccessGateway {
       controller.signal.throwIfAborted()
       try {
         const plan = parseMobileBootPlan(html)
+        const clean = this.config.cleanMobileFrontend && plan.batches !== undefined
+        // The catalog must describe the graph a paired device actually receives:
+        // under clean-frontend mode the hidden third-party modules are part of
+        // the effective exclusion even without an explicit preference entry.
+        const effectiveExclusions = clean
+          ? cleanFrontendExclusions(describeMobileClientModules(html), selection.excludedClientModules)
+          : selection.excludedClientModules
         return Object.freeze({
           entries: describeMobileClientModules(html),
           ...selection,
+          excludedClientModules: effectiveExclusions,
           ...(plan.batches === undefined ? { excludedClientModules: Object.freeze([]), defaultExcludedClientModules: Object.freeze([]) } : {}),
+          ...(clean ? { cleanFrontend: true } : {}),
           reloadRequired: true,
         })
       } catch (error) {
@@ -2375,7 +2385,9 @@ export class MobileAccessGateway {
     try {
       const index = await this.fetchAuthenticatedUpstreamIndex(operation.signal, request)
       const preference = await this.clientModulePreferences.read(authorization.deviceId)
-      const excludedClientModules = preference.excludedClientModules
+      const excludedClientModules = this.config.cleanMobileFrontend
+        ? cleanFrontendExclusions(describeMobileClientModules(index.html), preference.excludedClientModules)
+        : preference.excludedClientModules
       let body: Buffer
       try {
         const html = index.html

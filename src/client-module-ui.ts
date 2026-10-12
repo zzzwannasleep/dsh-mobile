@@ -1,12 +1,13 @@
 /** Device-local module selection and the computer's defaults share a read-only catalog. */
 import { createElement, type ReactElement } from 'react'
+import { isFirstPartyClientModuleId } from './client-module-clean.js'
 import { localAdminRequestHeaders } from './local-admin-host.js'
 import type { MobileControlLocale } from './client-messages.js'
 
 export const CLIENT_MODULE_COPY = {
-  zh: { title: '移动页面模块', computer: '为移动访问设置默认加载模块，不卸载电脑上的插件。', device: '只为本设备选择加载模块，不改变其他手机或电脑。', open: '管理', loading: '正在读取模块…', hint: '勾选表示加载。启动必需的模块不能取消；依赖冲突会在保存时说明。', save: '保存，下次打开生效', reset: '恢复默认', close: '关闭', required: '启动必需', dependencies: '依赖：', saved: '已保存，不会自动刷新当前页面。重新打开 DSH 后生效。', failed: '暂时无法完成。请确认移动访问已启用，或检查下面的依赖冲突。', conflict: '无法保存：', computerSource: '使用电脑默认设置', deviceSource: '使用本设备设置', resetConfirm: '恢复默认模块选择？不会重新加载当前会话。' },
-  en: { title: 'Mobile page modules', computer: 'Choose default modules for mobile access without uninstalling computer plugins.', device: 'Choose modules for this device only; other phones and computers are unchanged.', open: 'Manage', loading: 'Reading modules…', hint: 'Checked means loaded. Required boot modules cannot be unchecked; saving explains dependency conflicts.', save: 'Save for next open', reset: 'Restore defaults', close: 'Close', required: 'Required for boot', dependencies: 'Depends on: ', saved: 'Saved. This page is not reloaded automatically. Reopen DSH to apply.', failed: 'Could not complete this operation. Enable mobile access or check the dependency conflict below.', conflict: 'Could not save: ', computerSource: 'Using computer defaults', deviceSource: 'Using this device’s settings', resetConfirm: 'Restore default module selection? The current conversation will not reload.' },
-  it: { title: 'Moduli della pagina mobile', computer: 'Scegli i moduli predefiniti senza disinstallare i plugin del computer.', device: 'Scegli i moduli solo per questo dispositivo, senza cambiare gli altri.', open: 'Gestisci', loading: 'Lettura dei moduli…', hint: 'Selezionato significa caricato. I moduli obbligatori non possono essere rimossi; il salvataggio mostra i conflitti.', save: 'Salva per la prossima apertura', reset: 'Ripristina predefiniti', close: 'Chiudi', required: 'Obbligatorio', dependencies: 'Dipende da: ', saved: 'Salvato. La pagina non viene ricaricata automaticamente. Riapri DSH per applicare.', failed: 'Operazione non completata. Abilita accesso mobile o controlla il conflitto sotto.', conflict: 'Impossibile salvare: ', computerSource: 'Predefiniti del computer', deviceSource: 'Impostazioni del dispositivo', resetConfirm: 'Ripristinare i moduli predefiniti? La conversazione attuale non verrà ricaricata.' },
+  zh: { title: '移动页面模块', computer: '为移动访问设置默认加载模块，不卸载电脑上的插件。', device: '只为本设备选择加载模块，不改变其他手机或电脑。', open: '管理', loading: '正在读取模块…', hint: '勾选表示加载。启动必需的模块不能取消；依赖冲突会在保存时说明。第三方插件的界面默认不在手机上加载。', save: '保存，下次打开生效', reset: '恢复默认', close: '关闭', required: '启动必需', dependencies: '依赖：', cleanHidden: '纯净模式：不在手机加载', saved: '已保存，不会自动刷新当前页面。重新打开 DSH 后生效。', failed: '暂时无法完成。请确认移动访问已启用，或检查下面的依赖冲突。', conflict: '无法保存：', computerSource: '使用电脑默认设置', deviceSource: '使用本设备设置', resetConfirm: '恢复默认模块选择？不会重新加载当前会话。' },
+  en: { title: 'Mobile page modules', computer: 'Choose default modules for mobile access without uninstalling computer plugins.', device: 'Choose modules for this device only; other phones and computers are unchanged.', open: 'Manage', loading: 'Reading modules…', hint: 'Checked means loaded. Required boot modules cannot be unchecked; saving explains dependency conflicts. Third-party plugin interfaces stay off the phone by default.', save: 'Save for next open', reset: 'Restore defaults', close: 'Close', required: 'Required for boot', dependencies: 'Depends on: ', cleanHidden: 'Clean mode: not loaded on the phone', saved: 'Saved. This page is not reloaded automatically. Reopen DSH to apply.', failed: 'Could not complete this operation. Enable mobile access or check the dependency conflict below.', conflict: 'Could not save: ', computerSource: 'Using computer defaults', deviceSource: 'Using this device’s settings', resetConfirm: 'Restore default module selection? The current conversation will not reload.' },
+  it: { title: 'Moduli della pagina mobile', computer: 'Scegli i moduli predefiniti senza disinstallare i plugin del computer.', device: 'Scegli i moduli solo per questo dispositivo, senza cambiare gli altri.', open: 'Gestisci', loading: 'Lettura dei moduli…', hint: 'Selezionato significa caricato. I moduli obbligatori non possono essere rimossi; il salvataggio mostra i conflitti. Le interfacce dei plugin di terze parti restano fuori dal telefono per impostazione predefinita.', save: 'Salva per la prossima apertura', reset: 'Ripristina predefiniti', close: 'Chiudi', required: 'Obbligatorio', dependencies: 'Dipende da: ', cleanHidden: 'Modalità pulita: non caricato sul telefono', saved: 'Salvato. La pagina non viene ricaricata automaticamente. Riapri DSH per applicare.', failed: 'Operazione non completata. Abilita accesso mobile o controlla il conflitto sotto.', conflict: 'Impossibile salvare: ', computerSource: 'Predefiniti del computer', deviceSource: 'Impostazioni del dispositivo', resetConfirm: 'Ripristinare i moduli predefiniti? La conversazione attuale non verrà ricaricata.' },
 } as const
 
 export interface ClientModuleRow {
@@ -18,6 +19,7 @@ interface ClientModuleView {
   readonly entries: readonly ClientModuleRow[]
   readonly excludedClientModules: readonly string[]
   readonly source: 'device' | 'computer' | 'plugin'
+  readonly cleanFrontend: boolean
 }
 
 class ClientModuleUiConflict extends Error {
@@ -45,7 +47,7 @@ export function parseClientModuleView(value: unknown): ClientModuleView {
     if (typeof id !== 'string') throw new Error('invalid_module_catalog')
     return id
   })
-  return { entries, excludedClientModules, source: value.source === 'device' ? 'device' : value.source === 'computer' ? 'computer' : 'plugin' }
+  return { entries, excludedClientModules, source: value.source === 'device' ? 'device' : value.source === 'computer' ? 'computer' : 'plugin', cleanFrontend: (value as { cleanFrontend?: unknown }).cleanFrontend === true }
 }
 
 export const CLIENT_MODULE_STYLES = `
@@ -129,8 +131,12 @@ export function openClientModuleSettings(scope: 'computer' | 'device', locale: M
     for (const entry of view.entries) {
       const label = document.createElement('label'); label.className = 'dsh-module-choice'
       const input = document.createElement('input'); input.type = 'checkbox'; input.checked = !view.excludedClientModules.includes(entry.id); input.disabled = entry.required; if (entry.required) input.dataset.required = 'true'
+      const cleanHidden = view.cleanFrontend && !entry.required && !isFirstPartyClientModuleId(entry.id) && view.excludedClientModules.includes(entry.id)
+      if (cleanHidden) { input.checked = false; input.disabled = true }
       const name = document.createElement('span'); name.textContent = entry.id
-      const hint = document.createElement('small'); hint.textContent = entry.required ? copy.required : entry.dependencies.length === 0 ? '' : `${copy.dependencies}${entry.dependencies.join(', ')}`
+      const hint = document.createElement('small'); hint.textContent = entry.required ? copy.required
+        : cleanHidden ? copy.cleanHidden
+        : entry.dependencies.length === 0 ? '' : `${copy.dependencies}${entry.dependencies.join(', ')}`
       name.append(hint); label.append(input, name); list.append(label); choices.set(entry.id, input)
     }
     status.classList.remove('dsh-module-error'); status.textContent = view.source === 'device' ? copy.deviceSource : copy.computerSource

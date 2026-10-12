@@ -721,6 +721,18 @@ describe('dedicated mobile layout boot', () => {
     expect(MOBILE_LAYOUT_STYLES).toContain('.dshm-drawer[data-open=true]{width:340px')
   })
 
+  it('raises below-floor touch targets on the phone shell without touching wide viewports', () => {
+    // The desktop-sized 28px corner toggle and the drawer's 28-32px icon rows
+    // were measured at 390x844 (phone audit); the hit box grows while the
+    // drawn glyph keeps its size, and the rules stay inside the narrow query.
+    const narrowStart = MOBILE_LAYOUT_STYLES.indexOf('.dshm-shell [data-sidebar-right-expand]')
+    expect(narrowStart).toBeGreaterThan(0)
+    const narrow = MOBILE_LAYOUT_STYLES.slice(narrowStart)
+    expect(narrow).toContain('.dshm-shell [data-sidebar-right-expand]{width:44px;height:44px}')
+    expect(narrow).toContain('.dshm-drawer [class*="_iconButton"],.dshm-drawer [class*="_searchButton"]{min-width:40px!important;min-height:40px!important}')
+    expect(narrow.indexOf('}', narrow.indexOf('_iconButton'))).toBeGreaterThan(0)
+  })
+
   it('hides every plugin global-panel entry inside the mobile drawer', () => {
     // Every row in 全局面板/Global panels is a plugin-registered surface (the
     // plugin manager among them); the phone shell drops the whole section so

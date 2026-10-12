@@ -36,7 +36,7 @@ function manifest(legacy = false) {
 
 interface Result { readonly status: number; readonly body: string; readonly headers: IncomingHttpHeaders }
 
-async function fixture(defaults: readonly string[] = [], legacy = false) {
+async function fixture(defaults: readonly string[] = [], legacy = false, cleanMobileFrontend = false) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-module-gateway-'))
   cleanups.push(() => rm(root, { recursive: true, force: true }))
   const mobileLayoutFile = join(root, 'mobile-layout.js')
@@ -70,6 +70,9 @@ async function fixture(defaults: readonly string[] = [], legacy = false) {
     listenHost: '127.0.0.1', listenPort: 0, tls: { mode: 'disabled' },
     upstreamOrigin: `http://127.0.0.1:${String(address.port)}`, publicAuthorities: ['127.0.0.1'], allowedCidrs: ['127.0.0.0/8'],
     stateFile: join(root, 'devices.json'), mobileLayoutFile, excludedClientModules: [...defaults], upstreamTimeoutMs: 1_000,
+    // The explicit-preference tests below exercise third-party-named fixtures;
+    // clean-frontend behavior has its own suite at the end of this file.
+    cleanMobileFrontend,
   })
   const gateway = new MobileAccessGateway(Object.freeze({ ...config, discovery: false }), new MemoryDeviceStore(), undefined, undefined, undefined, undefined, undefined, preferences)
   cleanups.push(() => gateway.close())
@@ -421,5 +424,56 @@ describe('authenticated client module selection', () => {
     await setup.gateway.close()
     expect(started).toBe(3)
     expect(ended).toBe(3)
+  })
+})
+
+describe('clean mobile frontend', () => {
+  type CatalogView = ClientModulePreferenceView & { readonly cleanFrontend?: boolean }
+  const catalog = async (device: PairingResult, setup: Awaited<ReturnType<typeof fixture>>): Promise<CatalogView> =>
+    await setup.view(device) as CatalogView
+
+  it('hides every optional third-party module from the phone boot graph and marks the catalog', async () => {
+    const setup = await fixture([], false, true)
+    const view = await catalog(setup.first, setup)
+    expect(view.cleanFrontend).toBe(true)
+    expect(view.source).toBe('plugin')
+    expect(view.excludedClientModules).toEqual(['base', 'dependent', 'feature'])
+    const page = await setup.request('/', setup.first, undefined, { accept: 'text/html' })
+    expect(page.status).toBe(200)
+    const graph = boot(page.body)
+    const ids = graph.entries.map(entry => entry.id)
+    expect(ids).toContain(layoutId)
+    expect(ids).toContain(core[0]!)
+    for (const hidden of ['base', 'dependent', 'feature']) expect(ids).not.toContain(hidden)
+    const merged = graph.batches.find(batch => batch.url.startsWith('/mobile-access/mobile-boot/'))!
+    expect(merged.entries).not.toContain('feature')
+  })
+
+  it('keeps a third-party module that a remaining module depends on, without keeping its dependents', async () => {
+    const setup = await fixture([], false, true)
+    const next = setup.graph()
+    const extra = { id: '@deepseek-ai/dsh-client-ui-extra', url: '/plugins/extra.js?rev=v1234', rev: 'v1234', inject: ['base/client'] }
+    next.entries.push(extra)
+    next.batches![1]!.entries.push(extra.id)
+    setup.replaceGraph(next)
+    const page = await setup.request('/', setup.first, undefined, { accept: 'text/html' })
+    const ids = boot(page.body).entries.map(entry => entry.id)
+    // `base` must survive because the first-party module depends on it, while
+    // `dependent` (depends on base) and `feature` stay hidden.
+    expect(ids).toContain('base')
+    expect(ids).toContain(extra.id)
+    expect(ids).not.toContain('dependent')
+    expect(ids).not.toContain('feature')
+  })
+
+  it('unions the explicit device selection with the clean-mode exclusions', async () => {
+    const setup = await fixture([], false, true)
+    await setup.request(path, setup.first, { excludedClientModules: ['feature'] })
+    const view = await setup.view(setup.first)
+    expect(view.source).toBe('device')
+    expect(view.excludedClientModules).toEqual(['base', 'dependent', 'feature'])
+    // The computer default stays preference-owned: another device sees only
+    // the automatic clean-mode exclusions, not this device's explicit pick.
+    expect((await catalog(setup.second, setup))).toMatchObject({ source: 'plugin', excludedClientModules: ['base', 'dependent', 'feature'] })
   })
 })

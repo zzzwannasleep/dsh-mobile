@@ -469,6 +469,9 @@ async function gateway(
     allowedCidrs: ['127.0.0.0/8'],
     stateFile: join(tmpdir(), `dsh-mobile-access-${crypto.randomUUID()}.json`),
     tls: { mode: 'disabled' },
+    // Batch-assembly fixtures use third-party-named module ids; clean-frontend
+    // behavior has its own coverage, so these tests pin the raw graph rewriting.
+    cleanMobileFrontend: false,
     ...overrides,
   })
   const effective = testSessionTtlMs === undefined ? resolved : Object.freeze({ ...resolved, sessionTtlMs: testSessionTtlMs })

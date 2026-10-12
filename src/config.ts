@@ -70,6 +70,8 @@ export interface PluginConfig {
   mobileCompatibilityFile?: string
   /** Optional application-phase client package ids omitted only from the mobile boot graph. */
   excludedClientModules?: string[]
+  /** Hide every optional third-party client module on the dedicated mobile frontend. */
+  cleanMobileFrontend?: boolean
   /** Compression is opt-in; it does not authorize additional WebSocket paths. */
   websocketCompression?: WebSocketCompressionConfig
   /** Stable public discovery identifier; it is not an authentication secret. */
@@ -118,6 +120,7 @@ export interface ResolvedGatewayConfig {
   readonly mobileLayoutFile: string
   readonly mobileCompatibilityFile: string
   readonly excludedClientModules: readonly string[]
+  readonly cleanMobileFrontend: boolean
   readonly websocketCompression: ResolvedWebSocketCompressionConfig
   readonly instanceId: string
   readonly pairingCaFile?: string
@@ -167,6 +170,7 @@ export const Config: z<PluginConfig> = z.object({
   mobileLayoutFile: z.string().hidden(),
   mobileCompatibilityFile: z.string().hidden(),
   excludedClientModules: z.array(String).default([]),
+  cleanMobileFrontend: z.boolean(),
   websocketCompression: z.object({
     paths: z.array(String).default([]),
     maxMessageBytes: z.natural(),
@@ -388,6 +392,7 @@ export function parseGatewayConfig(raw: unknown): ResolvedGatewayConfig {
       ? fileURLToPath(new URL('./mobile-compat.js', import.meta.url))
       : absoluteFile(value.mobileCompatibilityFile, 'mobileCompatibilityFile'),
     excludedClientModules: excludedClientModules(value.excludedClientModules),
+    cleanMobileFrontend: value.cleanMobileFrontend !== false,
     websocketCompression: parseWebSocketCompression(value.websocketCompression),
     instanceId: value.instanceId === undefined
       ? createHash('sha256').update(absoluteFile(value.stateFile, 'stateFile')).digest('hex')

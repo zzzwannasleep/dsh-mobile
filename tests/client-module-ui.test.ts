@@ -7,7 +7,7 @@ describe('client module settings response', () => {
     { id: 'optional', required: false, dependencies: ['core'] },
   ] }
   it('retains the required marker, exact module ids and dependencies', () => {
-    expect(parseClientModuleView(catalog)).toEqual(catalog)
+    expect(parseClientModuleView(catalog)).toEqual({ ...catalog, cleanFrontend: false })
   })
   it('rejects malformed wire values before making choices interactive', () => {
     for (const value of [null, {}, { ...catalog, source: 'admin' }, { ...catalog, entries: [null] }, { ...catalog, entries: [{ id: 'x', required: 'yes', dependencies: [] }] }, { ...catalog, excludedClientModules: [null] }, { ...catalog, entries: [{ id: 'x', required: false, dependencies: [{}] }] }]) {

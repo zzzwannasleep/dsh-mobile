@@ -598,6 +598,15 @@ body:has(.dshm-shell) :is(input,textarea,[contenteditable=true],[contenteditable
 .dshm-drawer[data-open=false]{width:56px}
 }
 @media(prefers-reduced-motion:reduce){.dshm-drawer,.dshm-details,.dshm-scrim,.dshm-drawer>*,.dshm-main{transition:none!important}}
+/* Touch targets the stock desktop sizing leaves below the 44px floor on the
+   phone shell: the right-panel corner toggle keeps its data attribute across
+   DSH versions, and the drawer's icon-only row actions share DSH's hashed
+   *_iconButton class suffix (the same pattern the composer smokes rely on).
+   Icon glyphs keep their drawn size; only the hit box grows. */
+@media(max-width:899px){
+.dshm-shell [data-sidebar-right-expand]{width:44px;height:44px}
+.dshm-drawer [class*="_iconButton"],.dshm-drawer [class*="_searchButton"]{min-width:40px!important;min-height:40px!important}
+}
 `
 
 function MobileAppFrame(props: MobileRootProps & {

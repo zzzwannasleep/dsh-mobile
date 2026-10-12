@@ -43,6 +43,31 @@ const nativeBack = page => page.evaluate(() => {
   window.dispatchEvent(event)
   return event.defaultPrevented
 })
+/**
+ * Open one representative main panel from the drawer.
+ *
+ * The phone shell hides the stock Plugins drawer entry, and DSH 0.2.0-rc.2
+ * (the only version this acceptance runs on) ships no other main panel, so
+ * this fixture restores that one entry with an override stylesheet when the
+ * Schedules panel is unavailable. Newer DSH versions expose Schedules and use
+ * it directly; the hidden-by-default product behavior is asserted separately
+ * in tests/mobile-layout.test.ts.
+ */
+async function openMainPanel(drawer, phone) {
+  const schedules = drawer.getByRole('button', { name: 'Automation tasks', exact: true })
+  if (await schedules.count() > 0) {
+    await schedules.click()
+    return
+  }
+  await phone.evaluate(() => {
+    if (document.getElementById('composer-smoke-panel-override') !== null) return
+    const style = document.createElement('style')
+    style.id = 'composer-smoke-panel-override'
+    style.textContent = '.dshm-drawer nav[aria-label="Global panels"] button[aria-label="Plugins"],.dshm-drawer nav[aria-label="全局面板"] button[aria-label="插件"]{display:inline-flex!important}'
+    document.head.append(style)
+  })
+  await drawer.getByRole('button', { name: 'Plugins', exact: true }).click()
+}
 async function setMobileFontSize(page, size) {
   const drawer = page.locator('.dshm-drawer')
   if (await drawer.getAttribute('data-open') !== 'true') await drawer.locator('button[data-dsh-mobile-toggle]').click()
@@ -202,9 +227,10 @@ try {
     await phone.setViewportSize(viewport)
     await drawer.locator('button[data-dsh-mobile-toggle]').click()
     await phone.waitForFunction(() => document.querySelector('.dshm-drawer')?.getAttribute('data-open') === 'true')
-    // The Plugins panel entry is hidden in the mobile drawer; the Schedules
-    // panel ("Automation tasks") is the retained representative main panel.
-    await drawer.getByRole('button', { name: 'Automation tasks', exact: true }).click()
+    // The Plugins panel entry is hidden in the mobile drawer; openMainPanel
+    // falls back to a fixture-restored Plugins entry on DSH versions that
+    // ship no other main panel.
+    await openMainPanel(drawer, phone)
     await phone.waitForFunction(() => document.querySelector('.dshm-drawer')?.getAttribute('data-open') === 'false')
     const back = phone.getByRole('button', { name: 'Back to conversation', exact: true })
     await back.waitFor({ state: 'visible', timeout: CLIENT_TIMEOUT_MS })
@@ -248,7 +274,7 @@ try {
   await frames(phone)
   if (await drawer.getAttribute('data-open') !== 'true') await drawer.locator('button[data-dsh-mobile-toggle]').click()
   await phone.waitForFunction(() => document.querySelector('.dshm-drawer')?.getAttribute('data-open') === 'true', undefined, { timeout: CLIENT_TIMEOUT_MS })
-  await drawer.getByRole('button', { name: 'Automation tasks', exact: true }).click()
+  await openMainPanel(drawer, phone)
   await frames(phone)
   const widePanelState = await phone.evaluate(() => ({
     width: window.innerWidth,

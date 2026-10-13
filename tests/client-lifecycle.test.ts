@@ -495,18 +495,17 @@ describe('mobile-control localization', () => {
     expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel{box-sizing:border-box;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)')
     expect(CONTROL_STYLES).toContain('@media(max-width:599px){')
     expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel{left:0;right:0;top:auto;bottom:0;transform:none;width:100%;max-height:min(86dvh,calc(100dvh - 64px));border-radius:18px 18px 0 0;border-bottom:0;padding-bottom:calc(16px + env(safe-area-inset-bottom))')
-    // A desktop window is a landscape dashboard: the shell reads the panel's own
-    // width (container queries), so any window size gets the horizontal rail +
-    // content split, and the remote tab splits configuration from the live channel.
+    // A display declaration on the panel itself once beat the UA's [hidden] rule
+    // and popped the window open on every DSH start; the explicit guard pins it
+    // shut, and no author-level display on the panel is allowed to return.
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__panel[hidden]{display:none}')
+    expect(CONTROL_STYLES).not.toMatch(/\.dsh-mobile-control__panel\{[^}]*display:/u)
+    // The SakuraFrp key button is "Save key and connect": an already-selected
+    // tunnel is re-established right after the key is saved.
     const source = readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
-    expect(CONTROL_STYLES).toContain('container-type:inline-size')
-    expect(CONTROL_STYLES).toContain('@container (min-width:720px){')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__body{display:grid;grid-template-columns:150px minmax(0,1fr)')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__view.is-remote>.dsh-mobile-control__provider-section{grid-column:1;margin:0}')
-    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__view.is-remote>.dsh-mobile-control__remote-workspace{grid-column:2;margin:0}')
-    expect(source).toContain('shell.append(switcher, content)')
-    // Provider setup lives in the configuration column, not stacked under the workspace.
-    expect(source).toContain('providerSection.append(providerSetupHeader, providerSetupBody)')
+    expect(source).toContain('establishSakuraChannel(configuredSakuraTunnelId)')
+    expect(MOBILE_CONTROL_MESSAGES.zh.saveToken).toBe('保存密钥并连接')
+    expect(MOBILE_CONTROL_MESSAGES.en.saveToken).toBe('Save key and connect')
   })
 
   it('keeps the named-tunnel form masked and never persists the token in the DOM', () => {

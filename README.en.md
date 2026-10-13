@@ -31,7 +31,7 @@
 
 > DSH Mobile is a DeepSeek Harness community plugin; the native app supports Android only.
 >
-> **Current stable release: 0.7.3**. "Save and connect" establishes the remote channel after saving; the Mobile Access settings open as a two-column centered window, the phone drawer hides every plugin entry, and third-party plugin modules stay off the phone by default. [Release notes](https://github.com/saya-ch/dsh-mobile/releases/tag/v0.7.3).
+> **Current stable release: 0.7.4**. "Save and connect" establishes the remote channel after saving; the Mobile Access settings open as a two-column centered window, the phone drawer hides every plugin entry, and third-party plugin modules stay off the phone by default. [Release notes](https://github.com/saya-ch/dsh-mobile/releases/tag/v0.7.4).
 >
 > **Version policy**: since plugin **0.6.2**, the Android app and plugin use independent version numbers and releases. Their numbers do not need to match, and a plugin update does not imply an app update. [Compatibility notes](#compatibility).
 

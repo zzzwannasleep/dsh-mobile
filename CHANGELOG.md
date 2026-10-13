@@ -2,6 +2,12 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
+## 0.7.4 - 2026-10-13
+
+- Fix a 0.7.3 regression where the Mobile Access window opened on every DSH start: a display declaration on the panel beat the browser's `[hidden]` rule, and the panel now carries an explicit guard so it stays closed until opened.
+- The SakuraFrp access-key button is "Save key and connect": when a tunnel is already selected it re-establishes the channel right after the key is saved; without a tunnel yet it loads the tunnel list and the tunnel row's own button connects.
+- Revert the 0.7.3 layout experiment (left rail + two-column remote split) back to the single window flow: title row, LAN/Remote tabs row, then the selected view, with the remote page as a simple row sequence — choose provider, fill the access key, save key and connect, choose tunnel and save-and-connect.
+
 ## 0.7.3 - 2026-10-13
 
 - Rebuild the Mobile Access window layout as a landscape dashboard instead of a stacked strip: a fixed header, a vertical tab rail on the left, and one scrolling content pane on the right, driven by the panel's own width (container queries) so a desktop window of any size gets the horizontal shell.

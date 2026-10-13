@@ -2,6 +2,12 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
+## 0.7.3 - 2026-10-13
+
+- Rebuild the Mobile Access window layout as a landscape dashboard instead of a stacked strip: a fixed header, a vertical tab rail on the left, and one scrolling content pane on the right, driven by the panel's own width (container queries) so a desktop window of any size gets the horizontal shell.
+- The remote tab splits into a configuration column (provider choice plus the selected provider's setup card) and a live-channel column (status, address, QR, actions, devices) instead of stacking everything under one card.
+- Phones keep the single-column bottom sheet.
+
 ## 0.7.2 - 2026-10-13
 
 - The Mobile Access window becomes a real rectangle: desktop widths open a two-column remote setup (channel choice and live channel side by side) instead of a narrow strip; the phone keeps its single column.

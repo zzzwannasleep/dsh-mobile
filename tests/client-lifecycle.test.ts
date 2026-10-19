@@ -9,6 +9,7 @@ import {
   combineClientSignals,
   CONTROL_STYLES,
   clientReleaseInfo,
+  customizationLayerPaths,
   diagnosticEntriesForRender,
   diagnosticControllerAction,
   diagnosticOverallForChecks,
@@ -25,17 +26,22 @@ import {
   installMobileNativeBack,
   MOBILE_CONTROL_MESSAGES,
   mobileBackBlockedMessage,
+  normalizeCustomizationRevision,
   normalizeDiagnosticOverall,
   normalizeDiagnosticStatus,
   parseMobileExtensionManifest,
+  pcClientInfo,
   PerIdActivationLifecycle,
   publishAuthoritativeExtensionIds,
   reconcileRemovedExtensions,
   registerUniqueDisposable,
   renderDiagnosticPayloadSafely,
+  selectCustomizationLayer,
+  selectCustomizationRevisions,
   selectMobileControlLocale,
   setMobileSurfaceOpen,
   parseMobileRemoteProvider,
+  shouldRefreshCustomizationRevision,
   startExtensionChangeStream,
   startLifecycleRefreshScheduler,
   validateDiagnosticChecks,
@@ -1354,16 +1360,29 @@ describe('client extension manifest reconciliation', () => {
     expect(parseMobileExtensionManifest({
       protocol: 1,
       extensions: [{ id: 'demo', generation, scriptUrl: `/mobile-access/extensions/demo/mobile.js?generation=${generation}`, assetsUrl: '/mobile-access/extensions/demo/assets/' }, { id: 'theme', styleUrl: '/mobile-access/extensions/theme/mobile.css' }],
-      legacy: { scriptRevision: 'js-1', styleRevision: 'css-1' },
+      legacy: { scriptRevision: 'js-1', styleRevision: 'css-1', desktopScriptRevision: 'pc-js-1', desktopStyleRevision: 'pc-css-1' },
     })).toEqual({
       extensions: [{ id: 'demo', generation, scriptUrl: `/mobile-access/extensions/demo/mobile.js?generation=${generation}`, assetsUrl: '/mobile-access/extensions/demo/assets/' }, { id: 'theme', styleUrl: '/mobile-access/extensions/theme/mobile.css' }],
-      legacy: { scriptRevision: 'js-1', styleRevision: 'css-1' },
+      legacy: { scriptRevision: 'js-1', styleRevision: 'css-1', desktopScriptRevision: 'pc-js-1', desktopStyleRevision: 'pc-css-1' },
     })
     expect(parseMobileExtensionManifest({ protocol: 2, extensions: [], legacy: { scriptRevision: '', styleRevision: '' } })).toBeUndefined()
     expect(parseMobileExtensionManifest({ protocol: 1, extensions: {}, legacy: { scriptRevision: '', styleRevision: '' } })).toBeUndefined()
     expect(parseMobileExtensionManifest({ protocol: 1, extensions: [{ id: 'demo' }, { id: 'demo' }], legacy: { scriptRevision: '', styleRevision: '' } })).toBeUndefined()
     expect(parseMobileExtensionManifest({ protocol: 1, extensions: [{ id: 'demo', scriptUrl: 'https://evil.test/x.js' }], legacy: { scriptRevision: '', styleRevision: '' } })).toBeUndefined()
     expect(parseMobileExtensionManifest({ protocol: 1, extensions: [{ id: 'demo', generation: 'stale' }], legacy: { scriptRevision: '', styleRevision: '' } })).toBeUndefined()
+  })
+
+  it('normalizes the PC manifest revisions without rejecting an older manifest', () => {
+    // An older gateway omits the desktop fields; a malformed one must not take the
+    // whole manifest down, because that would also drop every extension entry.
+    const missing = parseMobileExtensionManifest({ protocol: 1, extensions: [], legacy: { scriptRevision: 'js-1', styleRevision: 'css-1' } })
+    expect(missing?.legacy).toEqual({ scriptRevision: 'js-1', styleRevision: 'css-1', desktopScriptRevision: '', desktopStyleRevision: '' })
+    const malformed = parseMobileExtensionManifest({
+      protocol: 1, extensions: [],
+      legacy: { scriptRevision: 'js-1', styleRevision: 'css-1', desktopScriptRevision: 7, desktopStyleRevision: null },
+    })
+    expect(malformed?.legacy.desktopScriptRevision).toBe('')
+    expect(malformed?.legacy.desktopStyleRevision).toBe('')
   })
 
   it('can reconcile script and style presence independently', () => {
@@ -1373,5 +1392,155 @@ describe('client extension manifest reconciliation', () => {
     reconcileRemovedExtensions(['style-only', 'both'], new Set(['style-only']), id => styles.push(id))
     expect(scripts).toEqual(['both'])
     expect(styles).toEqual(['both'])
+  })
+})
+
+describe('desktop customization layer', () => {
+  const source = (): string => readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
+  const declaration = (selector: string, property: string): string | undefined => {
+    const start = CONTROL_STYLES.indexOf(`${selector}{`)
+    if (start < 0) return undefined
+    const block = CONTROL_STYLES.slice(start, CONTROL_STYLES.indexOf('}', start))
+    return new RegExp(`${property}:([^;}]+)`, 'u').exec(block)?.[1]
+  }
+
+  it('keeps exactly one customization layer per client', () => {
+    // Touch-primary keeps today's phone layer; every other client is a PC. The two
+    // asset pairs are peers, so a PC never also applies custom.css/custom.js.
+    expect(selectCustomizationLayer(true)).toBe('mobile')
+    expect(selectCustomizationLayer(false)).toBe('desktop')
+    expect(customizationLayerPaths('mobile')).toEqual({ script: '/mobile-access/custom.js', style: '/mobile-access/custom.css' })
+    expect(customizationLayerPaths('desktop')).toEqual({ script: '/mobile-access/desktop.js', style: '/mobile-access/desktop.css' })
+    const text = source()
+    expect(text).toContain("window.matchMedia('(hover: none), (pointer: coarse)')")
+    expect(text).toContain("register: mount => { if (layer === 'mobile') custom.mount = mount")
+    expect(text).toContain("registerDesktop: mount => { if (layer === 'desktop') custom.mount = mount")
+  })
+
+  it('reads each layer revision from its own manifest fields', () => {
+    const legacy = { scriptRevision: 'js-1', styleRevision: 'css-1', desktopScriptRevision: 'pc-js-1', desktopStyleRevision: 'pc-css-1' }
+    expect(selectCustomizationRevisions(legacy, 'mobile')).toEqual({ scriptRevision: 'js-1', styleRevision: 'css-1' })
+    expect(selectCustomizationRevisions(legacy, 'desktop')).toEqual({ scriptRevision: 'pc-js-1', styleRevision: 'pc-css-1' })
+    // Missing or non-string fields read as empty, which forces the fetch.
+    expect(selectCustomizationRevisions({ scriptRevision: 'js-1', styleRevision: 'css-1' }, 'desktop')).toEqual({ scriptRevision: '', styleRevision: '' })
+    expect(selectCustomizationRevisions({ desktopScriptRevision: 7, desktopStyleRevision: null }, 'desktop')).toEqual({ scriptRevision: '', styleRevision: '' })
+    expect(normalizeCustomizationRevision('a')).toBe('a')
+    expect(normalizeCustomizationRevision(undefined)).toBe('')
+    expect(normalizeCustomizationRevision(42)).toBe('')
+    expect(normalizeCustomizationRevision({})).toBe('')
+  })
+
+  it('refreshes an empty revision and any revision that changed', () => {
+    expect(shouldRefreshCustomizationRevision('', '')).toBe(true)
+    expect(shouldRefreshCustomizationRevision('', 'js-1')).toBe(true)
+    expect(shouldRefreshCustomizationRevision('js-2', 'js-1')).toBe(true)
+    expect(shouldRefreshCustomizationRevision('js-1', 'js-1')).toBe(false)
+  })
+
+  it('reuses the extension refresh discipline for the active layer only', () => {
+    const text = source()
+    expect(text).toContain('selectCustomizationRevisions(payload.legacy, layer)')
+    expect(text).toContain('shouldRefreshCustomizationRevision(revisions.scriptRevision, layerScriptRevision)')
+    expect(text).toContain('shouldRefreshCustomizationRevision(revisions.styleRevision, layerStyleRevision)')
+    // The shared fetch helper keeps ETag/Last-Modified handling and the abort check.
+    expect(text).toContain("headers['if-none-match'] = custom.scriptEtag")
+    expect(text).toContain("headers['if-modified-since'] = custom.scriptModified")
+    expect(text).toContain('if (response.status === 304) return true')
+    expect(text).toContain('refreshCustomStyle(custom.style, custom.stylePath, signal, custom.styleState)')
+    expect(text).toContain('//# sourceURL=${custom.sourceUrl}')
+    // A stale generation never commits: the abort path restores the previous mount
+    // and removes the half-mounted root before returning false.
+    expect(text).toContain('if (refreshAborted(signal)) { custom.mount = previousMount; return false }')
+    expect(text).toContain('custom.dispose?.(); custom.root?.remove()')
+  })
+
+  it('fits three tabs and keeps the PC tab controls touch-sized', () => {
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__switcher{display:grid;grid-template-columns:repeat(3,1fr)')
+    expect(declaration('.dsh-mobile-control__pc-copy', 'min-height')).toBe('44px')
+    expect(declaration('.dsh-mobile-control__pc-channel-choice', 'min-height')).toBe('44px')
+    expect(declaration('.dsh-mobile-control__pc-channel-choice', 'min-width')).toBe('0')
+    expect(CONTROL_STYLES).toContain('.dsh-mobile-control__view.is-pc .dsh-mobile-control__actions{display:grid;grid-template-columns:1fr 1fr')
+  })
+
+  it('scopes every PC rule to the panel namespace', () => {
+    // A bare or element selector here would restyle DSH's own desktop UI, so each
+    // selector that touches the PC tab must stay under the panel's class prefix.
+    let checked = 0
+    postcss.parse(CONTROL_STYLES).walkRules((rule) => {
+      if (!rule.selector.includes('__pc') && !rule.selector.includes('.is-pc')) return
+      for (const selector of rule.selectors) {
+        checked += 1
+        expect(selector.startsWith('.dsh-mobile-control'), selector).toBe(true)
+      }
+    })
+    expect(checked).toBeGreaterThan(10)
+  })
+})
+
+describe('PC 端 tab data', () => {
+  const source = (): string => readFileSync(new URL('../src/client.ts', import.meta.url), 'utf8')
+
+  it('keeps only usable channels and rebuilds a missing entry URL', () => {
+    const info = pcClientInfo({
+      entryPath: '/mobile-access/pc',
+      packagePath: '/api/mobile-access/pc/package',
+      certificate: { available: true, url: 'https://192.168.1.7:3443/mobile-access/ca.cer' },
+      channels: [
+        { channel: 'lan', origin: 'https://192.168.1.7:3443' },
+        { channel: 'remote', origin: 'https://dsh.example.test', entryUrl: 'https://dsh.example.test/mobile-access/pc' },
+        { channel: 'lan', origin: 'https://duplicate.test' },
+        { channel: 'remote', origin: 'not a url' },
+        { channel: 'wan', origin: 'https://other.test' },
+        null,
+      ],
+    })
+    expect(info.entryPath).toBe('/mobile-access/pc')
+    expect(info.packagePath).toBe('/api/mobile-access/pc/package')
+    expect(info.certificateUrl).toBe('https://192.168.1.7:3443/mobile-access/ca.cer')
+    expect(info.channels).toEqual([
+      { channel: 'lan', origin: 'https://192.168.1.7:3443', entryUrl: 'https://192.168.1.7:3443/mobile-access/pc' },
+      { channel: 'remote', origin: 'https://dsh.example.test', entryUrl: 'https://dsh.example.test/mobile-access/pc' },
+    ])
+  })
+
+  it('falls back to the known routes and refuses an unsafe certificate URL', () => {
+    expect(pcClientInfo({})).toEqual({ entryPath: '/mobile-access/pc', packagePath: '/api/mobile-access/pc/package', channels: [] })
+    expect(pcClientInfo({ certificate: { available: false, url: 'https://x.test/ca.cer' } }).certificateUrl).toBeUndefined()
+    expect(pcClientInfo({ certificate: { available: true, url: 'javascript:alert(1)' } }).certificateUrl).toBeUndefined()
+    expect(pcClientInfo({ certificate: { available: true } }).certificateUrl).toBeUndefined()
+    const escaped = pcClientInfo({ entryPath: '//evil.test/pc', packagePath: '/api/../secret', channels: 'lan' })
+    expect(escaped.entryPath).toBe('/mobile-access/pc')
+    expect(escaped.packagePath).toBe('/api/mobile-access/pc/package')
+    expect(escaped.channels).toEqual([])
+  })
+
+  it('routes pairing, the installer and the certificate through the frozen paths', () => {
+    const text = source()
+    expect(text).toContain("t('pcGenerateKey')")
+    expect(text).toContain('/api/mobile-access/pc/info')
+    expect(text).toContain('/api/mobile-access/lan/pairing/open')
+    expect(text).toContain('/api/mobile-access/remote/pairing/open')
+    expect(text).toContain('`${pcPackagePath}?channel=${encodeURIComponent(channel)}`')
+    expect(text).toContain("anchor.download = 'dsh-mobile-pc.zip'")
+    expect(text).toContain('`${channelInfo.origin}${pcEntryPath}#key=${encodeURIComponent(appKey)}`')
+    expect(text).toContain("pcTab.setAttribute('aria-pressed', String(view === 'pc'))")
+    expect(text).toContain("switcher.hidden = view === 'diagnostics'")
+  })
+
+  it('has the PC copy in all three locales', () => {
+    const keys = [
+      'pc', 'pcAccess', 'pcIntro', 'pcNoChannels', 'pcCopyUrl', 'pcCopyUrlAria', 'pcUrlCopied', 'pcEntryLinkLabel',
+      'pcGenerateKey', 'pcGeneratingKey', 'pcKeyReady', 'pcAppKeyLabel', 'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage', 'pcPreparingPackage',
+      'pcPackageReady', 'pcPackageFailed', 'pcChannelUnavailable', 'pcInfoFailed', 'pcDownloadCertificate',
+      'pcCertificateNote', 'pcStepOpen', 'pcStepInstall', 'pcStepLaunch',
+    ]
+    for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
+      for (const key of keys) expect((catalog as Record<string, string>)[key], key).toBeTruthy()
+    }
+    expect(MOBILE_CONTROL_MESSAGES.zh.pc).toBe('PC 端')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateKey).toBe('生成配对码')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcDownloadPackage).toBe('下载 PC 安装包')
+    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).pcKeyReady).toMatch(/short-lived/u)
+    expect((MOBILE_CONTROL_MESSAGES.it as Record<string, string>).pcKeyReady).toMatch(/dura poco/u)
   })
 })

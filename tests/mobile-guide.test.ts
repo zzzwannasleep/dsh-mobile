@@ -6,6 +6,8 @@ function guide(overrides: Partial<MobileGuideState> = {}): string {
     directory: 'C:/dsh/mobile-access',
     hasCustomCss: false,
     hasCustomJs: false,
+    hasDesktopCss: false,
+    hasDesktopJs: false,
     extensions: [],
     failedExtensionCount: 0,
     ...overrides,
@@ -23,6 +25,23 @@ describe('buildMobileGuide', () => {
     const bare = guide()
     expect(bare).toContain('mobile.css：不存在')
     expect(bare).toContain('mobile.js：不存在')
+  })
+
+  it('reports the PC layer separately from the phone layer', () => {
+    const bare = guide()
+    expect(bare).toContain('desktop.css：不存在')
+    expect(bare).toContain('desktop.js：不存在')
+    const styled = guide({ hasDesktopCss: true, hasDesktopJs: true })
+    expect(styled).toContain('desktop.css：存在')
+    expect(styled).toContain('desktop.js：存在')
+    // A PC-only edit must not read as a phone-layer edit.
+    expect(styled).toContain('mobile.css：不存在')
+  })
+
+  it('explains that the two layers are mutually exclusive per client', () => {
+    const text = guide()
+    expect(text).toContain('触屏设备只加载 mobile.*，非触屏浏览器只加载 desktop.*')
+    expect(text).toContain('window.dshMobile.registerDesktop')
   })
 
   it('lists installed extensions', () => {
@@ -57,7 +76,7 @@ describe('buildMobileGuide', () => {
   it('teaches how to restore defaults', () => {
     const text = guide()
     expect(text).toContain('恢复默认')
-    expect(text).toContain('删除 mobile.css 与 mobile.js')
+    expect(text).toContain('删除对应的 mobile.css、mobile.js、desktop.css、desktop.js')
   })
 
   it('uses the running DSH frontend as a read-only reference for existing UI changes', () => {

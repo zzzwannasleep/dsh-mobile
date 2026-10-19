@@ -184,6 +184,12 @@ cloudflared 命名隧道使用 Cloudflare 账号令牌，能保留重启后不�
 
 </details>
 
+### PC 端（Windows 浏览器）
+
+朋友在自己的 Windows 电脑上不需要安装 DSH 或客户端程序：在 **移动访问 → PC 端** 点击 **生成配对码**、**下载 PC 安装包**，把 `dsh-mobile-pc.zip` 发给他；他解压后按需信任证书、运行启动脚本并输入配对码，就能在浏览器里使用同一份 DSH，浏览器支持时还可以把入口页安装成桌面应用。PC 使用独立的 `desktop.css` / `desktop.js` 定制层，与手机端的 `mobile.css` / `mobile.js` 互斥。完整步骤、证书与撤销说明见 [PC 端指南](docs/PC_CLIENT.md)。
+
+这是待发布功能，随下一个插件版本提供；现有局域网、远程通道与 Android App 不受影响。
+
 ## 扩展与自定义
 
 在 DSH 对话里输入 `/mobile <需求>`，当前会话的 agent 会处理定制请求；文件修改完成后，手机端通常会在几秒内刷新。例如：

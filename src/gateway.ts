@@ -83,8 +83,20 @@ import {
   renderLoginScript,
   renderPairPage,
   renderPairScript,
+  renderPcEntryPage,
   resolveAuthPageLocale,
+  type PairPageOptions,
 } from './auth-pages.js'
+import {
+  PWA_ICONS,
+  PWA_MANIFEST_PATH,
+  PWA_SERVICE_WORKER_PATH,
+  PWA_THEME_COLOR,
+  pwaIconPath,
+  renderPwaServiceWorker,
+  renderWebAppManifest,
+} from './pwa.js'
+import { buildPcPackage } from './pc-package.js'
 
 type GatewayServer = HttpServer | HttpsServer
 
@@ -160,6 +172,22 @@ const UPSTREAM_AUTH_REFRESH_MARGIN_MS = 60_000
 const UPSTREAM_COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=[\x21-\x3A\x3C-\x7E]*$/u
 const CUSTOM_STYLE_FALLBACK = '/* Add mobile overrides in the DSH home mobile-access/mobile.css file. */\n'
 const CUSTOM_SCRIPT_FALLBACK = 'window.dshMobile?.register(() => undefined)\n'
+/** PC customization layer; only non-touch clients on the dedicated frontend load it. */
+const DESKTOP_STYLE_PATH = `${AUTH_PREFIX}/desktop.css`
+const DESKTOP_SCRIPT_PATH = `${AUTH_PREFIX}/desktop.js`
+const DESKTOP_STYLE_FALLBACK = '/* Add PC overrides in the DSH home mobile-access/desktop.css file. */\n'
+const DESKTOP_SCRIPT_FALLBACK = 'window.dshMobile?.registerDesktop?.(() => undefined)\n'
+/**
+ * Desktop-first pairing page. Unlike {@link AUTH_PREFIX}/pair it is served even
+ * while no pairing window is open: the friend must be able to read the trust and
+ * install steps, which cannot fit into the short pairing window.
+ */
+export const PC_ENTRY_PATH = `${AUTH_PREFIX}/pc`
+const PC_ENTRY_SCRIPT_PATH = `${AUTH_PREFIX}/pc.js`
+/** Generated install package the owner sends to a friend. */
+export const PC_PACKAGE_PATH = `${LOCAL_ADMIN_PREFIX}/pc/package`
+export const PC_INFO_PATH = `${LOCAL_ADMIN_PREFIX}/pc/info`
+export const PC_PACKAGE_FILENAME = 'dsh-mobile-pc.zip'
 const EXTENSION_CHANGE_POLL_MS = 2_000
 const EXTENSION_EVENT_HEARTBEAT_MS = 15_000
 const MOBILE_CLIENT_MODULE = 'dsh-mobile'
@@ -660,6 +688,18 @@ function rewriteMobileApplicationPreloads(html: string, replacements: ReadonlyMa
   })
 }
 
+/**
+ * Add the installable-web-app head to the gateway's own document. The manifest
+ * and its icons are origin-relative, so the injected markup carries no host and
+ * the Android WebView, which ignores it, is unaffected.
+ */
+function injectPwaHead(html: string): string {
+  if (html.includes(`href="${PWA_MANIFEST_PATH}"`)) return html
+  const markup = `<link rel="manifest" href="${PWA_MANIFEST_PATH}"><meta name="theme-color" content="${PWA_THEME_COLOR}">`
+  const head = html.indexOf('</head>')
+  return head < 0 ? `${markup}${html}` : `${html.slice(0, head)}${markup}${html.slice(head)}`
+}
+
 function rewriteMobileIndexWithBatch(
   html: string,
   options: { readonly sizes?: ReadonlyMap<string, number>; readonly passThrough?: ReadonlySet<string>; readonly excludedClientModules?: readonly string[]; readonly csrfCookie?: string } = {},
@@ -698,7 +738,7 @@ function rewriteMobileIndexWithBatch(
   const replacement = `${MOBILE_GATEWAY_REACHABILITY_BOOTSTRAP}${transportBootstrap}${mobileCsrfFetchBootstrap(options.csrfCookie ?? CSRF_COOKIE)}window.__DSH_MOBILE_FRONTEND__="dedicated";${plan.assignment}${JSON.stringify(plan.parsed)};`
   const rewritten = `${html.slice(0, plan.replaceStart)}${replacement}${html.slice(plan.replaceEnd)}`
   return Object.freeze({
-    html: ensureMobileViewport(ensureMobileCompatibility(rewriteMobileApplicationPreloads(rewritten, preloadReplacements))),
+    html: injectPwaHead(ensureMobileViewport(ensureMobileCompatibility(rewriteMobileApplicationPreloads(rewritten, preloadReplacements)))),
     batches,
   })
 }
@@ -706,6 +746,26 @@ function rewriteMobileIndexWithBatch(
 /** Rewrite the dedicated mobile graph; exclusions are opt-in and leave stock DSH unchanged. */
 export function rewriteMobileIndex(html: string, excludedClientModules: readonly string[] = []): string {
   return rewriteMobileIndexWithBatch(html, { excludedClientModules }).html
+}
+
+/**
+ * One origin the PC client can be reached on, in the order the owner should try.
+ */
+export interface PcClientChannel {
+  readonly channel: 'lan' | 'remote'
+  readonly origin: string
+}
+
+/**
+ * Runtime facts the PC install package needs. The plugin owns them: the gateway
+ * cannot know whether the current remote channel is self-signed, and it must not
+ * guess which CA a friend's browser has to trust.
+ */
+export interface PcClientSource {
+  /** Channels that currently have a reachable origin, preferred first. */
+  readonly channels: () => Promise<readonly PcClientChannel[]>
+  /** CA the browser must trust for one channel, when that entry is self-signed. */
+  readonly certificate: (channel: 'lan' | 'remote') => Promise<{ readonly name: string; readonly body: Buffer } | undefined>
 }
 
 class ByteLimitTransform extends Transform {
@@ -1701,6 +1761,22 @@ export class MobileAccessGateway {
     sendJson(response, 200, { loggedOut: true }, this.tlsEnabled)
   }
 
+  /**
+   * Options for the desktop-first entry page. The certificate is offered exactly
+   * when this gateway serves its own CA, so the page never sends a browser to a
+   * trust step that does not apply to a public-CA entry.
+   */
+  private pcEntryOptions(): PairPageOptions {
+    return Object.freeze({
+      certificateRequired: this.pairingCaCertificate !== undefined,
+      certificateUrl: `${AUTH_PREFIX}/ca.cer`,
+      manifestPath: PWA_MANIFEST_PATH,
+      serviceWorkerPath: PWA_SERVICE_WORKER_PATH,
+      scriptPath: PC_ENTRY_SCRIPT_PATH,
+      entryPath: PC_ENTRY_PATH,
+    })
+  }
+
   private async handleExternalRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const target = parseRequestTarget(request.url)
     const policy = this.requirePolicy()
@@ -1742,6 +1818,57 @@ export class MobileAccessGateway {
         'Content-Type': 'application/pkix-cert',
         'Content-Length': body.length,
         'Cache-Control': 'no-store',
+      })
+      response.end(body)
+      return
+    }
+    if (target.search === '' && (request.method === 'GET' || request.method === 'HEAD')) {
+      const pwaDocument = target.decodedPathname === PWA_MANIFEST_PATH
+        ? { body: Buffer.from(renderWebAppManifest({})), contentType: 'application/manifest+json; charset=utf-8' }
+        : target.decodedPathname === PWA_SERVICE_WORKER_PATH
+          ? { body: Buffer.from(renderPwaServiceWorker()), contentType: 'text/javascript; charset=utf-8' }
+          : undefined
+      if (pwaDocument !== undefined) {
+        setSecurityHeaders(response, this.tlsEnabled)
+        // Revalidate both documents: the manifest must follow the plugin, and a
+        // service worker script may not be cached for more than a day anyway.
+        response.setHeader('Cache-Control', 'no-cache')
+        if (pwaDocument.contentType.startsWith('text/javascript')) response.setHeader('Service-Worker-Allowed', '/')
+        response.writeHead(200, {
+          'Content-Type': pwaDocument.contentType,
+          'Content-Length': pwaDocument.body.byteLength,
+        })
+        if (request.method === 'HEAD') response.end()
+        else response.end(pwaDocument.body)
+        return
+      }
+      const icon = PWA_ICONS.find(candidate => candidate.url === target.decodedPathname)
+      if (icon !== undefined) {
+        let body: Buffer
+        try {
+          body = await readFile(pwaIconPath(icon))
+        } catch {
+          throw new HttpError(404, 'not_found')
+        }
+        setSecurityHeaders(response, this.tlsEnabled)
+        response.setHeader('Cache-Control', 'public, max-age=86400')
+        response.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': body.byteLength })
+        if (request.method === 'HEAD') response.end()
+        else response.end(body)
+        return
+      }
+    }
+    if (target.search === '' && request.method === 'GET'
+      && (target.decodedPathname === PC_ENTRY_PATH || target.decodedPathname === PC_ENTRY_SCRIPT_PATH)) {
+      const languageHeader = request.headers['accept-language']
+      const locale = resolveAuthPageLocale(typeof languageHeader === 'string' ? languageHeader : undefined)
+      setSecurityHeaders(response, this.tlsEnabled)
+      response.setHeader('Vary', 'Accept-Language')
+      const script = target.decodedPathname === PC_ENTRY_SCRIPT_PATH
+      const body = script ? renderPairScript(locale) : renderPcEntryPage(locale, this.pcEntryOptions())
+      response.writeHead(200, {
+        'Content-Type': script ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
       })
       response.end(body)
       return
@@ -1818,19 +1945,31 @@ export class MobileAccessGateway {
               contentType: 'text/javascript; charset=utf-8',
               fallback: CUSTOM_SCRIPT_FALLBACK,
             }
-          : target.decodedPathname === MOBILE_LAYOUT_PATH
+          : target.decodedPathname === DESKTOP_STYLE_PATH
             ? {
-                file: this.config.mobileLayoutFile,
-                contentType: 'text/javascript; charset=utf-8',
-                fallback: undefined,
+                file: this.config.desktopCssFile,
+                contentType: 'text/css; charset=utf-8',
+                fallback: DESKTOP_STYLE_FALLBACK,
               }
-            : target.decodedPathname === MOBILE_COMPAT_PATH
+            : target.decodedPathname === DESKTOP_SCRIPT_PATH
               ? {
-                  file: this.config.mobileCompatibilityFile,
+                  file: this.config.desktopScriptFile,
                   contentType: 'text/javascript; charset=utf-8',
-                  fallback: undefined,
+                  fallback: DESKTOP_SCRIPT_FALLBACK,
                 }
-              : undefined
+              : target.decodedPathname === MOBILE_LAYOUT_PATH
+                ? {
+                    file: this.config.mobileLayoutFile,
+                    contentType: 'text/javascript; charset=utf-8',
+                    fallback: undefined,
+                  }
+                : target.decodedPathname === MOBILE_COMPAT_PATH
+                  ? {
+                      file: this.config.mobileCompatibilityFile,
+                      contentType: 'text/javascript; charset=utf-8',
+                      fallback: undefined,
+                    }
+                  : undefined
       : undefined
     if (customAsset === undefined && requestedMobileBootBatch === undefined && !computerImages && !computerImage && !clientModules
       && extensionTarget(target.decodedPathname) === undefined
@@ -2015,14 +2154,18 @@ export class MobileAccessGateway {
           if (source.byteLength > 256 * 1024) throw new HttpError(413, 'payload_too_large')
           return createHash('sha256').update(source).digest('hex')
         }
-        const [scriptRevision, styleRevision] = await Promise.all([
+        const [scriptRevision, styleRevision, desktopScriptRevision, desktopStyleRevision] = await Promise.all([
           customRevision(this.config.customScriptFile, CUSTOM_SCRIPT_FALLBACK),
           customRevision(this.config.customCssFile, CUSTOM_STYLE_FALLBACK),
+          customRevision(this.config.desktopScriptFile, DESKTOP_SCRIPT_FALLBACK),
+          customRevision(this.config.desktopCssFile, DESKTOP_STYLE_FALLBACK),
         ])
         const body = Buffer.from(JSON.stringify({
           protocol: 1,
           extensions: extensions.manifest(),
-          legacy: { scriptRevision, styleRevision },
+          // The phone layer and the PC layer carry their own revisions: a client
+          // loads one of them, so an edit to the other must not force a refetch.
+          legacy: { scriptRevision, styleRevision, desktopScriptRevision, desktopStyleRevision },
         }))
         // The ETag must cover extension content, not just the manifest body, so
         // editing mobile.js/css alone invalidates the client's cached manifest.
@@ -2944,6 +3087,8 @@ export class MobileAccessGateway {
     const task = Promise.all([
       digestFile(this.config.customScriptFile, CUSTOM_SCRIPT_FALLBACK),
       digestFile(this.config.customCssFile, CUSTOM_STYLE_FALLBACK),
+      digestFile(this.config.desktopScriptFile, DESKTOP_SCRIPT_FALLBACK),
+      digestFile(this.config.desktopCssFile, DESKTOP_STYLE_FALLBACK),
     ]).then(parts => {
       const next = createHash('sha256').update(parts.join('|')).digest('hex')
       if (this.legacyCustomDigest !== '' && next !== this.legacyCustomDigest) this.broadcastExtensionChange()
@@ -3208,6 +3353,7 @@ export class MobileAccessGateway {
   localAdminRoute(
     prefix: string = LOCAL_ADMIN_PREFIX,
     authenticateDesktop?: (request: IncomingMessage) => boolean,
+    pcClient?: PcClientSource,
   ): WebRoute {
     return {
       kind: 'prefix',
@@ -3217,7 +3363,16 @@ export class MobileAccessGateway {
           const target = parseRequestTarget(request.url)
           const mutation = request.method === 'POST'
           assertLocalAdminTrust(request, mutation, () => authenticateDesktop?.(request) === true)
-          if (target.search !== '') throw new HttpError(400, 'bad_request')
+          const pcPackageRequest = pcClient !== undefined && request.method === 'GET' && target.decodedPathname === `${prefix}/package`
+          if (target.search !== '' && !pcPackageRequest) throw new HttpError(400, 'bad_request')
+          if (pcClient !== undefined && request.method === 'GET' && target.decodedPathname === `${prefix}/info`) {
+            sendJson(response, 200, await this.pcClientInfo(pcClient), false)
+            return
+          }
+          if (pcPackageRequest) {
+            await this.sendPcClientPackage(request, response, pcClient)
+            return
+          }
           if (request.method === 'GET' && target.decodedPathname === `${prefix}/status`) {
             sendJson(response, 200, {
               gateway: this.address(),
@@ -3297,6 +3452,55 @@ export class MobileAccessGateway {
         }
       },
     }
+  }
+
+  /** Describe the PC client entry points for the owner's Mobile Access panel. */
+  private async pcClientInfo(source: PcClientSource): Promise<Record<string, unknown>> {
+    const channels = await source.channels()
+    const preferred = channels.find(entry => entry.channel === 'lan') ?? channels[0]
+    const certificate = preferred === undefined ? undefined : await source.certificate(preferred.channel)
+    return {
+      entryPath: PC_ENTRY_PATH,
+      packagePath: `${LOCAL_ADMIN_PREFIX}/pc/package`,
+      certificate: {
+        available: certificate !== undefined,
+        url: preferred === undefined ? `${AUTH_PREFIX}/ca.cer` : `${preferred.origin}${AUTH_PREFIX}/ca.cer`,
+      },
+      channels: channels.map(entry => ({
+        channel: entry.channel,
+        origin: entry.origin,
+        entryUrl: `${entry.origin}${PC_ENTRY_PATH}`,
+      })),
+    }
+  }
+
+  /** Build the install package for one PC channel; the pairing code is never part of it. */
+  private async sendPcClientPackage(request: IncomingMessage, response: ServerResponse, source: PcClientSource): Promise<void> {
+    const requested = new URLSearchParams(parseRequestTarget(request.url).search).get('channel')
+    if (requested !== null && requested !== 'lan' && requested !== 'remote') throw new HttpError(400, 'bad_request')
+    const channels = await source.channels()
+    const chosen = requested === null
+      ? channels.find(entry => entry.channel === 'lan') ?? channels[0]
+      : channels.find(entry => entry.channel === requested)
+    if (chosen === undefined) throw new HttpError(409, 'channel_unavailable')
+    const certificate = await source.certificate(chosen.channel)
+    const languageHeader = request.headers['accept-language']
+    const locale = resolveAuthPageLocale(typeof languageHeader === 'string' ? languageHeader : undefined)
+    const body = buildPcPackage({
+      origin: chosen.origin,
+      entryPath: PC_ENTRY_PATH,
+      locale,
+      ...(certificate === undefined ? {} : { certificate }),
+    })
+    setSecurityHeaders(response, this.tlsEnabled)
+    response.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Length': body.byteLength,
+      'Content-Disposition': `attachment; filename="${PC_PACKAGE_FILENAME}"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    })
+    response.end(body)
   }
 
   /** Close listeners and abort all accepted work before resolving teardown. */

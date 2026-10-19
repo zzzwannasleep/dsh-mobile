@@ -2,6 +2,10 @@
 
 Notable changes are recorded here. GitHub Releases provide the downloadable packages and generated commit notes.
 
+## Unreleased
+
+- Add a PC client so a friend can use the owner's DSH from a Windows browser: an always-available `/mobile-access/pc` entry page with certificate guidance and a pairing form, a downloadable `dsh-mobile-pc.zip` (trust-certificate and launcher scripts, Internet shortcut, localized README), a web app manifest with a pass-through service worker and icons for installing the page as a desktop app, a `desktop.css` / `desktop.js` customization layer applied only to non-touch browsers, and a `PC 端` tab in Mobile Access for entry addresses, pairing codes and the package download. [Guide](docs/PC_CLIENT.en.md).
+
 ## 0.7.4 - 2026-10-13
 
 - Fix a 0.7.3 regression where the Mobile Access window opened on every DSH start: a display declaration on the panel beat the browser's `[hidden]` rule, and the panel now carries an explicit guard so it stays closed until opened.

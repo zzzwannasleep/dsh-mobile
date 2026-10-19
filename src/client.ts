@@ -187,6 +187,7 @@ declare global {
   interface Window {
     dshMobile?: {
       register(mount: MobileExtensionMount): void
+      registerDesktop(mount: MobileExtensionMount): void
       define(definition: MobileClientDefinition): void
     }
     __DSH_MOBILE_FRONTEND__?: 'dedicated'
@@ -200,9 +201,11 @@ declare global {
 
 const queuedDefinitions: MobileClientDefinition[] = []
 let queuedLegacyMount: MobileExtensionMount | undefined
+let queuedDesktopMount: MobileExtensionMount | undefined
 if (typeof window !== 'undefined' && window.dshMobile === undefined) {
   window.dshMobile = {
     register: mount => { queuedLegacyMount = mount },
+    registerDesktop: mount => { queuedDesktopMount = mount },
     define: definition => { queuedDefinitions.push(definition) },
   }
 }
@@ -554,6 +557,79 @@ export function clientReleaseInfo(data: Readonly<Record<string, unknown>>): Clie
   }
 }
 
+export interface PcClientChannel {
+  readonly channel: 'lan' | 'remote'
+  readonly origin: string
+  readonly entryUrl: string
+}
+export interface PcClientInfo {
+  readonly entryPath: string
+  readonly packagePath: string
+  /** Present only when the gateway reports an available certificate URL. */
+  readonly certificateUrl?: string
+  readonly channels: readonly PcClientChannel[]
+}
+
+const PC_ENTRY_PATH_FALLBACK = '/mobile-access/pc'
+const PC_PACKAGE_PATH_FALLBACK = '/api/mobile-access/pc/package'
+
+/** Accept an origin-relative path without traversal, or fall back to the known route. */
+function pcRelativePath(value: unknown, fallback: string): string {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || value.includes('\\')) return fallback
+  const pathname = value.split(/[?#]/u, 1)[0] ?? ''
+  return pathname.split('/').some(part => part === '.' || part === '..') ? fallback : value
+}
+
+/** Accept a same-origin path or an absolute HTTP(S) URL, and nothing else. */
+function pcAssetUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value === '' || value.includes('\\')) return undefined
+  if (value.startsWith('/')) return value.startsWith('//') ? undefined : value
+  try {
+    const target = new URL(value)
+    return target.protocol === 'https:' || target.protocol === 'http:' ? target.href : undefined
+  } catch { return undefined }
+}
+
+/** Accept only an absolute HTTP(S) origin, because the PC entry lives on it. */
+function pcOrigin(value: unknown): string | undefined {
+  const url = pcAssetUrl(value)
+  if (url === undefined || url.startsWith('/')) return undefined
+  try { return new URL(url).origin } catch { return undefined }
+}
+
+/**
+ * Reduce the loopback PC info response to the URLs the tab may render.
+ * A channel without a usable origin is dropped rather than shown as a broken
+ * entry, and a missing `entryUrl` is rebuilt from that channel's own origin.
+ */
+export function pcClientInfo(data: Readonly<Record<string, unknown>>): PcClientInfo {
+  const entryPath = pcRelativePath(data.entryPath, PC_ENTRY_PATH_FALLBACK)
+  const packagePath = pcRelativePath(data.packagePath, PC_PACKAGE_PATH_FALLBACK)
+  const channels: PcClientChannel[] = []
+  const seen = new Set<string>()
+  if (Array.isArray(data.channels)) {
+    for (const value of data.channels) {
+      if (typeof value !== 'object' || value === null) continue
+      const entry = value as { channel?: unknown; origin?: unknown; entryUrl?: unknown }
+      const channel = entry.channel === 'lan' || entry.channel === 'remote' ? entry.channel : undefined
+      const origin = pcOrigin(entry.origin)
+      if (channel === undefined || origin === undefined || seen.has(channel)) continue
+      seen.add(channel)
+      channels.push({ channel, origin, entryUrl: pcAssetUrl(entry.entryUrl) ?? `${origin}${entryPath}` })
+    }
+  }
+  const certificate = data.certificate
+  const certificateUrl = typeof certificate === 'object' && certificate !== null && (certificate as { available?: unknown }).available === true
+    ? pcAssetUrl((certificate as { url?: unknown }).url)
+    : undefined
+  return {
+    entryPath,
+    packagePath,
+    ...(certificateUrl === undefined ? {} : { certificateUrl }),
+    channels,
+  }
+}
+
 async function requestJson(
   path: string,
   init?: RequestInit,
@@ -720,7 +796,9 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const switcher = element('div', 'dsh-mobile-control__switcher')
   const lanTab = element('button', 'dsh-mobile-control__tab is-active'); lanTab.type = 'button'; lanTab.textContent = t('lan')
   const remoteTab = element('button', 'dsh-mobile-control__tab'); remoteTab.type = 'button'; remoteTab.textContent = t('remote')
-  lanTab.setAttribute('aria-pressed', 'true'); remoteTab.setAttribute('aria-pressed', 'false'); switcher.append(lanTab, remoteTab)
+  const pcTab = element('button', 'dsh-mobile-control__tab'); pcTab.type = 'button'; pcTab.textContent = t('pc')
+  lanTab.setAttribute('aria-pressed', 'true'); remoteTab.setAttribute('aria-pressed', 'false'); pcTab.setAttribute('aria-pressed', 'false')
+  switcher.append(lanTab, remoteTab, pcTab)
   const lanView = element('div', 'dsh-mobile-control__view')
   const lanSetup = element('section', 'dsh-mobile-control__lan-setup'); lanSetup.hidden = true
   const lanSetupTitle = element('h3', 'dsh-mobile-control__section-title'); lanSetupTitle.textContent = t('lanSetupTitle')
@@ -1092,11 +1170,166 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const diagnosticsDetailsSummary = element('summary'); diagnosticsDetailsSummary.textContent = t('diagnosticsAdvanced')
   const diagnosticsReport = element('pre', 'dsh-mobile-control__diagnostic-report')
   diagnosticsDetails.append(diagnosticsDetailsSummary, diagnosticsReport)
+  const pcView = element('div', 'dsh-mobile-control__view is-pc'); pcView.hidden = true
+  const pcIntro = element('p', 'dsh-mobile-control__intro'); pcIntro.textContent = t('pcIntro')
+  const pcChannelList = element('div', 'dsh-mobile-control__pc-channels')
+  const pcChannelsEmpty = element('p', 'dsh-mobile-control__component-note'); pcChannelsEmpty.textContent = t('pcNoChannels'); pcChannelsEmpty.hidden = true
+  const pcActions = element('div', 'dsh-mobile-control__actions')
+  const pcPair = element('button', 'dsh-mobile-control__primary'); pcPair.type = 'button'; pcPair.textContent = t('pcGenerateKey'); pcPair.disabled = true
+  const pcPackage = element('button', 'dsh-mobile-control__secondary'); pcPackage.type = 'button'; pcPackage.textContent = t('pcDownloadPackage'); pcPackage.disabled = true
+  pcActions.append(pcPair, pcPackage)
+  const pcPairResult = element('div', 'dsh-mobile-control__pc-pair'); pcPairResult.hidden = true
+  const pcPairKeyRow = element('div', 'dsh-mobile-control__pc-pair-row')
+  const pcPairKeyLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairKeyLabel.textContent = t('pcAppKeyLabel')
+  const pcPairKeyValueRow = element('div', 'dsh-mobile-control__pc-pair-value-row')
+  const pcPairKeyValue = element('code', 'dsh-mobile-control__pc-pair-value')
+  const pcPairKeyCopy = element('button', 'dsh-mobile-control__pc-copy'); pcPairKeyCopy.type = 'button'; pcPairKeyCopy.textContent = t('pcCopyKey')
+  pcPairKeyCopy.addEventListener('click', () => { void copyPcText(pcPairKeyValue.textContent ?? '', t('pcKeyCopied'), t('pcAppKeyLabel')) })
+  pcPairKeyValueRow.append(pcPairKeyValue, pcPairKeyCopy)
+  pcPairKeyRow.append(pcPairKeyLabel, pcPairKeyValueRow)
+  const pcPairLinkRow = element('div', 'dsh-mobile-control__pc-pair-row')
+  const pcPairLinkLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairLinkLabel.textContent = t('pcEntryLinkLabel')
+  const pcPairLinkValue = element('code', 'dsh-mobile-control__pc-pair-value')
+  pcPairLinkRow.append(pcPairLinkLabel, pcPairLinkValue)
+  pcPairResult.append(pcPairKeyRow, pcPairLinkRow)
+  const pcCertificate = element('p', 'dsh-mobile-control__component-note dsh-mobile-control__pc-certificate'); pcCertificate.hidden = true
+  const pcCertificateNote = element('span'); pcCertificateNote.textContent = `${t('pcCertificateNote')} `
+  const pcCertificateLink = element('a', 'dsh-mobile-control__text-link'); pcCertificateLink.textContent = t('pcDownloadCertificate'); pcCertificateLink.setAttribute('download', 'dsh-mobile-ca.cer'); pcCertificateLink.rel = 'noopener'
+  pcCertificate.append(pcCertificateNote, pcCertificateLink)
+  const pcSteps = element('ol', 'dsh-mobile-control__pc-steps')
+  for (const stepKey of ['pcStepOpen', 'pcStepInstall', 'pcStepLaunch']) {
+    const step = element('li'); step.textContent = t(stepKey); pcSteps.append(step)
+  }
+  const pcStatus = element('p', 'dsh-mobile-control__status'); pcStatus.setAttribute('role', 'status'); pcStatus.setAttribute('aria-live', 'polite')
+  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcActions, pcPairResult, pcCertificate, pcSteps, pcStatus)
+  let pcChannels: readonly PcClientChannel[] = []
+  let pcActiveChannel: 'lan' | 'remote' | '' = ''
+  let pcEntryPath = PC_ENTRY_PATH_FALLBACK
+  let pcPackagePath = PC_PACKAGE_PATH_FALLBACK
+  let pcBusy = false
+  let pcPackageBusy = false
+  const pcChannelName = (channel: 'lan' | 'remote'): string => channel === 'lan' ? t('lan') : t('remote')
+  const syncPcControls = (): void => {
+    const available = pcActiveChannel !== ''
+    pcPair.disabled = !available || pcBusy
+    pcPackage.disabled = !available || pcPackageBusy
+    pcPair.setAttribute('aria-busy', String(pcBusy))
+    pcPackage.setAttribute('aria-busy', String(pcPackageBusy))
+  }
+  /** Copy one PC value, or show it for manual copying when the clipboard is denied. */
+  const copyPcText = async (value: string, copied: string, kind: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(value)
+      pcStatus.classList.remove('is-key')
+      pcStatus.textContent = copied
+    } catch {
+      pcStatus.classList.add('is-key')
+      pcStatus.textContent = t('copySecret', { kind, value })
+    }
+  }
+  const renderPcChannels = (): void => {
+    pcChannelList.replaceChildren()
+    for (const entry of pcChannels) {
+      const row = element('div', `dsh-mobile-control__pc-channel${entry.channel === pcActiveChannel ? ' is-active' : ''}`)
+      row.dataset.pcChannel = entry.channel
+      const choice = element('button', 'dsh-mobile-control__pc-channel-choice'); choice.type = 'button'
+      choice.setAttribute('aria-pressed', String(entry.channel === pcActiveChannel))
+      const name = element('span', 'dsh-mobile-control__pc-channel-name'); name.textContent = pcChannelName(entry.channel)
+      const url = element('span', 'dsh-mobile-control__pc-channel-url'); url.textContent = entry.entryUrl
+      choice.append(name, url)
+      choice.addEventListener('click', () => {
+        if (pcActiveChannel === entry.channel) return
+        pcActiveChannel = entry.channel
+        renderPcChannels()
+        syncPcControls()
+      })
+      const copy = element('button', 'dsh-mobile-control__pc-copy'); copy.type = 'button'; copy.textContent = t('pcCopyUrl')
+      copy.setAttribute('aria-label', t('pcCopyUrlAria', { channel: pcChannelName(entry.channel) }))
+      copy.addEventListener('click', () => { void copyPcText(entry.entryUrl, t('pcUrlCopied'), t('pcEntryLinkLabel')) })
+      row.append(choice, copy)
+      pcChannelList.append(row)
+    }
+    pcChannelList.hidden = pcChannels.length === 0
+    pcChannelsEmpty.hidden = pcChannels.length > 0
+  }
+  const renderPcInfo = (data: Record<string, unknown>): void => {
+    const info = pcClientInfo(data)
+    pcEntryPath = info.entryPath
+    pcPackagePath = info.packagePath
+    pcChannels = info.channels
+    if (!pcChannels.some(entry => entry.channel === pcActiveChannel)) pcActiveChannel = pcChannels[0]?.channel ?? ''
+    pcCertificate.hidden = info.certificateUrl === undefined
+    if (info.certificateUrl !== undefined) pcCertificateLink.href = info.certificateUrl
+    renderPcChannels()
+    syncPcControls()
+  }
+  const loadPcInfo = (): void => {
+    pcStatus.classList.remove('is-key')
+    pcStatus.textContent = t('loadingStatus')
+    void controlRequestJson('/api/mobile-access/pc/info').then(renderPcInfo, error => {
+      pcStatus.textContent = t('pcInfoFailed', { error: String(error) })
+    })
+  }
+  const generatePcKey = (): void => {
+    if (pcBusy || pcActiveChannel === '') return
+    const channel = pcActiveChannel
+    const channelInfo = pcChannels.find(entry => entry.channel === channel)
+    if (channelInfo === undefined) return
+    pcBusy = true
+    syncPcControls()
+    pcPairResult.hidden = true
+    pcStatus.classList.remove('is-key')
+    pcStatus.textContent = t('pcGeneratingKey')
+    // The pairing window is the same one the phone uses; only the entry link differs.
+    const path = channel === 'remote' ? '/api/mobile-access/remote/pairing/open' : '/api/mobile-access/lan/pairing/open'
+    void controlRequestJson(path, { method: 'POST', body: '{}' }).then(async data => {
+      const appKey = typeof data.appKey === 'string' ? data.appKey : ''
+      if (appKey === '') { pcStatus.textContent = t('keyGenerationFailed'); return }
+      const entryUrl = `${channelInfo.origin}${pcEntryPath}#key=${encodeURIComponent(appKey)}`
+      pcPairKeyValue.textContent = appKey
+      pcPairLinkValue.textContent = entryUrl
+      pcPairResult.hidden = false
+      await copyPcText(entryUrl, t('pcKeyReady'), t('pcEntryLinkLabel'))
+    }, error => { pcStatus.textContent = t('requestFailed', { error: String(error) }) }).finally(() => {
+      pcBusy = false
+      syncPcControls()
+    })
+  }
+  const downloadPcPackage = (): void => {
+    if (pcPackageBusy || pcActiveChannel === '') return
+    const channel = pcActiveChannel
+    pcPackageBusy = true
+    syncPcControls()
+    pcStatus.classList.remove('is-key')
+    pcStatus.textContent = t('pcPreparingPackage')
+    void fetch(`${pcPackagePath}?channel=${encodeURIComponent(channel)}`, { credentials: 'same-origin', cache: 'no-store', signal: lifecycle.signal }).then(async response => {
+      if (!response.ok) {
+        let code = ''
+        try {
+          const body = await response.json() as Record<string, unknown>
+          code = typeof body.error === 'string' ? body.error : ''
+        } catch { /* A non-JSON failure keeps the generic message. */ }
+        pcStatus.textContent = code === 'channel_unavailable' ? t('pcChannelUnavailable') : t('pcPackageFailed', { error: `HTTP ${String(response.status)}` })
+        return
+      }
+      const url = URL.createObjectURL(await response.blob())
+      const anchor = element('a'); anchor.href = url; anchor.download = 'dsh-mobile-pc.zip'; anchor.rel = 'noopener'; anchor.hidden = true
+      document.body.append(anchor); anchor.click(); anchor.remove()
+      window.setTimeout(() => { URL.revokeObjectURL(url) }, 30_000)
+      pcStatus.textContent = t('pcPackageReady')
+    }, error => { pcStatus.textContent = t('pcPackageFailed', { error: String(error) }) }).finally(() => {
+      pcPackageBusy = false
+      syncPcControls()
+    })
+  }
+  pcPair.addEventListener('click', generatePcKey)
+  pcPackage.addEventListener('click', downloadPcPackage)
+  syncPcControls()
   header.append(title, headerActions); actions.append(toggle, pair, linkPair)
   lanView.append(lanSetup, access, qrBox, status, extensionStatus, actions, manageRow, devicePanel, trustedNetworks)
   remoteView.append(remoteIntro, httpFrameWarning, providerSection, remoteWorkspace)
   diagnosticsView.append(diagnosticsIntro, diagnosticsSummary, diagnosticsToolbar, diagnosticsFeedback, diagnosticsChecks, wsPathsSection, diagnosticsDetails)
-  panel.append(header, releaseNotice, updateCard, appDownload, extensionRecovery.section, switcher, lanView, remoteView, diagnosticsView); windowBox.append(backdrop, panel); root.append(windowBox); document.body.append(root)
+  panel.append(header, releaseNotice, updateCard, appDownload, extensionRecovery.section, switcher, lanView, remoteView, pcView, diagnosticsView); windowBox.append(backdrop, panel); root.append(windowBox); document.body.append(root)
   let running = false
   let origin = ''
   let lanConfigured = true
@@ -1158,7 +1391,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   let sakuraInstalled = false
   let providerInfoPinned = false
   let providerInfoHovered = false
-  let previousAccessView: 'lan' | 'remote' = 'lan'
+  let previousAccessView: 'lan' | 'remote' | 'pc' = 'lan'
   let diagnosticsBusy = false
   let copiedDiagnosticReport = ''
   let pluginUpdateAvailable = false
@@ -1196,16 +1429,19 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     providerInfoPopover.hidden = true
     providerInfoButton.setAttribute('aria-expanded', 'false')
   })
-  const selectView = (view: 'lan' | 'remote' | 'diagnostics'): void => {
+  const selectView = (view: 'lan' | 'remote' | 'pc' | 'diagnostics'): void => {
     if (!panel.hidden) void extensionRecovery.refresh()
     if (view !== 'diagnostics') previousAccessView = view
     lanView.hidden = view !== 'lan'
     remoteView.hidden = view !== 'remote'
+    pcView.hidden = view !== 'pc'
     diagnosticsView.hidden = view !== 'diagnostics'
     lanTab.classList.toggle('is-active', view === 'lan')
     remoteTab.classList.toggle('is-active', view === 'remote')
+    pcTab.classList.toggle('is-active', view === 'pc')
     lanTab.setAttribute('aria-pressed', String(view === 'lan'))
     remoteTab.setAttribute('aria-pressed', String(view === 'remote'))
+    pcTab.setAttribute('aria-pressed', String(view === 'pc'))
     diagnosticsEntry.setAttribute('aria-pressed', String(view === 'diagnostics'))
     diagnosticsEntry.textContent = view === 'diagnostics' ? t('back') : t('diagnostics')
     diagnosticsEntry.setAttribute('aria-label', view === 'diagnostics' ? t('backToMobile') : t('openDiagnostics'))
@@ -1215,12 +1451,14 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       if (!wsPathsLoaded) loadWsPaths()
     }
     updatePlugin.hidden = view === 'diagnostics' || !pluginUpdateAvailable
-    appDownload.hidden = view === 'diagnostics'
+    // The Android download link is meaningless on the PC tab, which offers its own package.
+    appDownload.hidden = view === 'diagnostics' || view === 'pc'
     switcher.hidden = view === 'diagnostics'
-    title.textContent = view === 'lan' ? t('lanAccess') : view === 'remote' ? t('remoteAccess') : t('connectionDiagnostics')
+    title.textContent = view === 'lan' ? t('lanAccess') : view === 'remote' ? t('remoteAccess') : view === 'pc' ? t('pcAccess') : t('connectionDiagnostics')
   }
   lanTab.addEventListener('click', () => { selectView('lan') })
   remoteTab.addEventListener('click', () => { selectView('remote'); loadRemote() })
+  pcTab.addEventListener('click', () => { selectView('pc'); loadPcInfo() })
   let lastTriggerFocus: HTMLElement | undefined
   const setOpen = (open: boolean): void => {
     panel.hidden = !open
@@ -2354,6 +2592,58 @@ export function publishAuthoritativeExtensionIds(
   for (const id of seen) authoritativeIds.add(id)
 }
 
+/** One client's customization layer; the phone and PC layers never both load. */
+export type MobileCustomizationLayer = 'mobile' | 'desktop'
+
+/**
+ * Pick the customization layer for one client. Touch-primary clients keep the
+ * phone layer; every other client is a PC and gets the desktop layer.
+ */
+export function selectCustomizationLayer(touchPrimary: boolean): MobileCustomizationLayer {
+  return touchPrimary ? 'mobile' : 'desktop'
+}
+
+/** The two same-origin asset paths served for one customization layer. */
+export function customizationLayerPaths(layer: MobileCustomizationLayer): { readonly script: string; readonly style: string } {
+  return layer === 'desktop'
+    ? { script: '/mobile-access/desktop.js', style: '/mobile-access/desktop.css' }
+    : { script: '/mobile-access/custom.js', style: '/mobile-access/custom.css' }
+}
+
+/** One optional manifest revision; a missing or non-string value reads as empty. */
+export function normalizeCustomizationRevision(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Select the active layer's revisions from the manifest's legacy fields. The PC
+ * layer has its own pair, so a desktop refresh can never reuse a phone revision.
+ */
+export function selectCustomizationRevisions(
+  legacy: {
+    readonly scriptRevision?: unknown
+    readonly styleRevision?: unknown
+    readonly desktopScriptRevision?: unknown
+    readonly desktopStyleRevision?: unknown
+  },
+  layer: MobileCustomizationLayer,
+): { readonly scriptRevision: string; readonly styleRevision: string } {
+  return layer === 'desktop'
+    ? {
+      scriptRevision: normalizeCustomizationRevision(legacy.desktopScriptRevision),
+      styleRevision: normalizeCustomizationRevision(legacy.desktopStyleRevision),
+    }
+    : {
+      scriptRevision: normalizeCustomizationRevision(legacy.scriptRevision),
+      styleRevision: normalizeCustomizationRevision(legacy.styleRevision),
+    }
+}
+
+/** Whether one manifest revision needs a fetch; an empty revision always does. */
+export function shouldRefreshCustomizationRevision(revision: string, current: string): boolean {
+  return revision === '' || revision !== current
+}
+
 interface MobileExtensionManifestEntry {
   readonly id: string
   readonly generation?: string
@@ -2363,7 +2653,12 @@ interface MobileExtensionManifestEntry {
 }
 interface MobileExtensionManifest {
   readonly extensions: readonly MobileExtensionManifestEntry[]
-  readonly legacy: { readonly scriptRevision: string; readonly styleRevision: string }
+  readonly legacy: {
+    readonly scriptRevision: string
+    readonly styleRevision: string
+    readonly desktopScriptRevision: string
+    readonly desktopStyleRevision: string
+  }
 }
 
 function validManifestResourceUrl(value: unknown): value is string {
@@ -2376,7 +2671,7 @@ export function parseMobileExtensionManifest(payload: unknown): MobileExtensionM
   if (typeof payload !== 'object' || payload === null) return undefined
   const candidate = payload as { protocol?: unknown; extensions?: unknown; legacy?: unknown }
   if (candidate.protocol !== 1 || !Array.isArray(candidate.extensions) || typeof candidate.legacy !== 'object' || candidate.legacy === null) return undefined
-  const legacy = candidate.legacy as { scriptRevision?: unknown; styleRevision?: unknown }
+  const legacy = candidate.legacy as { scriptRevision?: unknown; styleRevision?: unknown; desktopScriptRevision?: unknown; desktopStyleRevision?: unknown }
   if (typeof legacy.scriptRevision !== 'string' || typeof legacy.styleRevision !== 'string') return undefined
   const ids = new Set<string>()
   const extensions: MobileExtensionManifestEntry[] = []
@@ -2397,7 +2692,15 @@ export function parseMobileExtensionManifest(payload: unknown): MobileExtensionM
       ...(entry.assetsUrl === undefined ? {} : { assetsUrl: entry.assetsUrl }),
     })
   }
-  return { extensions, legacy: { scriptRevision: legacy.scriptRevision, styleRevision: legacy.styleRevision } }
+  return {
+    extensions,
+    legacy: {
+      scriptRevision: legacy.scriptRevision,
+      styleRevision: legacy.styleRevision,
+      desktopScriptRevision: normalizeCustomizationRevision(legacy.desktopScriptRevision),
+      desktopStyleRevision: normalizeCustomizationRevision(legacy.desktopStyleRevision),
+    },
+  }
 }
 
 /** A missing manifest is authoritative before optional legacy resources finish refreshing. */
@@ -2694,14 +2997,50 @@ export class PerIdActivationLifecycle<T> {
   }
 }
 
+interface CustomizationLayerRuntime {
+  readonly layer: MobileCustomizationLayer
+  readonly scriptPath: string
+  readonly stylePath: string
+  readonly sourceUrl: string
+  readonly style: HTMLStyleElement
+  readonly styleState: LegacyCssState
+  mount: MobileExtensionMount | undefined
+  source: string
+  scriptEtag: string
+  scriptModified: string
+  root: HTMLElement | undefined
+  dispose: (() => void) | undefined
+}
+
+/**
+ * Whether this client is touch-primary. The dedicated frontend is the phone
+ * surface, so an environment that cannot report the media query keeps the phone
+ * layer rather than silently switching a phone to the PC layer.
+ */
+function touchPrimaryClient(): boolean {
+  if (typeof window.matchMedia !== 'function') return true
+  return window.matchMedia('(hover: none), (pointer: coarse)').matches
+}
+
 function installCustomAssets(): () => void {
-  const legacyStyle = element('style'); legacyStyle.dataset.plugin = 'dsh-mobile-custom'; document.head.append(legacyStyle)
-  const legacyCssState = { etag: '', modified: '' }
+  const layer = selectCustomizationLayer(touchPrimaryClient())
+  const layerPaths = customizationLayerPaths(layer)
+  const layerStyle = element('style'); layerStyle.dataset.plugin = 'dsh-mobile-custom'; layerStyle.dataset.dshMobileCustomLayer = layer; document.head.append(layerStyle)
+  const custom: CustomizationLayerRuntime = {
+    layer,
+    scriptPath: layerPaths.script,
+    stylePath: layerPaths.style,
+    sourceUrl: layer === 'desktop' ? 'dsh-mobile-desktop.js' : 'dsh-mobile-custom.js',
+    style: layerStyle,
+    styleState: { etag: '', modified: '' },
+    mount: layer === 'desktop' ? queuedDesktopMount : queuedLegacyMount,
+    source: '',
+    scriptEtag: '',
+    scriptModified: '',
+    root: undefined,
+    dispose: undefined,
+  }
   const previous = window.dshMobile
-  let legacyMount: MobileExtensionMount | undefined = queuedLegacyMount
-  let legacySource = ''
-  let legacyRoot: HTMLElement | undefined
-  let legacyDispose: (() => void) | undefined
   const definitions = new Map<string, MobileClientDefinition>()
   type ExtensionSurfaceEntry = { readonly dispose: () => void; readonly container: HTMLElement; readonly host: () => HTMLElement }
   type ActiveExtension = { readonly controller: AbortController; readonly surfaces: Map<string, ExtensionSurfaceEntry>; readonly cleanup?: () => void }
@@ -2907,45 +3246,50 @@ function installCustomAssets(): () => void {
     if (started && expectedDefinitionId === undefined) void activateDefinition(definition)
   }
   let started = false
-  window.dshMobile = Object.freeze({ register: mount => { legacyMount = mount }, define })
+  // Both public registration entry points target the one active layer. The
+  // inactive API keeps queueing so a script that loaded earlier than this
+  // installation still finds its mount when the flow evaluates it.
+  window.dshMobile = Object.freeze({
+    register: mount => { if (layer === 'mobile') custom.mount = mount; else queuedLegacyMount = mount },
+    registerDesktop: mount => { if (layer === 'desktop') custom.mount = mount; else queuedDesktopMount = mount },
+    define,
+  })
   for (const definition of queuedDefinitions.splice(0)) define(definition)
-  let legacyJsEtag = ''
-  let legacyJsModified = ''
-  const refreshLegacy = async (signal: AbortSignal): Promise<boolean> => {
-    const previousMount = legacyMount
+  const refreshLayerScript = async (signal: AbortSignal): Promise<boolean> => {
+    const previousMount = custom.mount
     let pendingRoot: HTMLElement | undefined
     try {
       const headers: Record<string, string> = {}
-      if (legacyJsEtag !== '') headers['if-none-match'] = legacyJsEtag
-      if (legacyJsModified !== '') headers['if-modified-since'] = legacyJsModified
-      const response = await fetch('/mobile-access/custom.js', { credentials: 'same-origin', cache: 'no-store', headers, signal })
+      if (custom.scriptEtag !== '') headers['if-none-match'] = custom.scriptEtag
+      if (custom.scriptModified !== '') headers['if-modified-since'] = custom.scriptModified
+      const response = await fetch(custom.scriptPath, { credentials: 'same-origin', cache: 'no-store', headers, signal })
       if (response.status === 304) return true
       if (!response.ok) return false
       const nextEtag = response.headers.get('etag') ?? ''
       const nextModified = response.headers.get('last-modified') ?? ''
       const next = await response.text()
       if (refreshAborted(signal)) return false
-      if (next === legacySource) { legacyJsEtag = nextEtag; legacyJsModified = nextModified; return true }
-      legacyMount = undefined
-      const script = element('script'); script.textContent = `${next}\n//# sourceURL=dsh-mobile-custom.js`; document.head.append(script); script.remove()
-      if (refreshAborted(signal)) { legacyMount = previousMount; return false }
-      const mount = legacyMount as MobileExtensionMount | undefined
+      if (next === custom.source) { custom.scriptEtag = nextEtag; custom.scriptModified = nextModified; return true }
+      custom.mount = undefined
+      const script = element('script'); script.textContent = `${next}\n//# sourceURL=${custom.sourceUrl}`; document.head.append(script); script.remove()
+      if (refreshAborted(signal)) { custom.mount = previousMount; return false }
+      const mount = custom.mount as MobileExtensionMount | undefined
       if (mount === undefined) {
-        legacyDispose?.(); legacyDispose = undefined
-        legacyRoot?.remove(); legacyRoot = undefined
-        legacySource = next; legacyJsEtag = nextEtag; legacyJsModified = nextModified
+        custom.dispose?.(); custom.dispose = undefined
+        custom.root?.remove(); custom.root = undefined
+        custom.source = next; custom.scriptEtag = nextEtag; custom.scriptModified = nextModified
         return true
       }
       const nextRoot = element('div'); pendingRoot = nextRoot; nextRoot.dataset.dshMobileExtension = 'true'; document.body.append(nextRoot)
       const nextDispose = mount({ document, request: mobileRequest, root: nextRoot, window })
-      if (refreshAborted(signal)) { if (typeof nextDispose === 'function') nextDispose(); pendingRoot.remove(); pendingRoot = undefined; legacyMount = previousMount; return false }
-      legacyDispose?.(); legacyRoot?.remove(); legacyRoot = nextRoot; pendingRoot = undefined; legacyDispose = typeof nextDispose === 'function' ? nextDispose : undefined; legacySource = next
-      legacyJsEtag = nextEtag; legacyJsModified = nextModified
+      if (refreshAborted(signal)) { if (typeof nextDispose === 'function') nextDispose(); pendingRoot.remove(); pendingRoot = undefined; custom.mount = previousMount; return false }
+      custom.dispose?.(); custom.root?.remove(); custom.root = nextRoot; pendingRoot = undefined; custom.dispose = typeof nextDispose === 'function' ? nextDispose : undefined; custom.source = next
+      custom.scriptEtag = nextEtag; custom.scriptModified = nextModified
       return true
-    } catch { pendingRoot?.remove(); legacyMount = previousMount; return false }
+    } catch { pendingRoot?.remove(); custom.mount = previousMount; return false }
   }
-  let legacyScriptRevision = ''
-  let legacyStyleRevision = ''
+  let layerScriptRevision = ''
+  let layerStyleRevision = ''
   const disposeManifestExtension = (id: string): void => {
     activations.remove(id)
     styleNodes.get(id)?.remove(); styleNodes.delete(id); styleEtags.delete(id); scriptDigests.delete(id); activeHostGenerations.delete(id); activationKeys.delete(id)
@@ -2962,11 +3306,11 @@ function installCustomAssets(): () => void {
       if (manifestEtag !== '') headers['if-none-match'] = manifestEtag
       const response = await fetch('/mobile-access/extensions/manifest', { credentials: 'same-origin', cache: 'no-store', headers, signal })
       if (response.status === 404) {
-        legacyScriptRevision = ''
-        legacyStyleRevision = ''
+        layerScriptRevision = ''
+        layerStyleRevision = ''
         return handleMissingExtensionManifest(
           clearManifestExtensions,
-          () => Promise.all([refreshLegacy(signal), refreshCssLegacy(legacyStyle, signal, legacyCssState)]),
+          () => Promise.all([refreshLayerScript(signal), refreshCustomStyle(custom.style, custom.stylePath, signal, custom.styleState)]),
           signal,
         )
       }
@@ -2977,15 +3321,14 @@ function installCustomAssets(): () => void {
       if (refreshAborted(signal) || payload === undefined) return false
       const entries = payload.extensions
       const seen = new Set(entries.map(entry => entry.id))
-      const scriptRevision = payload.legacy.scriptRevision
-      const styleRevision = payload.legacy.styleRevision
+      const revisions = selectCustomizationRevisions(payload.legacy, layer)
       let refreshComplete = true
-      if (scriptRevision === '' || scriptRevision !== legacyScriptRevision) {
-        if (await refreshLegacy(signal)) legacyScriptRevision = scriptRevision
+      if (shouldRefreshCustomizationRevision(revisions.scriptRevision, layerScriptRevision)) {
+        if (await refreshLayerScript(signal)) layerScriptRevision = revisions.scriptRevision
         else refreshComplete = false
       }
-      if (styleRevision === '' || styleRevision !== legacyStyleRevision) {
-        if (await refreshCssLegacy(legacyStyle, signal, legacyCssState)) legacyStyleRevision = styleRevision
+      if (shouldRefreshCustomizationRevision(revisions.styleRevision, layerStyleRevision)) {
+        if (await refreshCustomStyle(custom.style, custom.stylePath, signal, custom.styleState)) layerStyleRevision = revisions.styleRevision
         else refreshComplete = false
       }
       const commitStyle = (id: string, change: 'retain' | 'remove' | 'replace', css?: string, etag?: string): void => {
@@ -3129,20 +3472,20 @@ function installCustomAssets(): () => void {
     },
     () => { fireDeviceRevoked() },
   )
-  return () => { disposed = true; stopNativeBack(); stopEvents(); stopRefresh(); started = false; legacyDispose?.(); legacyDispose = undefined; legacyRoot?.remove(); legacyRoot = undefined; legacyStyle.remove(); activations.dispose(); for (const node of styleNodes.values()) node.remove(); styleNodes.clear(); const layer = document.querySelector('[data-dsh-mobile-extension-layer]'); layer?.remove(); for (const host of document.querySelectorAll('[data-dsh-mobile-surface-host]')) host.remove(); if (previous === undefined) delete window.dshMobile; else window.dshMobile = previous }
+  return () => { disposed = true; stopNativeBack(); stopEvents(); stopRefresh(); started = false; custom.dispose?.(); custom.dispose = undefined; custom.root?.remove(); custom.root = undefined; custom.style.remove(); activations.dispose(); for (const node of styleNodes.values()) node.remove(); styleNodes.clear(); const extensionLayer = document.querySelector('[data-dsh-mobile-extension-layer]'); extensionLayer?.remove(); for (const host of document.querySelectorAll('[data-dsh-mobile-surface-host]')) host.remove(); if (previous === undefined) delete window.dshMobile; else window.dshMobile = previous }
 }
 
 interface LegacyCssState { etag: string; modified: string }
-async function refreshCssLegacy(style: HTMLStyleElement, signal: AbortSignal, state: LegacyCssState): Promise<boolean> {
+async function refreshCustomStyle(style: HTMLStyleElement, path: string, signal: AbortSignal, state: LegacyCssState): Promise<boolean> {
   try {
     const headers: Record<string, string> = {}
     if (state.etag !== '') headers['if-none-match'] = state.etag
     if (state.modified !== '') headers['if-modified-since'] = state.modified
-    let response = await fetch('/mobile-access/custom.css', { credentials: 'same-origin', cache: 'no-store', headers, signal })
+    let response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', headers, signal })
     if (response.status === 304 && style.textContent === '') {
       state.etag = ''
       state.modified = ''
-      response = await fetch('/mobile-access/custom.css', { credentials: 'same-origin', cache: 'no-store', signal })
+      response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', signal })
     }
     if (response.status === 304) return true
     if (response.ok) {
@@ -3181,7 +3524,7 @@ export const CONTROL_STYLES = `
 @keyframes dsh-control-fade{from{opacity:0}to{opacity:1}}
 .dsh-mobile-control__header{position:sticky;top:-16px;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:8px;margin:-16px -16px 10px;padding:12px 16px 10px;background:var(--dsw-alias-bg-layer-2,#fff);border-bottom:1px solid var(--dsw-alias-border-l2,#e1e5eb)}.dsh-mobile-control__panel h2{margin:0;font-size:17px;line-height:24px}.dsh-mobile-control__header-actions{display:flex;align-items:center;gap:2px}.dsh-mobile-control__update-plugin,.dsh-mobile-control__diagnostic-entry,.dsh-mobile-control__close{display:inline-flex;align-items:center;justify-content:center;min-width:44px;height:44px;padding:0;border:0;border-radius:10px;background:transparent;color:inherit;cursor:pointer}.dsh-mobile-control__update-plugin,.dsh-mobile-control__diagnostic-entry{padding:0 8px;color:var(--dsw-alias-label-primary-bluish,#2563eb);font:650 12px/1 system-ui;white-space:nowrap}.dsh-mobile-control__update-plugin[hidden]{display:none}.dsh-mobile-control__update-plugin:disabled{cursor:wait;opacity:.55}.dsh-mobile-control__close{font-size:24px;line-height:1}.dsh-mobile-control__update-plugin:hover:not(:disabled),.dsh-mobile-control__diagnostic-entry:hover,.dsh-mobile-control__close:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
 .dsh-mobile-control__release-notice{margin:-2px 0 10px;padding:8px 10px;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#eff6ff);color:var(--dsw-alias-label-primary,#1d4ed8);font-size:11px;line-height:1.45}.dsh-mobile-control__release-notice.is-error{color:var(--dsw-alias-label-primary,#dc2626);border-left:3px solid var(--dsw-alias-state-error-primary,#dc2626)}.dsh-mobile-control__release-notice[hidden]{display:none}.dsh-mobile-control__update-card{margin:0 0 10px;padding:11px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#f8fafc)}.dsh-mobile-control__update-card[hidden]{display:none}.dsh-mobile-control__update-card-title{margin:0 0 7px;color:var(--dsw-alias-label-primary,#16181d);font:650 13px/1.4 system-ui}.dsh-mobile-control__update-notes{display:block;box-sizing:border-box;max-height:150px;overflow-y:auto;margin:0 0 8px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2,#e1e5eb);border-radius:9px;background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-secondary,#475569);white-space:pre-wrap;word-break:break-word;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.dsh-mobile-control__update-notes[hidden]{display:none}.dsh-mobile-control__update-notice{margin:0 0 9px;padding:7px 9px;border-radius:8px;background:var(--dsw-alias-state-warn-tertiary,#fff4d6);color:var(--dsw-alias-state-warn-label,#92400e);font-size:11px;line-height:1.5}.dsh-mobile-control__update-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.dsh-mobile-control__update-actions .dsh-mobile-control__primary,.dsh-mobile-control__update-actions .dsh-mobile-control__secondary{min-height:36px;padding:0 12px}.dsh-mobile-control__app-download{display:flex;align-items:center;justify-content:space-between;box-sizing:border-box;min-height:44px;margin:0 0 10px;padding:8px 11px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:11px;background:var(--dsw-alias-bg-layer-1,#f7f8fa);color:var(--dsw-alias-label-primary,#16181d);font:600 12px/1.3 system-ui;text-decoration:none}.dsh-mobile-control__app-download[hidden]{display:none}.dsh-mobile-control__app-download::after{color:var(--dsw-alias-label-primary-bluish,#2563eb);font-size:14px;content:"↗"}.dsh-mobile-control__app-download:hover{border-color:#9fb9e8;background:var(--dsw-alias-interactive-bg-hover-solid,var(--dsw-alias-bg-layer-2,#f5f8ff));color:var(--dsw-alias-label-primary,#1d4ed8)}
-.dsh-mobile-control__switcher{display:grid;grid-template-columns:repeat(2,1fr);gap:4px;margin:0 0 14px;padding:4px;border-radius:12px;background:var(--dsw-alias-bg-layer-1,#f3f5f8)}.dsh-mobile-control__switcher[hidden]{display:none}.dsh-mobile-control__tab{min-height:36px;border:0;border-radius:9px;background:transparent;color:var(--dsw-alias-label-secondary,#606873);font:600 13px/1 system-ui;cursor:pointer}.dsh-mobile-control__tab.is-active{background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-primary,#16181d);box-shadow:0 1px 3px rgb(15 23 42 / 10%)}.dsh-mobile-control__view[hidden]{display:none}.dsh-mobile-control__intro{margin:0 0 12px;color:var(--dsw-alias-label-secondary,#606873);font-size:12px;line-height:1.55}.dsh-mobile-control__http-frame-warning{box-sizing:border-box;margin:-4px 0 12px;padding:8px 10px;border:1px solid #d6a83f;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff7df);color:var(--dsw-alias-label-primary,#694b00);font-size:11px;line-height:1.5;overflow-wrap:anywhere}.dsh-mobile-control__http-frame-warning[hidden]{display:none}.dsh-mobile-control__view.is-remote .dsh-mobile-control__actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.dsh-mobile-control__view.is-remote .dsh-mobile-control__actions button[hidden]{display:none}
+.dsh-mobile-control__switcher{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:0 0 14px;padding:4px;border-radius:12px;background:var(--dsw-alias-bg-layer-1,#f3f5f8)}.dsh-mobile-control__switcher[hidden]{display:none}.dsh-mobile-control__tab{min-height:36px;border:0;border-radius:9px;background:transparent;color:var(--dsw-alias-label-secondary,#606873);font:600 13px/1 system-ui;cursor:pointer}.dsh-mobile-control__tab.is-active{background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-primary,#16181d);box-shadow:0 1px 3px rgb(15 23 42 / 10%)}.dsh-mobile-control__view[hidden]{display:none}.dsh-mobile-control__intro{margin:0 0 12px;color:var(--dsw-alias-label-secondary,#606873);font-size:12px;line-height:1.55}.dsh-mobile-control__http-frame-warning{box-sizing:border-box;margin:-4px 0 12px;padding:8px 10px;border:1px solid #d6a83f;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff7df);color:var(--dsw-alias-label-primary,#694b00);font-size:11px;line-height:1.5;overflow-wrap:anywhere}.dsh-mobile-control__http-frame-warning[hidden]{display:none}.dsh-mobile-control__view.is-remote .dsh-mobile-control__actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.dsh-mobile-control__view.is-remote .dsh-mobile-control__actions button[hidden]{display:none}
 .dsh-mobile-control__provider-section{position:relative;margin:0 0 14px}.dsh-mobile-control__section-title{margin:0 0 8px;color:var(--dsw-alias-label-primary,#16181d);font:650 13px/1.4 system-ui}.dsh-mobile-control__provider-section>.dsh-mobile-control__section-title{padding-right:42px}.dsh-mobile-control__provider-choices{display:grid;grid-template-columns:1fr;gap:8px}.dsh-mobile-control__provider{display:flex;min-width:0;flex-direction:column;gap:6px;min-height:94px;padding:10px 11px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:13px;background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-primary,#16181d);text-align:left;cursor:pointer;touch-action:manipulation;transition:border-color 160ms ease,background-color 160ms ease,box-shadow 160ms ease}.dsh-mobile-control__provider:hover{border-color:#6f96db;background:var(--dsw-alias-interactive-bg-hover-solid,var(--dsw-alias-bg-layer-1,#f8fbff))}.dsh-mobile-control__provider.is-selected{border-color:var(--dsw-alias-label-primary-bluish,#2563eb);background:var(--dsw-alias-interactive-bg-active,var(--dsw-alias-bg-layer-1,#f5f8ff));box-shadow:0 0 0 1px var(--dsw-alias-label-primary-bluish,#2563eb) inset}.dsh-mobile-control__provider:disabled{cursor:wait;opacity:.62}.dsh-mobile-control__provider-top{display:flex;min-width:0;align-items:flex-start;justify-content:space-between;gap:5px}.dsh-mobile-control__provider-top strong{min-width:0;font-size:12px;line-height:1.3}.dsh-mobile-control__provider-badge{flex:none;padding:2px 5px;border-radius:999px;background:var(--dsw-alias-state-business-tertiary,#e8f0ff);color:var(--dsw-alias-label-primary,#1d4ed8);font:650 11px/1.25 system-ui}.dsh-mobile-control__provider-badge.is-cpolar{background:var(--dsw-alias-state-success-tertiary,#eaf8f2);color:var(--dsw-alias-label-primary,#087454)}.dsh-mobile-control__provider-description{color:var(--dsw-alias-label-secondary,#606873);font-size:12px;line-height:1.45}.dsh-mobile-control__provider-info{position:absolute;z-index:5;top:-13px;right:-8px}.dsh-mobile-control__provider-info-button{display:flex;align-items:center;justify-content:center;width:44px;height:44px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--dsw-alias-label-secondary,#475569);cursor:pointer;touch-action:manipulation}.dsh-mobile-control__provider-info-button:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f5f9);color:var(--dsw-alias-label-primary-bluish,#2563eb)}.dsh-mobile-control__provider-info-glyph{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:18px;height:18px;border:1.5px solid currentColor;border-radius:50%;font:700 12px/1 system-ui}.dsh-mobile-control__provider-info-popover{position:absolute;z-index:6;top:38px;right:4px;box-sizing:border-box;width:min(292px,calc(100vw - 72px));padding:10px 12px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#fff);box-shadow:0 10px 28px rgb(15 23 42 / 16%)}.dsh-mobile-control__provider-info-popover[hidden]{display:none}.dsh-mobile-control__provider-info-popover strong,.dsh-mobile-control__provider-info-popover span{display:block}.dsh-mobile-control__provider-info-popover strong{margin-bottom:3px;font-size:12px}.dsh-mobile-control__provider-info-popover span{color:var(--dsw-alias-label-secondary,#606873);font-size:11px;line-height:1.55}
 /* The managed-component setup cards (cloudflared, SakuraFrp) deliberately reuse this card, so
    .dsh-mobile-control__cloudflared-setup and .dsh-mobile-control__sakurafrp-setup are DOM hooks
@@ -3208,6 +3551,25 @@ export const CONTROL_STYLES = `
 @media (max-width:359px){.dsh-mobile-control__provider{min-height:68px}}@media(min-width:600px){.dsh-mobile-control__provider-choices{grid-template-columns:1fr 1fr}.dsh-mobile-control__provider{min-height:88px}}@media (prefers-reduced-motion:reduce){.dsh-mobile-control__provider,.dsh-mobile-control__cpolar-connect{transition:none}.dsh-mobile-control__backdrop,.dsh-mobile-control__panel{animation:none}.dsh-mobile-control__diagnostic-summary.is-running .dsh-mobile-control__diagnostic-summary-icon::before,.dsh-mobile-control__diagnostic-checks{animation:none}}
 
 .dsh-mobile-control__origin-warning{margin:12px 0;padding:10px 12px;border-left:3px solid var(--dsw-alias-state-warn-primary,#a56810);border-radius:4px;background:var(--dsw-alias-bg-layer-1,#f3f5f8);color:var(--dsw-alias-label-primary,#384152);font-size:12px;line-height:1.6}
+/* PC 端 tab: one selectable entry per available channel, each with its own copy action. */
+.dsh-mobile-control__pc-channels{display:grid;gap:8px;margin:0 0 12px}.dsh-mobile-control__pc-channels[hidden],.dsh-mobile-control__pc-certificate[hidden],.dsh-mobile-control__pc-pair[hidden]{display:none}
+.dsh-mobile-control__pc-channel{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:8px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#fff)}
+.dsh-mobile-control__pc-channel.is-active{border-color:var(--dsw-alias-label-primary-bluish,#2563eb);box-shadow:0 0 0 1px var(--dsw-alias-label-primary-bluish,#2563eb) inset}
+.dsh-mobile-control__pc-channel-choice{display:flex;min-width:0;flex-direction:column;gap:3px;align-items:flex-start;min-height:44px;padding:6px 8px;border:0;border-radius:9px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.dsh-mobile-control__pc-channel-choice:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
+.dsh-mobile-control__pc-channel-name{font:650 12px/1.3 system-ui;color:var(--dsw-alias-label-primary,#16181d)}
+.dsh-mobile-control__pc-channel-url{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,#606873);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.dsh-mobile-control__pc-copy{box-sizing:border-box;min-width:44px;min-height:44px;padding:0 10px;border:1px solid var(--dsw-alias-border-l3,#cfd5dd);border-radius:10px;background:transparent;color:inherit;font:600 12px/1.2 system-ui;cursor:pointer}
+.dsh-mobile-control__pc-copy:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
+.dsh-mobile-control__pc-pair{display:grid;gap:7px;margin:0 0 12px;padding:10px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#f8fafc)}
+.dsh-mobile-control__pc-pair-row{display:grid;gap:2px;min-width:0}
+.dsh-mobile-control__pc-pair-value-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px}
+.dsh-mobile-control__pc-pair-label{color:var(--dsw-alias-label-secondary,#606873);font-size:11px}
+.dsh-mobile-control__pc-pair-value{overflow-wrap:anywhere;color:var(--dsw-alias-label-primary,#16181d);font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.dsh-mobile-control__pc-certificate{margin:0 0 12px;overflow-wrap:anywhere}
+.dsh-mobile-control__pc-steps{margin:0 0 12px;padding-left:18px;color:var(--dsw-alias-label-secondary,#606873);font-size:12px;line-height:1.55}
+.dsh-mobile-control__pc-steps li{margin:0 0 4px}
+.dsh-mobile-control__view.is-pc .dsh-mobile-control__actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 ` + EXTENSION_RECOVERY_STYLES
 
 /** Mount the desktop control or mobile feature enhancements. */

@@ -27,3 +27,5 @@ apps/mobile/store/ios/
 tmp-dsh-web.log
 tmp-dsh-web.err.log
 /Temp/
+# CI uploads the plugin tarball and the desktop install package from here.
+pc-client-artifacts/

@@ -184,6 +184,12 @@ See [Compatibility](#compatibility) for the supported components and platforms. 
 
 </details>
 
+### PC client (Windows browser)
+
+A friend can use the same DSH from a Windows browser without installing DSH or a client program: in **Mobile Access → PC**, choose **Generate pairing code** and **Download PC installer**, then send `dsh-mobile-pc.zip`. The friend unzips it, trusts the certificate when required, runs the launcher and enters the pairing code; a supporting browser can also install the entry page as a desktop app. The PC has its own `desktop.css` / `desktop.js` layer, mutually exclusive with the phone's `mobile.css` / `mobile.js`. Full steps, certificate handling and revocation are in the [PC client guide](docs/PC_CLIENT.en.md).
+
+This is unreleased and ships with the next plugin version; the existing local-network and remote channels and the Android app are unaffected.
+
 ## Extend and customize
 
 Type `/mobile <what you want>` in a DSH conversation to hand the request to the current agent. Once the files have been changed, the phone page usually refreshes within a few seconds. For example:

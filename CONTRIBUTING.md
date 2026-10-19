@@ -33,6 +33,9 @@ Browser checks consume built client files. Run `npm run build` and `npx playwrig
 | Async access-panel forms | `npm run smoke:control-state` |
 | Module-selection recovery | `npm run smoke:module-recovery` |
 | Local extension Worker execution and explicit recovery | `npm run smoke:extension-workers` |
+| PC entry page, install package and desktop customization layer | `npm run smoke:pc-client` |
+
+`npm run smoke:pc-client` drives the PC entry page, the manifest and service worker, the layer a desktop and a touch client actually fetch, one real pairing and the downloaded `dsh-mobile-pc.zip`. Set `DSH_PC_SMOKE_KEEP_PACKAGE=<directory>` to keep the package it downloaded for inspection; the package belongs to the fixture origin, so it is evidence rather than something to hand to a friend.
 
 These fixtures do not submit a model request or read the normal DSH home. Browser evidence does not establish physical Android keyboard, camera or device-lifecycle behavior.
 

@@ -7,6 +7,7 @@
 | 你想做什么 | 中文 | English |
 | --- | --- | --- |
 | 使用 Android App、了解返回键、权限与升级 | [App 手册](../apps/mobile/README.zh-CN.md) | [Android app](../apps/mobile/README.md) |
+| 在 Windows 电脑的浏览器里使用 DSH（待发布） | [PC 端](PC_CLIENT.md) | [PC client](PC_CLIENT.en.md) |
 | 使用固定 Cloudflare 域名，而非临时随机地址 | [命名隧道](CLOUDFLARE_TUNNEL.md) | [Named tunnel](CLOUDFLARE_TUNNEL.en.md) |
 | 页面加载慢、实时连接反复重连或长操作超时 | [慢链路与重连](SLOW_CONNECTIONS.md) | [Slow links and reconnection](SLOW_CONNECTIONS.en.md) |
 

@@ -30,7 +30,7 @@ import {
   MobileAccessGatewayController,
   type MobileAccessRuntime,
 } from './control.js'
-import { MobileAccessGateway, ClientModuleConflictError } from './gateway.js'
+import { MobileAccessGateway, ClientModuleConflictError, PC_INFO_PATH, PC_PACKAGE_PATH, type PcClientChannel, type PcClientSource } from './gateway.js'
 import { ClientModulePreferenceStore } from './client-module-preferences.js'
 import { createMobileAccessService, MobileExtensionError, type MobileAccessService } from './extensions.js'
 import { listComputerImages, readComputerImage } from './computer-images.js'
@@ -776,6 +776,38 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       && connection.requestRejection(request) === undefined
   }
 
+  /**
+   * The PC install package is built from runtime state only the plugin owns: which
+   * channels are reachable right now, and which of them the friend's browser must
+   * trust a private CA for. The LAN listener and the self-signed FRP ingress both
+   * carry the plugin CA; a public-CA tunnel does not.
+   */
+  const pcClientSource: PcClientSource = {
+    channels: async (): Promise<readonly PcClientChannel[]> => {
+      const channels: PcClientChannel[] = []
+      const lanOrigin = lanGateway?.address().origin
+      if (lanOrigin !== undefined) channels.push({ channel: 'lan', origin: lanOrigin })
+      const remoteOrigin = remoteController().status().origin
+      if (remoteOrigin !== undefined) channels.push({ channel: 'remote', origin: remoteOrigin })
+      return Object.freeze(channels)
+    },
+    certificate: async (channel: 'lan' | 'remote') => {
+      const file = channel === 'lan'
+        ? template.pairingCaFile
+        : remoteProviders.selected === 'sakurafrp'
+          ? tlsIngressPaths(remoteDeviceFile).caCertFile
+          : undefined
+      if (file === undefined) return undefined
+      try {
+        // Windows accepts the DER form directly; certutil rejects a PEM-only .cer.
+        return { name: 'dsh-mobile-ca.cer', body: new X509Certificate(await readFile(file)).raw }
+      } catch {
+        // A missing or unreadable CA must not fail the whole package.
+        return undefined
+      }
+    },
+  }
+
   const adminRoute: WebRoute = {
     kind: 'prefix',
     path: LOCAL_ADMIN_PREFIX,
@@ -784,7 +816,18 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
         const target = parseRequestTarget(request.url)
         assertLocalAdminTrust(request, request.method === 'POST', () => authenticateDesktopAdmin(request))
         if (adminClosing) throw new HttpError(503, 'unavailable')
-        if (target.search !== '') throw new HttpError(400, 'bad_request')
+        // The PC package download carries the channel selector; every other admin
+        // request stays query-free.
+        const pcRequest = target.decodedPathname === PC_INFO_PATH || target.decodedPathname === PC_PACKAGE_PATH
+        if (target.search !== '' && !(pcRequest && target.decodedPathname === PC_PACKAGE_PATH)) {
+          throw new HttpError(400, 'bad_request')
+        }
+        if (pcRequest) {
+          const active = lanGateway ?? remoteController().gateway()
+          if (active === undefined) throw new HttpError(409, 'gateway_stopped')
+          await active.localAdminRoute(`${LOCAL_ADMIN_PREFIX}/pc`, authenticateDesktopAdmin, pcClientSource).handler(request, response)
+          return
+        }
         const lanControl = target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/control`
           || target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/lan/control`
         if (request.method === 'GET' && lanControl) {
@@ -1101,7 +1144,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     const stopAdmin = (): void => { adminClosing = true; unregister() }
     const disposeMobileCommand = ctx.commands.register({
       name: 'mobile',
-      description: '定制手机界面或添加电脑能力',
+      description: '定制手机端或电脑端界面，或添加电脑能力',
       input: { hint: '<要做什么>' },
       handler: async ({ agent, rawInput }) => {
         const task = rawInput.trim()
@@ -1113,6 +1156,8 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
           directory: stateDirectory,
           hasCustomCss: await existsRegularFile(template.customCssFile),
           hasCustomJs: await existsRegularFile(template.customScriptFile),
+          hasDesktopCss: await existsRegularFile(template.desktopCssFile),
+          hasDesktopJs: await existsRegularFile(template.desktopScriptFile),
           extensions: mobileAccess.manifest().map(entry => {
             const host = hostStates.get(entry.id)
             return { id: entry.id, name: entry.name, version: entry.version,

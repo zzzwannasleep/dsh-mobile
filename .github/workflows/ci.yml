@@ -166,6 +166,30 @@ jobs:
       - name: Install and inspect the pinned macOS components in temporary state
         run: npm run smoke:cloudflared-component
 
+  pc-client:
+    name: PC client (desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium --only-shell
+      - name: Verify the desktop client over real HTTPS
+        env:
+          DSH_PC_SMOKE_KEEP_PACKAGE: pc-client-artifacts
+        run: npm run smoke:pc-client
+      - name: Pack the plugin
+        run: npm pack --ignore-scripts --pack-destination pc-client-artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dsh-mobile-pc-client
+          path: pc-client-artifacts/
+          if-no-files-found: error
+
   android:
     name: Android
     runs-on: ubuntu-latest

@@ -426,3 +426,49 @@ export const DIAGNOSTIC_REASON_MESSAGES = {
     'phone-network-unknown': ['电脑无法判断路由器是否隔离了手机。', '确认手机与电脑使用同一网络，并关闭访客网络或 AP 隔离。'],
   },
 } as const
+
+// The PC 端 tab: a friend opens the entry link on a Windows PC and installs the
+// page as a desktop app. The desktop customization layer is separate from this
+// owner-facing panel copy.
+Object.assign(MOBILE_CONTROL_MESSAGES.en, {
+  pc: 'PC', pcAccess: 'PC access',
+  pcIntro: 'Hand a friend on a Windows PC a DSH client: they open the entry link in Edge or Chrome and install the page as a desktop app.',
+  pcNoChannels: 'No PC entry is available yet. Turn on local network access or remote access first.',
+  pcCopyUrl: 'Copy', pcCopyUrlAria: 'Copy the {channel} PC entry address', pcUrlCopied: 'PC entry address copied.', pcEntryLinkLabel: 'PC entry link',
+  pcGenerateKey: 'Generate pairing code', pcGeneratingKey: 'Generating the pairing code…', pcAppKeyLabel: 'Pairing code',
+  pcKeyReady: 'Pairing code generated and the PC entry link copied. The code is short-lived — open the link on the PC right away.',
+  pcCopyKey: 'Copy code', pcKeyCopied: 'Pairing code copied.',
+  pcDownloadPackage: 'Download PC installer', pcPreparingPackage: 'Preparing the installer…', pcPackageReady: 'The installer download started. Send the archive to your friend.',
+  pcPackageFailed: 'Download failed: {error}', pcChannelUnavailable: 'That channel is unavailable right now. Turn it on first.', pcInfoFailed: 'Could not read the PC entry details: {error}',
+  pcDownloadCertificate: 'Download the pairing certificate', pcCertificateNote: 'The PC must trust this certificate before the first connection.',
+  pcStepOpen: 'Open the entry link above in Edge or Chrome on the PC.', pcStepInstall: 'Choose “Install” in the address bar, or “Install as app” in the browser menu.',
+  pcStepLaunch: 'Launch it from the desktop or Start menu afterwards; no need to type the address again.',
+})
+Object.assign(MOBILE_CONTROL_MESSAGES.it, {
+  pc: 'PC', pcAccess: 'Accesso PC',
+  pcIntro: 'Condividi questo DSH con un amico su PC Windows: apre il link in Edge o Chrome e installa la pagina come app desktop.',
+  pcNoChannels: 'Nessun ingresso PC disponibile. Attiva prima la rete locale o l’accesso remoto.',
+  pcCopyUrl: 'Copia', pcCopyUrlAria: 'Copia l’indirizzo PC per {channel}', pcUrlCopied: 'Indirizzo PC copiato.', pcEntryLinkLabel: 'Link di ingresso PC',
+  pcGenerateKey: 'Genera codice di abbinamento', pcGeneratingKey: 'Generazione del codice di abbinamento…', pcAppKeyLabel: 'Codice di abbinamento',
+  pcKeyReady: 'Codice generato e link di ingresso PC copiato. Il codice dura poco: apri subito il link sul PC.',
+  pcCopyKey: 'Copia codice', pcKeyCopied: 'Codice di abbinamento copiato.',
+  pcDownloadPackage: 'Scarica il pacchetto PC', pcPreparingPackage: 'Preparazione del pacchetto…', pcPackageReady: 'Download del pacchetto avviato. Invia l’archivio all’amico.',
+  pcPackageFailed: 'Download non riuscito: {error}', pcChannelUnavailable: 'Questo canale non è disponibile. Attivalo prima.', pcInfoFailed: 'Impossibile leggere i dati dell’ingresso PC: {error}',
+  pcDownloadCertificate: 'Scarica il certificato di abbinamento', pcCertificateNote: 'Il PC deve considerare attendibile questo certificato prima della prima connessione.',
+  pcStepOpen: 'Apri il link qui sopra in Edge o Chrome sul PC.', pcStepInstall: 'Scegli «Installa» nella barra degli indirizzi oppure «Installa come app» nel menu del browser.',
+  pcStepLaunch: 'Avvialo dal desktop o dal menu Start: non serve reinserire l’indirizzo.',
+})
+Object.assign(MOBILE_CONTROL_MESSAGES.zh, {
+  pc: 'PC 端', pcAccess: '电脑端访问',
+  pcIntro: '把电脑端交给使用 Windows 的朋友：对方在 Edge 或 Chrome 中打开入口链接，并安装为桌面应用即可使用。',
+  pcNoChannels: '当前没有可用的电脑端入口，请先开启局域网访问或远程访问。',
+  pcCopyUrl: '复制', pcCopyUrlAria: '复制{channel}电脑端地址', pcUrlCopied: '电脑端地址已复制。', pcEntryLinkLabel: '电脑端入口',
+  pcGenerateKey: '生成配对码', pcGeneratingKey: '正在生成配对码…', pcAppKeyLabel: '配对码',
+  pcKeyReady: '配对码已生成，并已复制电脑端入口链接。配对码有效期很短，请立即在电脑上打开该链接。',
+  pcCopyKey: '复制配对码', pcKeyCopied: '配对码已复制。',
+  pcDownloadPackage: '下载 PC 安装包', pcPreparingPackage: '正在准备安装包…', pcPackageReady: '安装包已开始下载，请把压缩包发送给对方。',
+  pcPackageFailed: '下载失败：{error}', pcChannelUnavailable: '该通道当前不可用，请先开启。', pcInfoFailed: '无法读取电脑端入口信息：{error}',
+  pcDownloadCertificate: '下载配对证书', pcCertificateNote: '首次连接前，请先在电脑上安装并信任该证书。',
+  pcStepOpen: '在电脑上用 Edge 或 Chrome 打开上方入口链接。', pcStepInstall: '点击地址栏的「安装」图标，或使用浏览器菜单中的「安装为应用」。',
+  pcStepLaunch: '安装后从桌面或开始菜单打开，之后无需再输入地址。',
+})

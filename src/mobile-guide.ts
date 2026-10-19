@@ -27,6 +27,10 @@ export interface MobileGuideState {
   readonly hasCustomCss: boolean
   /** True when the user's mobile.js exists (a custom script override). */
   readonly hasCustomJs: boolean
+  /** True when the user's desktop.css exists (a PC-browser style override). */
+  readonly hasDesktopCss: boolean
+  /** True when the user's desktop.js exists (a PC-browser script override). */
+  readonly hasDesktopJs: boolean
   /** Extensions currently installed under extensions/. */
   readonly extensions: readonly MobileGuideExtensionState[]
   /** Extensions whose host failed to activate. */
@@ -37,6 +41,8 @@ export interface MobileGuideState {
 export function buildMobileGuide(state: MobileGuideState): string {
   const styleLine = state.hasCustomCss ? '存在（当前生效的自定义样式）' : '不存在（使用内置默认样式）'
   const scriptLine = state.hasCustomJs ? '存在（当前生效的自定义脚本）' : '不存在（无自定义脚本）'
+  const desktopStyleLine = state.hasDesktopCss ? '存在（当前生效的电脑端样式）' : '不存在（电脑端使用内置默认样式）'
+  const desktopScriptLine = state.hasDesktopJs ? '存在（当前生效的电脑端脚本）' : '不存在（电脑端无自定义脚本）'
   const extensionLines = state.extensions.length === 0
     ? '（无）'
     : state.extensions.map(entry => `- ${entry.id}（${entry.name} v${entry.version}）${entry.executionMode === undefined ? '' : ` · ${entry.executionMode}${entry.executionState === 'unavailable' ? ' · 当前不可用，需要显式重启扩展' : ''}`}`).join('\n')
@@ -48,11 +54,13 @@ export function buildMobileGuide(state: MobileGuideState): string {
 - 定制目录：${state.directory}（所有改动只允许在这里进行）
 - mobile.css：${styleLine}
 - mobile.js：${scriptLine}
+- desktop.css：${desktopStyleLine}
+- desktop.js：${desktopScriptLine}
 - 已安装扩展：
 ${extensionLines}
 ${failureLine}
 
-“恢复默认”操作说明：当用户要求恢复默认 / 还原初始外观时，删除 mobile.css 与 mobile.js 两个文件（删除后手机端自动回到内置默认外观，无需创建占位文件），并按需删除 extensions/ 下的扩展目录。\n\n`
+手机端（触屏设备）只加载 mobile.css / mobile.js，电脑浏览器只加载 desktop.css / desktop.js，两套互不影响。“恢复默认”操作说明：当用户要求恢复默认 / 还原初始外观时，删除对应的 mobile.css、mobile.js、desktop.css、desktop.js（删除后自动回到内置默认外观，无需创建占位文件），并按需删除 extensions/ 下的扩展目录。\n\n`
 
   return `${currentState}${MOBILE_CUSTOMIZATION_GUIDE_BODY}`
 }
@@ -61,16 +69,18 @@ ${failureLine}
  * Static body of the customization guide. Kept separate from the injected
  * state snapshot so the two concerns stay easy to edit independently.
  */
-const MOBILE_CUSTOMIZATION_GUIDE_BODY = `你在为用户定制 DSH Mobile 的手机端。DSH Mobile 是一个把电脑上的 DeepSeek Harness 带到手机浏览器的插件，手机端界面和能力都来自本机文件。
+const MOBILE_CUSTOMIZATION_GUIDE_BODY = `你在为用户定制 DSH Mobile 的手机端与电脑端。DSH Mobile 是一个把电脑上的 DeepSeek Harness 带到手机浏览器和电脑浏览器的插件，两端界面和能力都来自本机文件。
 
 所有改动只允许在 $DSH_HOME/mobile-access/ 目录内进行，绝不修改 DeepSeek Harness 的源码或其他目录。$DSH_HOME 是 DeepSeek Harness 的配置目录（通常为 ~/.dsh），先确认它的实际路径再操作。
 
-手机端的能力分两层，按用户需求选择改动目标：
+界面与交互的能力分两层，按用户说的设备选择改动目标：
 
 1. 界面与交互 —— 只改外观和交互，不需要碰电脑的文件或程序：
-   - $DSH_HOME/mobile-access/mobile.css：手机端样式
-   - $DSH_HOME/mobile-access/mobile.js：手机端脚本，用 window.dshMobile.register(({ root }) => { ... }) 把内容挂载到 root，返回清理函数
-   - 保存后手机端几秒内自动应用，无需重启
+   - 手机端（触屏设备）：$DSH_HOME/mobile-access/mobile.css 样式、mobile.js 脚本
+   - 电脑端（鼠标键盘的浏览器，例如把手机访问地址发给朋友在电脑上打开）：$DSH_HOME/mobile-access/desktop.css 样式、desktop.js 脚本
+   - 两层互斥：触屏设备只加载 mobile.*，非触屏浏览器只加载 desktop.*，改动其中一层不会影响另一层
+   - mobile.js 用 window.dshMobile.register(({ root }) => { ... }) 把内容挂载到 root；desktop.js 用 window.dshMobile.registerDesktop(({ root }) => { ... })，两者都返回清理函数
+   - 保存后几秒内自动应用，无需重启
 
 动手前先读已有的定制文件。若要调整 DSH 自带的输入框、侧栏或设置等现有界面，先确认当前 DSH 版本与手机页面模式（专用移动页面或 ?frontend=stock），只读核对运行页面的 DOM、属性和样式；本机有同版本前端源码时可参考相应组件，没有源码时可查看已安装的客户端产物，不必下载源码。优先使用扩展 API、插槽和稳定的 data-* 标记，不凭猜测依赖构建类名。只读查看不改变前述写入范围。
 

@@ -547,7 +547,7 @@ describe('stock DSH lifecycle', () => {
     const mounted = await mount()
     expect(mounted.command).toMatchObject({
       name: 'mobile',
-      description: '定制手机界面或添加电脑能力',
+      description: '定制手机端或电脑端界面，或添加电脑能力',
       input: { hint: expect.any(String) },
     })
     const steered: { text: string; source: unknown }[] = []

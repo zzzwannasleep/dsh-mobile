@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -94,6 +94,8 @@ describe('gateway configuration', () => {
     expect(resolved.allowedCidrs).toHaveLength(2)
     expect(resolved.customCssFile).toBe(join(tmpdir(), 'mobile.css'))
     expect(resolved.customScriptFile).toBe(join(tmpdir(), 'mobile.js'))
+    expect(resolved.desktopCssFile).toBe(join(tmpdir(), 'desktop.css'))
+    expect(resolved.desktopScriptFile).toBe(join(tmpdir(), 'desktop.js'))
     expect(resolved.mobileCompatibilityFile).toBe(fileURLToPath(new URL('../src/mobile-compat.js', import.meta.url)))
     expect(resolved.excludedClientModules).toEqual([])
   })
@@ -119,6 +121,26 @@ describe('gateway configuration', () => {
       .toBe(mobileCompatibilityFile)
     expect(() => parseGatewayConfig({ stateFile, tls: { mode: 'disabled' }, mobileCompatibilityFile: 'compat.js' }))
       .toThrow(/mobileCompatibilityFile must be an absolute file path/u)
+  })
+
+  it('keeps the PC customization layer beside the phone layer and requires absolute overrides', () => {
+    const stateDirectory = dirname(stateFile)
+    const resolved = parseGatewayConfig({ stateFile, tls: { mode: 'disabled' } })
+    expect(resolved.desktopCssFile).toBe(join(stateDirectory, 'desktop.css'))
+    expect(resolved.desktopScriptFile).toBe(join(stateDirectory, 'desktop.js'))
+    // The PC layer must not alias the phone layer.
+    expect(resolved.desktopCssFile).not.toBe(resolved.customCssFile)
+    expect(resolved.desktopScriptFile).not.toBe(resolved.customScriptFile)
+
+    const desktopCssFile = join(tmpdir(), 'custom-desktop.css')
+    const desktopScriptFile = join(tmpdir(), 'custom-desktop.js')
+    const overridden = parseGatewayConfig({ stateFile, tls: { mode: 'disabled' }, desktopCssFile, desktopScriptFile })
+    expect(overridden.desktopCssFile).toBe(desktopCssFile)
+    expect(overridden.desktopScriptFile).toBe(desktopScriptFile)
+    expect(() => parseGatewayConfig({ stateFile, tls: { mode: 'disabled' }, desktopCssFile: 'desktop.css' }))
+      .toThrow(/desktopCssFile must be an absolute file path/u)
+    expect(() => parseGatewayConfig({ stateFile, tls: { mode: 'disabled' }, desktopScriptFile: 'desktop.js' }))
+      .toThrow(/desktopScriptFile must be an absolute file path/u)
   })
 
   it('keeps durable device state required at the Loader boundary', () => {

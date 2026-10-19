@@ -64,6 +64,10 @@ export interface PluginConfig {
   customCssFile?: string
   /** Optional user script that mounts authenticated mobile-only Web features. */
   customScriptFile?: string
+  /** Optional user stylesheet served to authenticated desktop (non-touch) browsers. */
+  desktopCssFile?: string
+  /** Optional user script that mounts authenticated desktop (non-touch) Web features. */
+  desktopScriptFile?: string
   /** Internal dedicated mobile layout browser bundle. */
   mobileLayoutFile?: string
   /** Standalone browser compatibility bundle used before DSH boot. */
@@ -117,6 +121,8 @@ export interface ResolvedGatewayConfig {
   readonly extensionsDir: string
   readonly customCssFile: string
   readonly customScriptFile: string
+  readonly desktopCssFile: string
+  readonly desktopScriptFile: string
   readonly mobileLayoutFile: string
   readonly mobileCompatibilityFile: string
   readonly excludedClientModules: readonly string[]
@@ -167,6 +173,8 @@ export const Config: z<PluginConfig> = z.object({
   controlFile: z.string().hidden().required(),
   customCssFile: z.string().hidden(),
   customScriptFile: z.string().hidden(),
+  desktopCssFile: z.string().hidden(),
+  desktopScriptFile: z.string().hidden(),
   mobileLayoutFile: z.string().hidden(),
   mobileCompatibilityFile: z.string().hidden(),
   excludedClientModules: z.array(String).default([]),
@@ -385,6 +393,12 @@ export function parseGatewayConfig(raw: unknown): ResolvedGatewayConfig {
     customScriptFile: value.customScriptFile === undefined
       ? join(dirname(absoluteFile(value.stateFile, 'stateFile')), 'mobile.js')
       : absoluteFile(value.customScriptFile, 'customScriptFile'),
+    desktopCssFile: value.desktopCssFile === undefined
+      ? join(dirname(absoluteFile(value.stateFile, 'stateFile')), 'desktop.css')
+      : absoluteFile(value.desktopCssFile, 'desktopCssFile'),
+    desktopScriptFile: value.desktopScriptFile === undefined
+      ? join(dirname(absoluteFile(value.stateFile, 'stateFile')), 'desktop.js')
+      : absoluteFile(value.desktopScriptFile, 'desktopScriptFile'),
     mobileLayoutFile: value.mobileLayoutFile === undefined
       ? fileURLToPath(new URL('./mobile-layout.js', import.meta.url))
       : absoluteFile(value.mobileLayoutFile, 'mobileLayoutFile'),

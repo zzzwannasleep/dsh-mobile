@@ -65,6 +65,26 @@ function sourceFixture(version = '0.1.2-alpha.2', architecture: 'renderer-v2' | 
   return sources
 }
 
+function hostSettingsFixture(version = '0.2.1-alpha.3'): Record<string, string> {
+  const sources = sourceFixture(version)
+  sources['packages/client/ui-settings/src/client/index.ts'] = [
+    "export const inject = ['remote', 'remote.settings']",
+    'const mirror = new SettingsDescribeMirror(ctx)',
+    'new ConfigForms(ctx, { mirror, schema })',
+  ].join('\n')
+  sources['packages/client/ui-settings/src/client/settings-mirror.ts'] = [
+    'export class SettingsDescribeMirror', 'constructor(private readonly ctx: ClientContext)',
+    "status: 'idle'", 'const response = await this.ctx.remote.settings.describe()',
+  ].join('\n')
+  sources['packages/client/ui-settings/src/client/config-form.ts'] = [
+    'export class ConfigFormController', 'this.owner = ctx',
+    'this.owner, { namespace: entryId }, this.mirror, this.schema,',
+    'const response = await this.ctx.remote.settings.mutate(this.spec.namespace, ownedOps, revision)',
+    'this.mirror.acceptView(response.value)', 'await this.mirror.load()',
+  ].join('\n')
+  return sources
+}
+
 async function check(sources: Record<string, string>): Promise<{ status: number | null; output: string }> {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-contract-'))
   temporaryDirectories.push(directory)
@@ -85,6 +105,43 @@ afterEach(async () => {
 })
 
 describe('DSH source compatibility gate', () => {
+  it.each(['0.2.1-alpha.3', '0.2.1-alpha.99'])('accepts %s only with Host-backed settings reads and writes', async version => {
+    const result = await check(hostSettingsFixture(version))
+    expect(result.status).toBe(0)
+    expect(result.output).toContain(`DSH compatibility ok: ${version} (renderer-v2)`)
+  })
+
+  it.each([
+    ['replaces mirror wiring with a constant', 'packages/client/ui-settings/src/client/index.ts', 'const mirror = new SettingsDescribeMirror(ctx)', "const persistence = 'host'", 'settings trust contract changed'],
+    ['skips Host reads', 'packages/client/ui-settings/src/client/settings-mirror.ts', 'this.ctx.remote.settings.describe()', 'Promise.resolve({ namespaces: [] })', 'settings Host read contract changed'],
+    ['skips Host writes', 'packages/client/ui-settings/src/client/config-form.ts', 'this.ctx.remote.settings.mutate(this.spec.namespace, ownedOps, revision)', 'Promise.resolve({ ok: true })', 'settings Host write contract changed'],
+    ['drops write-result adoption', 'packages/client/ui-settings/src/client/config-form.ts', 'this.mirror.acceptView(response.value)', '', 'settings Host write contract changed'],
+    ['drops failure recovery reads', 'packages/client/ui-settings/src/client/config-form.ts', 'await this.mirror.load()', '', 'settings Host write contract changed'],
+    ['uses the caller instead of the settings owner', 'packages/client/ui-settings/src/client/config-form.ts', 'this.owner = ctx', 'this.owner = caller', 'settings Host write contract changed'],
+    ['restores process-local persistence', 'packages/client/ui-settings/src/client/settings-mirror.ts', "status: 'idle'", "status: this.persistence === 'memory' ? 'unavailable' : 'idle'", 'settings Host-only persistence policy changed'],
+    ['omits its Remote runtime dependency', 'packages/client/ui-settings/src/client/index.ts', "export const inject = ['remote', 'remote.settings']", 'export const inject = []', 'settings Remote trust contract changed'],
+  ] as const)('rejects Host-only settings when it %s', async (_label, path, expected, replacement, error) => {
+    const sources = hostSettingsFixture()
+    sources[path] = sources[path]!.replace(expected, replacement)
+    const result = await check(sources)
+    expect(result.status).toBe(1)
+    expect(result.output).toContain(error)
+  })
+
+  it.each([
+    ['settings loses Remote assembly', 'packages/client/ui-settings/package.json', manifest('0.2.1-alpha.3', []), 'Remote dependency profile'],
+    ['Remote assembly loses Gateway', 'packages/api/remotes/package.json', manifest('0.2.1-alpha.3', []), 'Remote assembly trust dependency changed'],
+    ['Gateway loses Connection', 'packages/api/gateway/package.json', manifest('0.2.1-alpha.3', []), 'API Gateway trust dependency changed'],
+    ['renderer acquires a cyclic dependency', 'packages/client/ui-renderer/package.json', manifest('0.2.1-alpha.3', [gateway]), 'renderer gained dependencies'],
+    ['Gateway alters Host authentication facts', 'packages/api/gateway/src/client/index.ts', 'get $host() { return { isLoopback: false } }', 'API Gateway Host facts contract changed'],
+  ] as const)('rejects Host-only settings when %s', async (_label, path, replacement, error) => {
+    const sources = hostSettingsFixture()
+    sources[path] = replacement
+    const result = await check(sources)
+    expect(result.status).toBe(1)
+    expect(result.output).toContain(error)
+  })
+
   it.each([
     ['0.1.0-rc.7', 'runtime-v1', false],
     ['0.1.2-alpha.1', 'renderer-v2', false],

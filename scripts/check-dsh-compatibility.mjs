@@ -160,11 +160,13 @@ const settingsManifest = await json('packages/client/ui-settings/package.json')
 const settingsInject = settingsManifest.dsh?.client?.inject
 const directSettingsTrust = settingsSource.includes("connection.isLoopback ? 'host' : 'memory'")
 const remoteSettingsTrust = settingsSource.includes("ctx.remote.$host.isLoopback ? 'host' : 'memory'")
-if (directSettingsTrust && !remoteSettingsTrust) {
+const hostSettingsMirror = settingsSource.includes('const mirror = new SettingsDescribeMirror(ctx)')
+  && settingsSource.includes('new ConfigForms(ctx, { mirror, schema })')
+if (directSettingsTrust && !remoteSettingsTrust && !hostSettingsMirror) {
   if (!Array.isArray(settingsInject) || !settingsInject.includes('@deepseek-ai/dsh-client-connection')) {
     throw new Error('DSH settings trust contract changed: direct trust requires the Connection module')
   }
-} else if (remoteSettingsTrust && !directSettingsTrust) {
+} else if (!directSettingsTrust && (remoteSettingsTrust !== hostSettingsMirror)) {
   if (clientArchitecture !== 'renderer-v2'
     || !Array.isArray(settingsInject)
     || !settingsInject.includes('@deepseek-ai/dsh-api-remotes')
@@ -205,6 +207,33 @@ if (directSettingsTrust && !remoteSettingsTrust) {
   ]) {
     for (const declaration of declarations) {
       if (!source.includes(declaration)) throw new Error(`DSH ${label} contract changed: missing ${declaration}`)
+    }
+  }
+  if (hostSettingsMirror) {
+    const mirrorSource = await text('packages/client/ui-settings/src/client/settings-mirror.ts')
+    const formsSource = await text('packages/client/ui-settings/src/client/config-form.ts')
+    if (mirrorSource.includes('this.persistence') || formsSource.includes('this.persistence')) {
+      throw new Error('DSH settings Host-only persistence policy changed')
+    }
+    for (const [source, label, declarations] of [
+      [mirrorSource, 'settings Host read', [
+        'export class SettingsDescribeMirror',
+        'constructor(private readonly ctx: ClientContext)',
+        "status: 'idle'",
+        'const response = await this.ctx.remote.settings.describe()',
+      ]],
+      [formsSource, 'settings Host write', [
+        'export class ConfigFormController',
+        'this.owner = ctx',
+        'this.owner, { namespace: entryId }, this.mirror, this.schema,',
+        'const response = await this.ctx.remote.settings.mutate(this.spec.namespace, ownedOps, revision)',
+        'this.mirror.acceptView(response.value)',
+        'await this.mirror.load()',
+      ]],
+    ]) {
+      for (const declaration of declarations) {
+        if (!source.includes(declaration)) throw new Error(`DSH ${label} contract changed: missing ${declaration}`)
+      }
     }
   }
 } else {

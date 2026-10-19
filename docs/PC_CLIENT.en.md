@@ -57,7 +57,7 @@ Package contents:
 
 - **The access link never expires**: it stays valid and is not single use — the same link can sign in several computers, until you choose **Regenerate link** in the panel; after that every previously copied link stops working immediately.
 - **The fallback pairing code does expire**: it is valid for 5 minutes by default (the `pairingTtlMs` plugin option, settable from 10 seconds to 15 minutes) and stops working as soon as it is used once, so a second device, or a second browser on the same computer, needs a freshly generated one.
-- **Opening the same link again**: on a remote (HTTPS) entry, when this computer already paired and its device cookie is still in the browser, opening the link again refreshes that session instead of adding a device; a local-network (plain HTTP) entry has no readable device binding, so a repeat open can still add a device, and the extra entry can be revoked from the device list.
+- **Opening the same link again**: on a remote (HTTPS) entry, when this computer already paired and its device cookie is still in the browser, opening the link again refreshes that session instead of adding a device; a local-network (plain HTTP) entry issues no such readable device binding, so every repeat open adds one, and the extra entry can be revoked from the device list.
 - **Filling the field by hand**: it accepts the raw code, the app key (`dsh1.<instance>.<code>`, or `dsh2.…` for a self-signed remote entry) or the whole entry link — pasting the link is enough.
 - When pairing is rejected, the page distinguishes four cases:
   - **The code is invalid, expired or already used** (401): ask the computer for a newly generated code.

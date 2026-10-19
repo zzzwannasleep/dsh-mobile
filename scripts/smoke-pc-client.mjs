@@ -664,6 +664,10 @@ try {
       const page = await durableContext.newPage()
       let pairStatus = 0
       let pairCookieHeader = Promise.resolve('')
+      // Only the status is read here: the entry page navigates away right after the
+      // pair response, which can discard the body before it is read. The body is
+      // asserted below through a plain HTTPS request that carries the very Cookie the
+      // browser sent.
       page.on('response', response => {
         try { if (new URL(response.url()).pathname === `${AUTH}/auth/pair`) pairStatus = response.status() } catch { /* ignore */ }
       })
@@ -689,6 +693,9 @@ try {
     const afterFirst = (await channelStatus(adminPort)).deviceCount
     assert.equal(first.pairStatus, 201, 'the first durable open pairs a device')
     assert.equal(afterFirst, before + 1, 'the first durable open registers exactly one device')
+    const binding = first.cookies.find(cookie => cookie.name === '__Host-dsh_ma_device_id')
+    assert.ok(binding, 'the TLS entry hands the browser a __Host- device id binding')
+
     // Keep every device-scoped cookie; drop only the session pair, which is what a
     // returning friend's browser looks like.
     for (const cookie of first.cookies) {
@@ -703,18 +710,42 @@ try {
     console.log(`durable link: first open ${String(first.pairStatus)}, second open ${String(second.pairStatus)}; devices ${String(before)} → ${String(afterFirst)} → ${String(afterSecond)}`)
     console.log(`durable link: cookies kept for the second open: ${keptNames.join(', ') || '(none)'}`)
     console.log(`durable link: Cookie header on the second /auth/pair: ${sentNames.join(', ') || '(none)'}`)
-    // The browser cannot send the narrow pairing token cookie to /auth/pair, so the
-    // gateway's reuse branch is unreachable here and each open adds a device.
+    // The browser sends the `__Host-` device id everywhere but the token only to the
+    // renewal path, so reuse keys off the id that actually arrives.
     assert.equal(sentNames.includes('dsh_ma_device'), false,
       'the browser never sends dsh_ma_device (Path=/mobile-access/auth/renew) to /auth/pair')
-    assert.ok(sentNames.includes('__Host-dsh_ma_device_id'), 'the TLS entry does send its device id binding')
-    // Observed browser behaviour, reported to the Lead as a contradiction of the
-    // intended reuse: the token cookie is path-scoped to /mobile-access/auth/renew,
-    // so the reuse branch never sees it. If the gateway is later changed to make
-    // reuse reachable, these two assertions must flip to 200/reused and an unchanged
-    // device count.
-    assert.equal(second.pairStatus, 201, 'the repeated durable open answers 201, not a reuse')
-    assert.equal(afterSecond, before + 2, 'a repeated durable open registers another device')
+    assert.ok(sentNames.includes('__Host-dsh_ma_device_id'), 'the TLS entry sends its device id binding')
+    assert.equal(second.pairStatus, 200, 'the repeated durable open reuses the device')
+    assert.equal(afterSecond, before + 1, 'a repeated durable open registers no further device')
+
+    // Replay the browser's own Cookie header as a plain HTTPS request, so the reuse
+    // body can be asserted without racing the page's navigation.
+    const replayPair = async (cookie) => {
+      const body = JSON.stringify({ token: durableLink.appKey, label: 'PC smoke reuse' })
+      return await httpsRequest(port, `${AUTH}/auth/pair`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+          cookie,
+        },
+        body,
+      })
+    }
+    const browserShaped = await replayPair(second.pairCookies)
+    assert.equal(browserShaped.status, 200, `browser-shaped reuse: ${browserShaped.body}`)
+    const reused = JSON.parse(browserShaped.body)
+    assert.equal(reused.paired, true)
+    assert.equal(reused.reused, true)
+    assert.equal(reused.deviceId, binding.value, 'reuse resolves the device the browser identified')
+    assert.ok(reused.csrfToken !== undefined && reused.sessionExpiresAt > Date.now(), 'the reuse issues a live session')
+    assert.equal((await channelStatus(adminPort)).deviceCount, before + 1, 'the replayed reuse adds no device')
+    // A stale id is unauthorised and falls through to a normal pair, never a 401.
+    const stalePair = await replayPair('__Host-dsh_ma_device_id=not-a-device')
+    assert.equal(stalePair.status, 201, `a stale binding pairs again: ${stalePair.body}`)
+    assert.equal(JSON.parse(stalePair.body).reused, undefined)
     cases++
   } finally {
     await durableContext.close()
@@ -776,8 +807,10 @@ try {
     assert.ok(desktopObservation.worker.supported, 'the TLS origin is also a secure context')
     cases++
 
-    // The plain-HTTP half of the durable link: a non-secure origin cannot set the
-    // `__Host-` binding, so a returning browser sends nothing the reuse branch needs.
+    // The plain-HTTP half of the durable link, kept as the documented limitation: a
+    // non-secure origin cannot set the `__Host-` binding at all, and the device token
+    // stays on the narrow renewal path, so a returning browser presents nothing the
+    // reuse branch can use and the repeat open pairs again. This is deliberate.
     const plainLink = await createLink(plainAdminPort)
     const plainOpen = async () => {
       const page = await plainContext.newPage()
@@ -805,7 +838,7 @@ try {
     const plainSecond = await plainOpen()
     const plainAfter = JSON.parse((await adminRequest(plainAdminPort, `${ADMIN}/lan/status`)).body).deviceCount
     const plainCookieNames = plainSecond.cookies.map(cookie => cookie.name).sort()
-    console.log(`durable link (plain HTTP): opens ${String(plainFirst.pairStatus)} then ${String(plainSecond.pairStatus)}; devices ${String(plainBefore)} → ${String(plainAfter)}`)
+    console.log(`durable link (plain HTTP): opens ${String(plainFirst.pairStatus)} then ${String(plainSecond.pairStatus)}; devices ${String(plainBefore)} → ${String(plainAfter)} — deliberate LAN limitation, not a regression`)
     console.log(`durable link (plain HTTP): jar ${plainCookieNames.join(', ') || '(none)'}; Cookie header ${plainSecond.cookieHeader || '(none)'}`)
     assert.deepEqual(plainFirst.cookies.map(cookie => cookie.name).filter(name => name.startsWith('__Host-')), [],
       'a plain-HTTP origin sets no __Host- cookie')
@@ -815,7 +848,7 @@ try {
     assert.equal(plainSentNames.includes('dsh_ma_device'), false,
       'the plain-HTTP repeat open sends no dsh_ma_device token to /auth/pair either')
     assert.equal(plainFirst.pairStatus, 201)
-    assert.equal(plainSecond.pairStatus, 201, 'the plain-HTTP repeat open also answers 201')
+    assert.equal(plainSecond.pairStatus, 201, 'the plain-HTTP repeat open pairs again')
     assert.equal(plainAfter, plainBefore + 2, 'the plain-HTTP repeat open registers another device too')
     cases++
   } finally {

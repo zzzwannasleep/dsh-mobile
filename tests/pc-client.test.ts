@@ -22,7 +22,7 @@ import {
   type ServerResponse,
 } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { createServer as createHttpsServer } from 'node:https'
+import { createServer as createHttpsServer, request as requestHttps } from 'node:https'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -30,6 +30,7 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { normalizePairingToken } from '../src/access.js'
 import { extractPairingToken } from '../src/auth-pages.js'
+import { HOST_DEVICE_COOKIE } from '../src/browser-auth-cookies.js'
 import { diagnosticControllerAction, MOBILE_CONTROL_MESSAGES } from '../src/client.js'
 import { Config, parseGatewayConfig, type PluginConfig } from '../src/config.js'
 import { MobileAccessService } from '../src/extensions.js'
@@ -76,6 +77,8 @@ interface PcFixture {
   readonly desktopCssFile: string
   readonly desktopScriptFile: string
   readonly pcOrigin: string
+  /** True when the external listener terminates TLS, which is what issues `__Host-` cookies. */
+  readonly tls: boolean
 }
 
 interface PcFixtureOptions {
@@ -85,6 +88,8 @@ interface PcFixtureOptions {
   readonly maxPairingAttempts?: number
   /** Device cap, lowered to prove the durable link still respects it. */
   readonly maxDevices?: number
+  /** Terminate TLS with a throwaway leaf, which is what makes the `__Host-` cookies apply. */
+  readonly tls?: boolean
 }
 
 interface OpenedPairing {
@@ -123,28 +128,33 @@ async function closeServer(server: Server): Promise<void> {
 async function request(
   port: number,
   path: string,
-  options: { method?: string; headers?: Record<string, string>; body?: string } = {},
+  options: { method?: string; headers?: Record<string, string>; body?: string; tls?: boolean } = {},
 ): Promise<HttpResult> {
   return new Promise<HttpResult>((resolve, reject) => {
     const body = options.body
     const headers = { ...options.headers }
     if (body !== undefined && headers['content-length'] === undefined) headers['content-length'] = String(Buffer.byteLength(body))
-    const outgoing = requestHttp({
-      host: '127.0.0.1',
-      port,
-      path,
-      method: options.method ?? 'GET',
-      headers,
-      agent: false,
-    }, (response) => {
-      const chunks: Buffer[] = []
-      response.on('data', chunk => { chunks.push(Buffer.from(chunk)) })
-      response.once('error', reject)
-      response.once('end', () => {
-        const rawBody = Buffer.concat(chunks)
-        resolve({ status: response.statusCode ?? 0, headers: response.headers, body: rawBody.toString('utf8'), rawBody })
+    const target = { host: '127.0.0.1', port, path, method: options.method ?? 'GET', headers, agent: false }
+    // The TLS-facing fixture uses a throwaway leaf, so the client skips verification.
+    const outgoing = options.tls === true
+      ? requestHttps({ ...target, rejectUnauthorized: false }, (response) => {
+        const chunks: Buffer[] = []
+        response.on('data', chunk => { chunks.push(Buffer.from(chunk)) })
+        response.once('error', reject)
+        response.once('end', () => {
+          const rawBody = Buffer.concat(chunks)
+          resolve({ status: response.statusCode ?? 0, headers: response.headers, body: rawBody.toString('utf8'), rawBody })
+        })
       })
-    })
+      : requestHttp(target, (response) => {
+        const chunks: Buffer[] = []
+        response.on('data', chunk => { chunks.push(Buffer.from(chunk)) })
+        response.once('error', reject)
+        response.once('end', () => {
+          const rawBody = Buffer.concat(chunks)
+          resolve({ status: response.statusCode ?? 0, headers: response.headers, body: rawBody.toString('utf8'), rawBody })
+        })
+      })
     outgoing.once('error', reject)
     outgoing.end(body)
   })
@@ -240,10 +250,22 @@ async function createFixture(options: PcFixtureOptions = {}): Promise<PcFixture>
   const desktopScriptFile = join(directory, 'desktop.js')
   await writeFile(desktopCssFile, ':root { --pc-layer-fixture: first; }\n', 'utf8')
   await writeFile(desktopScriptFile, 'window.dshMobile?.registerDesktop?.(() => undefined)\n', 'utf8')
+  // A TLS-facing fixture issues the `__Host-` cookies; the client-only fixture stays
+  // plain HTTP, which is the documented local-network shape.
+  let tlsFiles: { readonly certFile: string; readonly keyFile: string } | undefined
+  if (options.tls === true) {
+    const { leafCert, leafKey } = createTestTlsChain()
+    const certFile = join(directory, 'fixture-cert.pem')
+    const keyFile = join(directory, 'fixture-key.pem')
+    await writeFile(certFile, leafCert, 'utf8')
+    await writeFile(keyFile, leafKey, { mode: 0o600 })
+    tlsFiles = { certFile, keyFile }
+  }
   const gateway = new MobileAccessGateway(parseGatewayConfig(baseGatewayOptions(directory, upstreamPort, {
     // The pairing-form tests open many windows from one loopback address.
     maxPairingAttempts: options.maxPairingAttempts ?? 50,
     ...(options.maxDevices === undefined ? {} : { maxDevices: options.maxDevices }),
+    ...(tlsFiles === undefined ? {} : { tls: { mode: 'provided', certFile: tlsFiles.certFile, keyFile: tlsFiles.keyFile } }),
   })), new MemoryDeviceStore(), new MobileAccessService(context))
   await gateway.start()
   cleanups.push(() => gateway.close())
@@ -285,6 +307,7 @@ async function createFixture(options: PcFixtureOptions = {}): Promise<PcFixture>
     desktopCssFile,
     desktopScriptFile,
     pcOrigin,
+    tls: tlsFiles !== undefined,
   }
 }
 
@@ -539,11 +562,12 @@ function appKeySecret(appKey: string): string {
 }
 
 async function pairBrowser(
-  fixture: { readonly port: number; readonly origin: string },
+  fixture: { readonly port: number; readonly origin: string; readonly tls?: boolean },
   token: string,
   extra: Record<string, string> = {},
 ): Promise<HttpResult> {
   return request(fixture.port, '/mobile-access/auth/pair', {
+    tls: fixture.tls === true,
     method: 'POST',
     headers: {
       host: new URL(fixture.origin).host,
@@ -1077,49 +1101,82 @@ describe('durable PC entry link (task-13 + task-16)', () => {
   })
 
   it('reuses a bound device on a durable open and never consumes the link', async () => {
-    const fixture = await createFixture()
+    const fixture = await createFixture({ tls: true })
     const { appKey } = JSON.parse((await adminPost(fixture, LINK_PATH)).body) as { appKey: string }
 
     const first = await pairBrowser(fixture, appKey)
     expect(first.status, first.body).toBe(201)
     const firstBody = JSON.parse(first.body) as { deviceId: string; reused?: boolean }
     expect(firstBody.reused).toBeUndefined()
-    const deviceToken = cookiesByName(first.headers).get(DEVICE_COOKIE) ?? ''
+    const issued = cookiesByName(first.headers)
+    const deviceToken = issued.get(DEVICE_COOKIE) ?? ''
+    const deviceId = issued.get(HOST_DEVICE_COOKIE) ?? ''
     expect(deviceToken, 'the narrow device cookie is issued').not.toBe('')
+    expect(deviceId, 'the __Host- device id binding is issued').toBe(firstBody.deviceId)
 
-    // White-box: this asserts the *server branch* when the request really carries the
-    // narrow `dsh_ma_device` token. A browser is not sent that cookie on /auth/pair
-    // (its Path is /mobile-access/auth/renew), so scripts/smoke-pc-client.mjs records
-    // the browser-visible outcome instead: 201 and a new device on every open. That
-    // gap is reported to the Lead; the assertions below describe the server, not a
-    // reachable browser flow.
-    const second = await pairBrowser(fixture, appKey, { cookie: `${DEVICE_COOKIE}=${deviceToken}` })
-    expect(second.status, second.body).toBe(200)
-    expect(JSON.parse(second.body)).toMatchObject({ paired: true, reused: true, deviceId: firstBody.deviceId })
-    expect(cookiesByName(second.headers).has(SESSION_COOKIE)).toBe(true)
+    // The shape a browser actually sends to /auth/pair: the `__Host-` device id, and
+    // never the token cookie, whose Path is /mobile-access/auth/renew. This is the
+    // path scripts/smoke-pc-client.mjs measures in Chromium.
+    const viaId = await pairBrowser(fixture, appKey, { cookie: `${HOST_DEVICE_COOKIE}=${deviceId}` })
+    expect(viaId.status, viaId.body).toBe(200)
+    expect(JSON.parse(viaId.body)).toMatchObject({ paired: true, reused: true, deviceId: firstBody.deviceId })
+    expect(cookiesByName(viaId.headers).has(SESSION_COOKIE)).toBe(true)
     expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).deviceCount).toBe(1)
 
-    // The documented plain-HTTP limitation: no `__Host-` binding exists at all, so a
-    // browser never sends anything the reuse branch could use.
-    const withoutBinding = await pairBrowser(fixture, appKey)
-    expect(withoutBinding.status).toBe(201)
-    expect((JSON.parse(withoutBinding.body) as { reused?: boolean }).reused).toBeUndefined()
-    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).deviceCount).toBe(2)
+    // A caller that really does present the narrow token (the renewal-path client)
+    // reuses through the same branch.
+    const viaToken = await pairBrowser(fixture, appKey, {
+      cookie: `${HOST_DEVICE_COOKIE}=${deviceId}; ${DEVICE_COOKIE}=${deviceToken}`,
+    })
+    expect(viaToken.status, viaToken.body).toBe(200)
+    expect(JSON.parse(viaToken.body)).toMatchObject({ paired: true, reused: true, deviceId: firstBody.deviceId })
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).deviceCount).toBe(1)
 
     // A one-time code never takes the reuse path, even carrying the same binding.
     const opened = await openPairing(fixture)
-    const byCode = await pairBrowser(fixture, opened.token, { cookie: `${DEVICE_COOKIE}=${deviceToken}` })
+    const byCode = await pairBrowser(fixture, opened.token, { cookie: `${HOST_DEVICE_COOKIE}=${deviceId}` })
     expect(byCode.status, byCode.body).toBe(201)
     expect((JSON.parse(byCode.body) as { reused?: boolean }).reused).toBeUndefined()
 
-    // A stale binding falls through to a normal pair instead of failing.
-    const stale = await pairBrowser(fixture, appKey, { cookie: `${DEVICE_COOKIE}=stale-device-token` })
+    // A stale binding falls through to a normal pair, never a 401: an id that no
+    // device has, and an id whose device was revoked.
+    const stale = await pairBrowser(fixture, appKey, { cookie: `${HOST_DEVICE_COOKIE}=stale-device-id` })
     expect(stale.status, stale.body).toBe(201)
+    expect((JSON.parse(stale.body) as { reused?: boolean }).reused).toBeUndefined()
+    const revokedId = (JSON.parse(stale.body) as { deviceId: string }).deviceId
+    expect((await adminPost(fixture, `${LOCAL_ADMIN_PREFIX}/lan/devices/revoke`, JSON.stringify({ deviceId: revokedId }))).status).toBe(200)
+    const afterRevoke = await pairBrowser(fixture, appKey, { cookie: `${HOST_DEVICE_COOKIE}=${revokedId}` })
+    expect(afterRevoke.status, afterRevoke.body).toBe(201)
+    expect((JSON.parse(afterRevoke.body) as { reused?: boolean }).reused).toBeUndefined()
+    expect((JSON.parse(afterRevoke.body) as { deviceId: string }).deviceId).not.toBe(revokedId)
 
-    // A revoked device falls through too: the link itself is still valid.
-    const staleId = (JSON.parse(stale.body) as { deviceId: string }).deviceId
-    expect((await adminPost(fixture, `${LOCAL_ADMIN_PREFIX}/lan/devices/revoke`, JSON.stringify({ deviceId: staleId }))).status).toBe(200)
-    expect((await pairBrowser(fixture, appKey)).status).toBe(201)
+    // The link itself was never consumed: the original binding still reuses.
+    expect((await pairBrowser(fixture, appKey, { cookie: `${HOST_DEVICE_COOKIE}=${deviceId}` })).status).toBe(200)
+
+    // The token path also treats a revoked device as unauthorised and pairs again
+    // instead of surfacing the controller's 401 (`AccessError`, not `HttpError`).
+    expect((await adminPost(fixture, `${LOCAL_ADMIN_PREFIX}/lan/devices/revoke`, JSON.stringify({ deviceId }))).status).toBe(200)
+    const revokedToken = await pairBrowser(fixture, appKey, { cookie: `${DEVICE_COOKIE}=${deviceToken}` })
+    expect(revokedToken.status, revokedToken.body).toBe(201)
+    expect((JSON.parse(revokedToken.body) as { reused?: boolean }).reused).toBeUndefined()
+  })
+
+  it('cannot reuse a device on a plain-HTTP entry, which issues no binding', async () => {
+    // The documented local-network limitation, pinned here rather than left to the
+    // smoke: a non-secure origin sets no `__Host-` cookie, so the repeat request a
+    // browser can make carries nothing the reuse branch could use and it pairs again.
+    const plain = await createFixture()
+    const { appKey } = JSON.parse((await adminPost(plain, LINK_PATH)).body) as { appKey: string }
+    const first = await pairBrowser(plain, appKey)
+    expect(first.status, first.body).toBe(201)
+    const issued = cookiesByName(first.headers)
+    expect(issued.has(HOST_DEVICE_COOKIE), 'a plain-HTTP entry issues no __Host- binding').toBe(false)
+    // The token exists but only on the narrow renewal path, which /auth/pair never sees.
+    expect(issued.get(DEVICE_COOKIE), 'the token is issued on the narrow path only').not.toBe('')
+    const repeat = await pairBrowser(plain, appKey)
+    expect(repeat.status, repeat.body).toBe(201)
+    expect((JSON.parse(repeat.body) as { reused?: boolean }).reused).toBeUndefined()
+    expect(JSON.parse((await adminGet(plain, LAN_STATUS_PATH)).body).deviceCount).toBe(2)
   })
 
   it('keeps the device cap and the rate limit in front of the durable link', async () => {
@@ -1577,5 +1634,7 @@ describe('SakuraFrp trusted entry (子域绑定 + 自动 HTTPS)', () => {
     // The tunnel listing never echoes the token either.
     const tunnels = await invokeRoute(mounted, 'GET', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/tunnels`)
     expect(tunnels.body).not.toContain(token)
-  })
+    // Booting the real plugin and then making six admin calls outlives the default
+    // budget once the rest of the suite is competing for the same machine.
+  }, 25_000)
 })

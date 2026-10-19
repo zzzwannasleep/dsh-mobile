@@ -5,7 +5,17 @@ import { isAbsolute, join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AccessController } from '../src/access.js'
 import { parseGatewayConfig } from '../src/config.js'
-import { JsonEntryLinkStore, createEntryLinkSecret, parseEntryLinkSnapshot } from '../src/entry-link.js'
+import {
+  ENTRY_LINK_LABEL_DEFAULT,
+  JsonEntryLinkStore,
+  MAX_ENTRY_LINKS,
+  createEntryLinkId,
+  createEntryLinkSecret,
+  deriveEntryLinkId,
+  normalizeEntryLinkLabel,
+  parseEntryLinkState,
+  type EntryLinkRecord,
+} from '../src/entry-link.js'
 import { MobileAccessGateway } from '../src/gateway.js'
 import { LOCAL_ADMIN_PREFIX } from '../src/http-security.js'
 import { JsonDeviceStore, MemoryDeviceStore } from '../src/storage.js'
@@ -62,6 +72,10 @@ async function controller(entrySecret?: string): Promise<AccessController> {
   return access
 }
 
+function record(secret: string, label = ENTRY_LINK_LABEL_DEFAULT, id = createEntryLinkId()): EntryLinkRecord {
+  return Object.freeze({ id, label, secret, createdAt: 1_500_000 })
+}
+
 interface Fixture {
   readonly directory: string
   readonly gateway: MobileAccessGateway
@@ -69,7 +83,7 @@ interface Fixture {
   readonly externalPort: number
 }
 
-async function fixture(directory?: string, options: { publicTls?: boolean, nestedState?: boolean } = {}): Promise<Fixture> {
+async function fixture(directory?: string, options: { publicTls?: boolean, nestedState?: boolean, persistentDevices?: boolean } = {}): Promise<Fixture> {
   const root = directory ?? await temporaryDirectory()
   const upstream = createServer((_request, response) => {
     response.writeHead(200, { 'content-type': 'application/json' })
@@ -93,7 +107,9 @@ async function fixture(directory?: string, options: { publicTls?: boolean, neste
   // derives publicTls from the listener mode, so the public half is set here.
   const gateway = new MobileAccessGateway(
     options.publicTls === true ? { ...parsed, publicTls: true } : parsed,
-    new MemoryDeviceStore(),
+    // The restart scenarios need the devices to survive with the link file, exactly as
+    // the plugin's own JsonDeviceStore does.
+    options.persistentDevices === true ? new JsonDeviceStore(parsed.stateFile) : new MemoryDeviceStore(),
   )
   gateways.push(gateway)
   await gateway.start()
@@ -145,30 +161,75 @@ async function json(port: number, path: string, init: { method?: string, body?: 
   }
 }
 
+const LINK_PATH = `${LOCAL_ADMIN_PREFIX}/lan/link`
+const LINKS_PATH = `${LOCAL_ADMIN_PREFIX}/lan/links`
+const REVOKE_PATH = `${LOCAL_ADMIN_PREFIX}/lan/link/revoke`
+const STATUS_PATH = `${LOCAL_ADMIN_PREFIX}/lan/status`
+
+/** Create one link through the admin route and return its view. */
+async function createLink(port: number, label?: string): Promise<Record<string, unknown>> {
+  const created = await json(port, LINK_PATH, {
+    method: 'POST',
+    body: JSON.stringify(label === undefined ? {} : { label }),
+    admin: true,
+  })
+  expect(created.status, JSON.stringify(created.body)).toBe(201)
+  return created.body
+}
+
+async function listLinks(port: number): Promise<readonly Record<string, unknown>[]> {
+  const listed = await json(port, LINKS_PATH, { admin: true })
+  expect(listed.status).toBe(200)
+  return listed.body.links as readonly Record<string, unknown>[]
+}
+
 describe('JsonEntryLinkStore', () => {
-  it('round-trips a generated secret and clears it', async () => {
+  it('round-trips several links and clears them', async () => {
     const directory = await temporaryDirectory()
     const store = new JsonEntryLinkStore(directory)
-    expect(await store.load()).toBeUndefined()
+    expect(await store.load()).toStrictEqual({ version: 2, links: [] })
 
-    const secret = createEntryLinkSecret()
-    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/u)
-    await store.save(secret)
-    expect(await store.load()).toBe(secret)
+    const first = record(createEntryLinkSecret(), '我的电脑')
+    const second = record(createEntryLinkSecret(), '朋友的电脑')
+    await store.save({ version: 2, links: [first, second] })
+    expect(await store.load()).toStrictEqual({ version: 2, links: [first, second] })
 
     const persisted = JSON.parse(await readFile(store.file, 'utf8')) as Record<string, unknown>
-    expect(persisted).toStrictEqual({ version: 1, secret })
+    expect(persisted).toStrictEqual({ version: 2, links: [first, second] })
 
     await store.clear()
-    expect(await store.load()).toBeUndefined()
+    expect(await store.load()).toStrictEqual({ version: 2, links: [] })
     await expect(store.clear()).resolves.toBeUndefined()
   })
 
-  it('refuses a malformed, foreign or replaced file instead of disabling the link silently', async () => {
+  it('upgrades the single-link file of the previous release with a stable id', async () => {
+    const directory = await temporaryDirectory()
+    const store = new JsonEntryLinkStore(directory)
+    const secret = createEntryLinkSecret()
+    await writeFile(store.file, `${JSON.stringify({ version: 1, secret, extra: 1 })}\n`, 'utf8')
+
+    const migrated = await store.load()
+    expect(migrated.links).toHaveLength(1)
+    // The identifier is what ties a paired device back to its link, so it must be
+    // derived from the secret rather than drawn fresh on every read.
+    expect(migrated.links[0]).toStrictEqual({
+      id: deriveEntryLinkId(secret),
+      label: ENTRY_LINK_LABEL_DEFAULT,
+      secret,
+      createdAt: expect.any(Number) as unknown as number,
+    })
+    expect(migrated.links[0]?.createdAt).toBeGreaterThan(0)
+    expect((await store.load()).links[0]?.id).toBe(deriveEntryLinkId(secret))
+  })
+
+  it('refuses a malformed, foreign or replaced file instead of disabling the links silently', async () => {
     const directory = await temporaryDirectory()
     const store = new JsonEntryLinkStore(directory)
     await writeFile(store.file, 'not json at all\n', 'utf8')
     await expect(store.load()).rejects.toThrow()
+
+    await writeFile(store.file, `${JSON.stringify({ version: 3, links: [] })}\n`, 'utf8')
+    await expect(store.load()).rejects.toThrow(/unsupported version/u)
 
     await writeFile(store.file, `${JSON.stringify({ version: 2, secret: createEntryLinkSecret() })}\n`, 'utf8')
     await expect(store.load()).rejects.toThrow(/unsupported version/u)
@@ -176,8 +237,13 @@ describe('JsonEntryLinkStore', () => {
     await writeFile(store.file, `${JSON.stringify({ version: 1, secret: 'too-short' })}\n`, 'utf8')
     await expect(store.load()).rejects.toThrow(/invalid secret/u)
 
-    await writeFile(store.file, `${JSON.stringify({ version: 1, secret: createEntryLinkSecret(), extra: 1 })}\n`, 'utf8')
-    await expect(store.load()).resolves.toMatch(/^[\w-]{43}$/u)
+    const many = Array.from({ length: MAX_ENTRY_LINKS + 1 }, () => record(createEntryLinkSecret()))
+    await writeFile(store.file, `${JSON.stringify({ version: 2, links: many })}\n`, 'utf8')
+    await expect(store.load()).rejects.toThrow(/unsupported version or link count/u)
+
+    const secret = createEntryLinkSecret()
+    await writeFile(store.file, `${JSON.stringify({ version: 2, links: [record(secret), record(secret)] })}\n`, 'utf8')
+    await expect(store.load()).rejects.toThrow(/duplicate link identities/u)
 
     await rm(store.file, { force: true })
     await mkdir(store.file)
@@ -186,11 +252,31 @@ describe('JsonEntryLinkStore', () => {
 
   it('validates the persisted shape directly', () => {
     const secret = createEntryLinkSecret()
-    expect(parseEntryLinkSnapshot({ version: 1, secret })).toStrictEqual({ version: 1, secret })
-    expect(() => parseEntryLinkSnapshot(null)).toThrow()
-    expect(() => parseEntryLinkSnapshot([])).toThrow()
-    expect(() => parseEntryLinkSnapshot({ version: 1 })).toThrow()
-    expect(() => parseEntryLinkSnapshot({ version: 1, secret: `${secret}=` })).toThrow()
+    const migrated = { id: deriveEntryLinkId(secret), createdAt: 1 }
+    expect(parseEntryLinkState({ version: 1, secret }, migrated)).toStrictEqual({
+      version: 2,
+      links: [{ id: migrated.id, label: ENTRY_LINK_LABEL_DEFAULT, secret, createdAt: 1 }],
+    })
+    // Without the metadata the version 1 secret has no stable identity.
+    expect(() => parseEntryLinkState({ version: 1, secret })).toThrow(/migration metadata/u)
+    expect(() => parseEntryLinkState(null)).toThrow()
+    expect(() => parseEntryLinkState([])).toThrow()
+    expect(() => parseEntryLinkState({ version: 1 })).toThrow()
+    expect(() => parseEntryLinkState({ version: 1, secret: `${secret}=` }, migrated)).toThrow()
+    expect(() => parseEntryLinkState({ version: 2, links: [] })).not.toThrow()
+    expect(() => parseEntryLinkState({ version: 2, links: 'nope' })).toThrow()
+    expect(() => parseEntryLinkState({ version: 2, links: [{ ...record(secret), id: 'nope' }] })).toThrow(/invalid id/u)
+    expect(() => parseEntryLinkState({ version: 2, links: [{ ...record(secret), label: 'x'.repeat(65) }] })).toThrow(/invalid label/u)
+    expect(() => parseEntryLinkState({ version: 2, links: [{ ...record(secret), createdAt: -1 }] })).toThrow(/createdAt/u)
+    expect(() => parseEntryLinkState({ version: 2, links: [{ ...record(secret), lastUsedAt: 1.5 }] })).toThrow(/lastUsedAt/u)
+  })
+
+  it('normalizes the label the owner types', () => {
+    expect(normalizeEntryLinkLabel(undefined)).toBe(ENTRY_LINK_LABEL_DEFAULT)
+    expect(normalizeEntryLinkLabel('  ')).toBe(ENTRY_LINK_LABEL_DEFAULT)
+    expect(normalizeEntryLinkLabel('  我的电脑  ')).toBe('我的电脑')
+    expect(() => normalizeEntryLinkLabel('x'.repeat(65))).toThrow()
+    expect(() => normalizeEntryLinkLabel('bad\u0000name')).toThrow()
   })
 })
 
@@ -198,7 +284,7 @@ describe('durable entry link authorization', () => {
   it('pairs repeatedly through the durable secret without any window', async () => {
     const secret = createEntryLinkSecret()
     const access = await controller(secret)
-    expect(access.entryLinkStatus()).toStrictEqual({ active: true })
+    expect(access.entryLinkStatus()).toStrictEqual({ active: true, count: 1 })
 
     const first = await access.pair('friend-a', secret, 'Friend PC')
     const second = await access.pair('friend-b', `dsh1.3f2a1b.${secret}`, 'Second PC')
@@ -207,9 +293,16 @@ describe('durable entry link authorization', () => {
     // Still reusable after both pairings: the link is a bearer credential, not a window.
     await expect(access.pair('friend-c', secret, 'Third PC')).resolves.toMatchObject({ deviceToken: expect.any(String) })
     expect(access.pairingStatus().open).toBe(false)
+    // Every device records the link it came through, so revoking the link finds them.
+    expect(new Set(access.listDevices().map(device => device.entryLinkId)).size).toBe(1)
+    expect(access.listDevices().map(device => device.entryLinkId)).toStrictEqual([
+      deriveEntryLinkId(secret), deriveEntryLinkId(secret), deriveEntryLinkId(secret),
+    ])
+    expect(access.matchEntryLink(`dsh2.a.${secret}`)).toBe(deriveEntryLinkId(secret))
+    expect(access.matchEntryLink(createEntryLinkSecret())).toBeUndefined()
   })
 
-  it('never exposes the secret through device listings', async () => {
+  it('never exposes a secret through device listings', async () => {
     const secret = createEntryLinkSecret()
     const access = await controller(secret)
     await access.pair('friend-a', secret, 'Friend PC')
@@ -222,9 +315,59 @@ describe('durable entry link authorization', () => {
     const secret = createEntryLinkSecret()
     const access = await controller(secret)
     const window = await access.openPairing()
-    await expect(access.pair('phone', window.token, 'Phone')).resolves.toMatchObject({ deviceToken: expect.any(String) })
+    const phone = await access.pair('phone', window.token, 'Phone')
+    // A code is not an invitation: the device it creates belongs to no link.
+    expect(phone.entryLinkId).toBeUndefined()
+    expect(access.listDevices()[0]?.entryLinkId).toBeUndefined()
     await expect(access.pair('phone-2', window.token, 'Replay')).rejects.toMatchObject({ status: 401 })
     await expect(access.pair('friend', secret, 'Friend PC')).resolves.toMatchObject({ deviceToken: expect.any(String) })
+  })
+
+  it('revokes one link without touching the others', async () => {
+    const access = await controller()
+    const mine = record(createEntryLinkSecret(), '我的电脑')
+    const friend = record(createEntryLinkSecret(), '朋友的电脑')
+    access.setEntryLinks([mine, friend])
+    expect(access.entryLinkStatus()).toStrictEqual({ active: true, count: 2 })
+
+    const own = await access.pair('me', mine.secret, 'My PC')
+    const theirs = await access.pair('friend', friend.secret, 'Friend PC')
+    expect(own.entryLinkId).toBe(mine.id)
+    expect(theirs.entryLinkId).toBe(friend.id)
+
+    await expect(access.revokeEntryLink(mine.id)).resolves.toBe(1)
+    expect(access.entryLinkStatus()).toStrictEqual({ active: true, count: 1 })
+    expect(access.listDevices().map(device => device.id)).toStrictEqual([theirs.deviceId])
+    // The revoked invitation cannot be used again, and its device lost its Session.
+    await expect(access.pair('stranger', mine.secret, 'Late')).rejects.toMatchObject({ status: 401 })
+    await expect(access.renewDevice(own.deviceId)).rejects.toMatchObject({ status: 401 })
+    expect(() => access.authorizeSession(own.sessionToken)).toThrow(/authentication_failed|device_revoked/u)
+    // The other link keeps working exactly as before.
+    await expect(access.renewDevice(theirs.deviceId)).resolves.toMatchObject({ deviceId: theirs.deviceId })
+    await expect(access.pair('friend-2', friend.secret, 'Second friend PC')).resolves.toMatchObject({ deviceToken: expect.any(String) })
+    await expect(access.revokeEntryLink(mine.id)).resolves.toBe(0)
+  })
+
+  it('refuses a device whose link is no longer installed', async () => {
+    const access = await controller()
+    const link = record(createEntryLinkSecret())
+    access.setEntryLinks([link])
+    const paired = await access.pair('friend', link.secret, 'Friend PC')
+    expect(paired.entryLinkId).toBe(link.id)
+
+    // A lost or replaced link file must fail closed rather than leave the invitation
+    // alive for the whole device lifetime.
+    access.setEntryLinks([])
+    await expect(access.renewDevice(paired.deviceId)).rejects.toMatchObject({ status: 401, code: 'device_revoked' })
+    await expect(access.renew(paired.deviceToken)).rejects.toMatchObject({ status: 401, code: 'device_revoked' })
+    await expect(access.probe(paired.deviceToken)).rejects.toMatchObject({ status: 401, code: 'device_revoked' })
+    expect(() => access.authorizeDevice(paired.deviceToken)).toThrow()
+    expect(() => access.authorizeSession(paired.sessionToken)).toThrow()
+
+    // Re-installing the same link makes the device usable again, because nothing about
+    // the device itself changed.
+    access.setEntryLinks([link])
+    await expect(access.renewDevice(paired.deviceId)).resolves.toMatchObject({ deviceId: paired.deviceId })
   })
 
   it('rejects a rotated or revoked secret and keeps the cap in place', async () => {
@@ -236,7 +379,7 @@ describe('durable entry link authorization', () => {
     await expect(access.pair('friend-b', rotated, 'New link')).resolves.toMatchObject({ deviceToken: expect.any(String) })
 
     access.setEntrySecret(undefined)
-    expect(access.entryLinkStatus()).toStrictEqual({ active: false })
+    expect(access.entryLinkStatus()).toStrictEqual({ active: false, count: 0 })
     await expect(access.pair('friend-c', rotated, 'Revoked link')).rejects.toMatchObject({ status: 401 })
 
     const capped = await controller(createEntryLinkSecret())
@@ -246,6 +389,17 @@ describe('durable entry link authorization', () => {
       await expect(capped.pair(`device-${String(index)}`, capSecret, `PC ${String(index)}`)).resolves.toMatchObject({ deviceToken: expect.any(String) })
     }
     await expect(capped.pair('device-overflow', capSecret, 'One too many')).rejects.toMatchObject({ status: 409 })
+  })
+
+  it('refuses credentials it cannot use instead of installing them', async () => {
+    const access = await controller()
+    const secret = createEntryLinkSecret()
+    expect(() => { access.setEntryLinks([{ id: 'nope', secret }]) }).toThrow(/invalid_request/u)
+    expect(() => { access.setEntryLinks([{ id: createEntryLinkId(), secret: '' }]) }).toThrow(/invalid_request/u)
+    expect(() => { access.setEntryLinks([{ id: createEntryLinkId(), secret: 'x'.repeat(513) }]) }).toThrow(/invalid_request/u)
+    const id = createEntryLinkId()
+    expect(() => { access.setEntryLinks([{ id, secret }, { id, secret: createEntryLinkSecret() }]) }).toThrow(/invalid_request/u)
+    expect(access.entryLinkStatus()).toStrictEqual({ active: false, count: 0 })
   })
 
   it('keeps the rate limiter in front of the durable secret', async () => {
@@ -258,37 +412,133 @@ describe('durable entry link authorization', () => {
 })
 
 describe('entry link admin route', () => {
-  it('creates the link once, returns it unchanged, and regenerates on request', async () => {
+  it('appends one link per call and lists them with their own URLs', async () => {
     const { adminPort, externalPort } = await fixture()
-    const created = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    expect(created.status).toBe(201)
-    expect(created.body.created).toBe(true)
-    const appKey = created.body.appKey as string
+    const first = await createLink(adminPort, '我的电脑')
+    expect(first.created).toBe(true)
+    const appKey = first.appKey as string
     expect(appKey).toMatch(/^dsh[12]\.[\w-]+\.[\w-]{43}$/u)
-    const entryUrl = created.body.entryUrl as string
-    expect(entryUrl).toBe(`http://127.0.0.1:${String(externalPort)}/mobile-access/pc#key=${appKey}`)
+    expect(first.entryUrl).toBe(`http://127.0.0.1:${String(externalPort)}/mobile-access/pc#key=${appKey}`)
+    expect(first.link).toMatchObject({ label: '我的电脑', deviceCount: 0, appKey, entryUrl: first.entryUrl })
 
-    const again = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    expect(again.status).toBe(200)
-    expect(again.body.created).toBe(false)
-    expect(again.body.appKey).toBe(appKey)
+    // A second call is a second invitation, not a rotation.
+    const second = await createLink(adminPort)
+    expect(second.appKey).not.toBe(appKey)
+    expect((second.link as Record<string, unknown>).label).toBe(ENTRY_LINK_LABEL_DEFAULT)
+    const links = await listLinks(adminPort)
+    expect(links).toHaveLength(2)
+    expect(links.map(link => link.id)).toStrictEqual([
+      (first.link as Record<string, unknown>).id,
+      (second.link as Record<string, unknown>).id,
+    ])
+    expect(links.map(link => link.appKey)).toStrictEqual([appKey, second.appKey])
+    expect(links[0]?.createdAt).toEqual(expect.any(Number))
+    expect(links[0]?.lastUsedAt).toBeUndefined()
 
-    const regenerated = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{"regenerate":true}', admin: true })
-    expect(regenerated.status).toBe(201)
-    expect(regenerated.body.appKey).not.toBe(appKey)
+    const status = await json(adminPort, STATUS_PATH, { admin: true })
+    expect(status.body.entryLink).toStrictEqual({ active: true, count: 2 })
 
-    const status = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })
-    expect(status.body.entryLink).toStrictEqual({ active: true })
+    // A device that pairs through one link is counted on that link only, and the link
+    // records when it was last used.
+    const paired = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin: `http://127.0.0.1:${String(externalPort)}`,
+    })
+    expect(paired.status).toBeLessThan(300)
+    const counted = await listLinks(adminPort)
+    expect(counted.map(link => link.deviceCount)).toStrictEqual([1, 0])
+    expect(counted[0]?.lastUsedAt).toEqual(expect.any(Number))
+  })
 
-    const bad = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{"regenerate":"yes"}', admin: true })
-    expect(bad.status).toBe(400)
+  it('revokes exactly the link it is told to, and everything with all', async () => {
+    const { adminPort, externalPort } = await fixture()
+    const origin = `http://127.0.0.1:${String(externalPort)}`
+    const mine = await createLink(adminPort, '我的电脑')
+    const friend = await createLink(adminPort, '朋友的电脑')
+    const myId = (mine.link as Record<string, unknown>).id as string
+    const friendId = (friend.link as Record<string, unknown>).id as string
+
+    const myDevice = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: mine.appKey, label: 'My PC' }), origin,
+    })
+    const friendDevice = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: friend.appKey, label: 'Friend PC' }), origin,
+    })
+    expect(myDevice.status).toBeLessThan(300)
+    expect(friendDevice.status).toBeLessThan(300)
+
+    const revoked = await json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ linkId: friendId }), admin: true })
+    expect(revoked.status, JSON.stringify(revoked.body)).toBe(200)
+    expect(revoked.body).toStrictEqual({ revoked: true, devicesRevoked: 1 })
+
+    // Only the friend's invitation and the friend's device are gone.
+    expect((await listLinks(adminPort)).map(link => link.id)).toStrictEqual([myId])
+    const devices = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/devices`, { admin: true })
+    expect((devices.body.devices as readonly Record<string, unknown>[]).map(device => device.label)).toStrictEqual(['My PC'])
+    await expect(json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: friend.appKey, label: 'Too late' }), origin,
+    })).resolves.toMatchObject({ status: 401 })
+    await expect(json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: mine.appKey, label: 'Still fine' }), origin,
+    })).resolves.toMatchObject({ status: expect.any(Number) })
+
+    // A stale browser that still holds the friend's device cannot get back in either.
+    const stale = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST',
+      body: JSON.stringify({ token: friend.appKey, label: 'Friend PC' }),
+      origin,
+      cookie: (friendDevice.setCookie.filter(entry => !entry.toLowerCase().includes('path=/mobile-access/auth/renew')).map(entry => entry.split(';')[0] as string).join('; ')),
+    })
+    expect(stale.status).toBe(401)
+
+    await expect(json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ linkId: '0'.repeat(16) }), admin: true }))
+      .resolves.toMatchObject({ status: 404 })
+    await expect(json(adminPort, REVOKE_PATH, { method: 'POST', body: '{}', admin: true }))
+      .resolves.toMatchObject({ status: 400 })
+    await expect(json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ linkId: 'nope' }), admin: true }))
+      .resolves.toMatchObject({ status: 400 })
+
+    const all = await json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ all: true }), admin: true })
+    expect(all.status).toBe(200)
+    // Only the owner's link is left, and it carries two devices by now.
+    expect(all.body).toStrictEqual({ revoked: true, devicesRevoked: 2, revokedLinks: 1 })
+    expect(await listLinks(adminPort)).toStrictEqual([])
+    const status = await json(adminPort, STATUS_PATH, { admin: true })
+    expect(status.body.entryLink).toStrictEqual({ active: false, count: 0 })
+  })
+
+  it('refuses a link name it cannot store', async () => {
+    const { adminPort } = await fixture()
+    await expect(json(adminPort, LINK_PATH, { method: 'POST', body: JSON.stringify({ label: 7 }), admin: true }))
+      .resolves.toMatchObject({ status: 400 })
+    await expect(json(adminPort, LINK_PATH, { method: 'POST', body: JSON.stringify({ label: 'x'.repeat(65) }), admin: true }))
+      .resolves.toMatchObject({ status: 400 })
+    await expect(json(adminPort, LINK_PATH, { method: 'POST', body: JSON.stringify({ label: 'bad\u0000name' }), admin: true }))
+      .resolves.toMatchObject({ status: 400 })
+    expect(await listLinks(adminPort)).toStrictEqual([])
+    // A blank name is not a failure: the link gets the default one.
+    const blank = await createLink(adminPort, '   ')
+    expect((blank.link as Record<string, unknown>).label).toBe(ENTRY_LINK_LABEL_DEFAULT)
+  })
+
+  it('stops at the link limit and accepts a new link after a revocation', async () => {
+    const { adminPort } = await fixture()
+    for (let index = 0; index < MAX_ENTRY_LINKS; index += 1) await createLink(adminPort, `链接 ${String(index)}`)
+    const overflow = await json(adminPort, LINK_PATH, { method: 'POST', body: '{}', admin: true })
+    expect(overflow.status).toBe(409)
+    expect(overflow.body.error).toBe('entry_link_limit')
+    expect(await listLinks(adminPort)).toHaveLength(MAX_ENTRY_LINKS)
+
+    const links = await listLinks(adminPort)
+    await json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ linkId: links[0]?.id }), admin: true })
+    await expect(createLink(adminPort, '替换')).resolves.toMatchObject({ created: true })
   })
 
   it('lets a friend pair through the link repeatedly, then revokes it', async () => {
     const { adminPort, externalPort } = await fixture()
-    const created = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    const appKey = created.body.appKey as string
-    const entryUrl = created.body.entryUrl as string
+    const created = await createLink(adminPort, '朋友')
+    const appKey = created.appKey as string
+    const entryUrl = created.entryUrl as string
+    const linkId = (created.link as Record<string, unknown>).id as string
     const origin = `http://127.0.0.1:${String(externalPort)}`
 
     const first = await json(externalPort, '/mobile-access/auth/pair', {
@@ -303,14 +553,16 @@ describe('entry link admin route', () => {
     })
     expect(second.status).toBeLessThan(300)
 
-    const revoked = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link/revoke`, { method: 'POST', body: '{}', admin: true })
+    const revoked = await json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ linkId }), admin: true })
     expect(revoked.status).toBe(200)
+    expect(revoked.body.devicesRevoked).toBe(2)
     const afterRevoke = await json(externalPort, '/mobile-access/auth/pair', {
       method: 'POST', body: JSON.stringify({ token: appKey, label: 'Too late' }), origin,
     })
     expect(afterRevoke.status).toBe(401)
-    const status = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })
-    expect(status.body.entryLink).toStrictEqual({ active: false })
+    const status = await json(adminPort, STATUS_PATH, { admin: true })
+    expect(status.body.entryLink).toStrictEqual({ active: false, count: 0 })
+    expect(status.body.deviceCount).toBe(0)
   })
 
   it('keeps the local and the public entry link independent', async () => {
@@ -319,8 +571,8 @@ describe('entry link admin route', () => {
     const root = await temporaryDirectory()
     const lan = await fixture(root)
     const remote = await fixture(root, { nestedState: true })
-    const lanKey = (await json(lan.adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })).body.appKey as string
-    const remoteKey = (await json(remote.adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })).body.appKey as string
+    const lanKey = (await createLink(lan.adminPort)).appKey as string
+    const remoteKey = (await createLink(remote.adminPort)).appKey as string
     expect(lanKey).not.toBe(remoteKey)
 
     const cross = await json(remote.externalPort, '/mobile-access/auth/pair', {
@@ -337,31 +589,78 @@ describe('entry link admin route', () => {
     expect(own.status).toBeLessThan(300)
   })
 
-  it('keeps the same link valid after a gateway restart', async () => {
+  it('keeps the same links valid after a gateway restart', async () => {
     const directory = await temporaryDirectory()
-    const first = await fixture(directory)
-    const created = await json(first.adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    const appKey = created.body.appKey as string
+    const first = await fixture(directory, { persistentDevices: true })
+    const mine = await createLink(first.adminPort, '我的电脑')
+    const friend = await createLink(first.adminPort, '朋友的电脑')
+    const myId = (mine.link as Record<string, unknown>).id
+    const paired = await json(first.externalPort, '/mobile-access/auth/pair', {
+      method: 'POST',
+      body: JSON.stringify({ token: friend.appKey, label: 'After restart' }),
+      origin: `http://127.0.0.1:${String(first.externalPort)}`,
+    })
+    expect(paired.status).toBeLessThan(300)
     await first.gateway.close()
     gateways.splice(gateways.indexOf(first.gateway), 1)
 
-    const restarted = await fixture(directory)
-    const status = await json(restarted.adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })
-    expect(status.body.entryLink).toStrictEqual({ active: true })
-    const paired = await json(restarted.externalPort, '/mobile-access/auth/pair', {
+    const restarted = await fixture(directory, { persistentDevices: true })
+    const status = await json(restarted.adminPort, STATUS_PATH, { admin: true })
+    expect(status.body.entryLink).toStrictEqual({ active: true, count: 2 })
+    const links = await listLinks(restarted.adminPort)
+    expect(links.map(link => link.id)).toStrictEqual([myId, (friend.link as Record<string, unknown>).id])
+    expect(links.map(link => link.deviceCount)).toStrictEqual([0, 1])
+    expect(links.map(link => link.label)).toStrictEqual(['我的电脑', '朋友的电脑'])
+    const again = await json(restarted.externalPort, '/mobile-access/auth/pair', {
       method: 'POST',
-      body: JSON.stringify({ token: appKey, label: 'After restart' }),
+      body: JSON.stringify({ token: friend.appKey, label: 'After restart' }),
       origin: `http://127.0.0.1:${String(restarted.externalPort)}`,
     })
+    expect(again.status).toBeLessThan(300)
+    // The device that paired before the restart is still bound to its link.
+    const revoked = await json(restarted.adminPort, REVOKE_PATH, {
+      method: 'POST', body: JSON.stringify({ linkId: (friend.link as Record<string, unknown>).id }), admin: true,
+    })
+    expect(revoked.body.devicesRevoked).toBe(2)
+  })
+
+  it('upgrades a previous release\'s link file and keeps the devices it paired', async () => {
+    const directory = await temporaryDirectory()
+    const secret = createEntryLinkSecret()
+    await writeFile(join(directory, 'entry-link.json'), `${JSON.stringify({ version: 1, secret })}\n`, 'utf8')
+    const legacy = await fixture(directory, { persistentDevices: true })
+    const status = await json(legacy.adminPort, STATUS_PATH, { admin: true })
+    expect(status.body.entryLink).toStrictEqual({ active: true, count: 1 })
+    const links = await listLinks(legacy.adminPort)
+    expect(links[0]?.id).toBe(deriveEntryLinkId(secret))
+    expect(links[0]?.label).toBe(ENTRY_LINK_LABEL_DEFAULT)
+
+    const paired = await json(legacy.externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: secret, label: 'Friend PC' }), origin: `http://127.0.0.1:${String(legacy.externalPort)}`,
+    })
     expect(paired.status).toBeLessThan(300)
+    expect((await listLinks(legacy.adminPort))[0]?.deviceCount).toBe(1)
+
+    // The upgraded file keeps the link, and the device still belongs to it.
+    await legacy.gateway.close()
+    gateways.splice(gateways.indexOf(legacy.gateway), 1)
+    const restarted = await fixture(directory, { persistentDevices: true })
+    const links2 = await listLinks(restarted.adminPort)
+    expect(links2[0]?.id).toBe(deriveEntryLinkId(secret))
+    expect(links2[0]?.deviceCount).toBe(1)
+    const revoked = await json(restarted.adminPort, REVOKE_PATH, {
+      method: 'POST', body: JSON.stringify({ linkId: deriveEntryLinkId(secret) }), admin: true,
+    })
+    expect(revoked.body).toStrictEqual({ revoked: true, devicesRevoked: 1 })
   })
 
   it('refreshes an already-bound computer instead of registering another device', async () => {
     // publicTls mirrors the Cloudflare/SakuraFrp remote gateway: the listener is plain
     // but the public origin is HTTPS, so the __Host- device binding is issued.
     const { adminPort, externalPort } = await fixture(undefined, { publicTls: true })
-    const created = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    const appKey = created.body.appKey as string
+    const created = await createLink(adminPort)
+    const appKey = created.appKey as string
+    const linkId = (created.link as Record<string, unknown>).id as string
     const origin = `https://127.0.0.1:${String(externalPort)}`
 
     const first = await json(externalPort, '/mobile-access/auth/pair', {
@@ -378,7 +677,7 @@ describe('entry link admin route', () => {
     expect(everyPath).toContain('__Host-dsh_ma_device_id=')
     expect(everyPath).not.toContain('dsh_ma_device=')
     expect(renewPath).toContain('dsh_ma_device=')
-    const before = (await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })).body.deviceCount
+    const before = (await json(adminPort, STATUS_PATH, { admin: true })).body.deviceCount
 
     const second = await json(externalPort, '/mobile-access/auth/pair', {
       method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: everyPath,
@@ -386,7 +685,7 @@ describe('entry link admin route', () => {
     expect(second.status).toBe(200)
     expect(second.body.reused).toBe(true)
     expect(second.body.deviceId).toBe(first.body.deviceId)
-    const after = (await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })).body.deviceCount
+    const after = (await json(adminPort, STATUS_PATH, { admin: true })).body.deviceCount
     expect(after).toBe(before)
 
     // A caller that does send the token (the renewal path's own client) reuses too.
@@ -402,6 +701,13 @@ describe('entry link admin route', () => {
     })
     expect(stale.status).toBe(201)
     expect(stale.body.reused).toBeUndefined()
+
+    // Once the link is revoked the bound browser cannot reuse its way back in.
+    await json(adminPort, REVOKE_PATH, { method: 'POST', body: JSON.stringify({ linkId }), admin: true })
+    const afterRevoke = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: everyPath,
+    })
+    expect(afterRevoke.status).toBe(401)
   })
 
   it('cannot reuse a local-network device, which carries no binding the browser sends', async () => {
@@ -409,8 +715,8 @@ describe('entry link admin route', () => {
     // narrow renewal path, so a repeat open has nothing the browser would send and
     // pairs again. This is the documented limitation, not an accident of the fixture.
     const { adminPort, externalPort } = await fixture()
-    const created = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    const appKey = created.body.appKey as string
+    const created = await createLink(adminPort)
+    const appKey = created.appKey as string
     const origin = `http://127.0.0.1:${String(externalPort)}`
 
     const first = await json(externalPort, '/mobile-access/auth/pair', {
@@ -430,18 +736,21 @@ describe('entry link admin route', () => {
     expect(second.body.reused).toBeUndefined()
   })
 
-  it('never serves the link secret on the external listener', async () => {
+  it('never serves a link secret on the external listener', async () => {
     const { adminPort, externalPort } = await fixture()
-    const created = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
-    const secret = (created.body.appKey as string).split('.')[2] as string
+    const created = await createLink(adminPort)
+    const secret = (created.appKey as string).split('.')[2] as string
     expect(secret).toMatch(/^[\w-]{43}$/u)
 
     // The external listener proxies unknown paths upstream; whatever it answers,
-    // the link secret and the admin route must not be reachable from outside.
-    const external = await json(externalPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
+    // the link secret and the admin routes must not be reachable from outside.
+    const external = await json(externalPort, LINK_PATH, { method: 'POST', body: '{}', admin: true })
     expect(JSON.stringify(external.body)).not.toContain(secret)
     expect(external.body.entryUrl).toBeUndefined()
-    const externalStatus = await json(externalPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })
+    const externalLinks = await json(externalPort, LINKS_PATH, { admin: true })
+    expect(JSON.stringify(externalLinks.body)).not.toContain(secret)
+    expect(externalLinks.body.links).toBeUndefined()
+    const externalStatus = await json(externalPort, STATUS_PATH, { admin: true })
     expect(JSON.stringify(externalStatus.body)).not.toContain(secret)
     expect(externalStatus.body.entryLink).toBeUndefined()
   })

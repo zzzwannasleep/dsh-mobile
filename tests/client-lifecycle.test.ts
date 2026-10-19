@@ -30,7 +30,9 @@ import {
   normalizeDiagnosticOverall,
   normalizeDiagnosticStatus,
   parseMobileExtensionManifest,
+  newestPcClientLink,
   pcClientInfo,
+  pcClientLinks,
   PerIdActivationLifecycle,
   publishAuthoritativeExtensionIds,
   reconcileRemovedExtensions,
@@ -1514,12 +1516,13 @@ describe('PC 端 tab data', () => {
     expect(escaped.channels).toEqual([])
   })
 
-  it('routes the durable link, the installer and the certificate through the frozen paths', () => {
+  it('routes the link list, the installer and the certificate through the frozen paths', () => {
     const text = source()
     expect(text).toContain("t('pcGenerateLink')")
     expect(text).toContain('/api/mobile-access/pc/info')
     expect(text).toContain('`/api/mobile-access/${channel}/link`')
-    expect(text).toContain('`/api/mobile-access/${channel}/status`')
+    expect(text).toContain('`/api/mobile-access/${channel}/links`')
+    expect(text).toContain('`/api/mobile-access/${channel}/link/revoke`')
     expect(text).toContain('`${pcPackagePath}?channel=${encodeURIComponent(channel)}`')
     expect(text).toContain("anchor.download = 'dsh-mobile-pc.zip'")
     expect(text).toContain("pcTab.setAttribute('aria-pressed', String(view === 'pc'))")
@@ -1528,15 +1531,23 @@ describe('PC 端 tab data', () => {
     // channel origin, and the PC tab no longer opens a pairing window of its own.
     expect(text).not.toContain('#key=${encodeURIComponent(appKey)}')
     expect(text).not.toContain('/api/mobile-access/lan/pairing/open`')
+    // One link can no longer be replaced in place: the tab only lists and revokes.
+    expect(text).not.toContain('regenerate')
+    expect(text).not.toContain("t('pcRegenerateLink')")
+    expect(text).not.toContain("t('pcCopyLink')")
+    expect(text).not.toContain("t('pcLinkRegenerated')")
+    expect(text).not.toContain('`/api/mobile-access/${channel}/status`')
   })
 
   it('has the PC copy in all three locales', () => {
     const keys = [
       'pc', 'pcAccess', 'pcIntro', 'pcNoChannels', 'pcCopyUrl', 'pcCopyUrlAria', 'pcUrlCopied', 'pcEntryLinkLabel',
-      'pcGenerateLink', 'pcCopyLink', 'pcGeneratingLink', 'pcRegenerateLink', 'pcLinkReady', 'pcLinkDurable',
-      'pcLinkRegenerated', 'pcAppKeyLabel', 'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage', 'pcPreparingPackage',
-      'pcPackageReady', 'pcPackageFailed', 'pcChannelUnavailable', 'pcInfoFailed', 'pcDownloadCertificate',
-      'pcCertificateNote', 'pcStepOpen', 'pcStepInstall', 'pcStepLaunch',
+      'pcGenerateLink', 'pcLinkCreating', 'pcLinkLabelPlaceholder', 'pcLinkDefaultLabel', 'pcLinkReady',
+      'pcLinkDurable', 'pcLinkListEmpty', 'pcLinkCreatedMeta', 'pcLinkUsedMeta', 'pcLinkUnusedMeta',
+      'pcLinkDeviceCount', 'pcLinkRevoke', 'pcLinkRevokeConfirm', 'pcLinkRevoked', 'pcLinkRevokedDevices',
+      'pcLinksFailed', 'pcLinkLimit', 'pcAppKeyLabel', 'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage',
+      'pcPreparingPackage', 'pcPackageReady', 'pcPackageFailed', 'pcChannelUnavailable', 'pcInfoFailed',
+      'pcDownloadCertificate', 'pcCertificateNote', 'pcStepOpen', 'pcStepInstall', 'pcStepLaunch',
     ]
     for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
       for (const key of keys) {
@@ -1546,36 +1557,34 @@ describe('PC 端 tab data', () => {
       }
     }
     expect(MOBILE_CONTROL_MESSAGES.zh.pc).toBe('PC 端')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateLink).toBe('生成访问链接')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcCopyLink).toBe('复制访问链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateLink).toBe('生成新链接')
     expect(MOBILE_CONTROL_MESSAGES.zh.pcDownloadPackage).toBe('下载 PC 安装包')
   })
 
-  it('states the durable-link rule instead of a window in every locale', () => {
-    // The panel must agree with the server: the link does not expire and needs no
-    // code, and only an explicit regeneration replaces it.
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkDurable).toBe('链接长期有效，无需配对码；重新生成后旧链接立即失效。')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkReady).toBe('访问链接已复制。链接长期有效，朋友随时打开都能进入。')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkRegenerated).toBe('已生成新的访问链接并复制，旧链接已失效。')
+  it('states the per-link rule instead of a window in every locale', () => {
+    // The panel must agree with the server: each link stays valid, is reopened freely,
+    // and revoking one also removes the devices that entered through it.
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkDurable).toBe('每条链接长期有效、可重复打开，可以给每个人单独发一条；撤销某条链接后，用它进入的设备会一起移除。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkReady).toBe('访问链接已复制，可以随时发给需要远程访问的人。')
     expect(MOBILE_CONTROL_MESSAGES.zh.pcAppKeyLabel).toBe('配对码（备用，可粘贴到入口页）')
     expect(MOBILE_CONTROL_MESSAGES.zh.pcEntryLinkLabel).toBe('访问链接（直接打开，无需配对码）')
     const en = MOBILE_CONTROL_MESSAGES.en as Record<string, string>
     const it = MOBILE_CONTROL_MESSAGES.it as Record<string, string>
-    expect(en.pcLinkDurable).toMatch(/does not expire|stays valid/u)
-    expect(en.pcLinkDurable).toMatch(/no pairing code/u)
-    expect(en.pcLinkRegenerated).toMatch(/previous link no longer works/u)
-    expect(it.pcLinkDurable).toMatch(/non serve alcun codice/u)
-    expect(it.pcLinkRegenerated).toMatch(/non funziona più/u)
+    expect(en.pcLinkDurable).toMatch(/stays valid|reopened/u)
+    expect(en.pcLinkDurable).toMatch(/removes the devices/u)
+    expect(it.pcLinkDurable).toMatch(/resta valido|riaperto/u)
+    expect(it.pcLinkDurable).toMatch(/rimossi/u)
     // The labels must stay unambiguous about which value goes where.
     expect(en.pcAppKeyLabel).toMatch(/paste it into the entry page/u)
-    expect(en.pcEntryLinkLabel).toMatch(/open it directly/u)
+    expect(en.pcEntryLinkLabel).toMatch(/open one directly/u)
     expect(it.pcAppKeyLabel).toMatch(/incollalo nella pagina di ingresso/u)
-    expect(it.pcEntryLinkLabel).toMatch(/aprilo direttamente/u)
-    // No window is rendered on this tab, so no link message takes a placeholder, and
-    // none of them may promise the old five-minute single-use rule.
+    expect(it.pcEntryLinkLabel).toMatch(/aprine uno direttamente/u)
+    // No window is rendered on this tab, so no link message takes the old five-minute
+    // single-use rule, and the placeholder-free ones must not carry a placeholder.
     const placeholderFree = [
-      'pcGenerateLink', 'pcCopyLink', 'pcGeneratingLink', 'pcRegenerateLink', 'pcLinkReady',
-      'pcLinkDurable', 'pcLinkRegenerated', 'pcAppKeyLabel', 'pcEntryLinkLabel',
+      'pcGenerateLink', 'pcLinkCreating', 'pcLinkLabelPlaceholder', 'pcLinkDefaultLabel',
+      'pcLinkReady', 'pcLinkDurable', 'pcLinkListEmpty', 'pcLinkUnusedMeta', 'pcLinkRevoke',
+      'pcLinkRevokeConfirm', 'pcLinkRevoked', 'pcAppKeyLabel', 'pcEntryLinkLabel',
     ]
     for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
       const record = catalog as Record<string, string>
@@ -1588,16 +1597,76 @@ describe('PC 端 tab data', () => {
     }
   })
 
-  it('copies the link the gateway returned and regenerates only on request', () => {
+  it('renders one row per link and revokes only on the second click', () => {
+    const text = source()
+    expect(text).toContain("element('div', 'dsh-mobile-control__pc-links')")
+    expect(text).toContain("element('div', 'dsh-mobile-control__pc-link')")
+    expect(text).toContain('row.dataset.linkId = link.id')
+    expect(text).toContain("copy.dataset.action = 'copy'")
+    expect(text).toContain("revoke.dataset.action = 'revoke'")
+    expect(text).toContain("element('button', 'dsh-mobile-control__pc-revoke')")
+    // The confirm step is in-place and timed, so the same button carries both clicks.
+    expect(text).toContain("button.textContent = confirming ? t('pcLinkRevokeConfirm') : t('pcLinkRevoke')")
+    expect(text).toContain("button.classList.toggle('is-danger', confirming)")
+    expect(text).toContain("button.dataset.confirm = 'true'")
+    expect(text).toContain('}, PC_REVOKE_CONFIRM_MS)')
+    expect(text).toContain('const PC_REVOKE_CONFIRM_MS = 5_000')
+    expect(text).toContain('JSON.stringify({ linkId: link.id })')
+    // The count comes back from the gateway and is shown as-is.
+    expect(text).toContain("t('pcLinkRevokedDevices', { count: devicesRevoked })")
+    expect(text).toContain("t('pcLinkRevoked')")
+    expect(text).toContain("t('pcLinksFailed', { error: error instanceof Error ? error.message : String(error) })")
+    expect(text).toContain("t('pcLinkLimit', { max: PC_ENTRY_LINK_LIMIT })")
+    expect(text).toContain('pcLinksEmpty.hidden = !pcLinksLoaded || pcLinks.length > 0')
+    expect(text).toContain('pcPairResult.hidden = newest === undefined || newest.appKey === \'\'')
+  })
+
+  it('reduces the link list to the rows the tab may render', () => {
+    const id = 'a1b2c3d4e5f60718'
+    const other = '0011223344556677'
+    const links = pcClientLinks({
+      links: [
+        { id, label: '  Alice  ', createdAt: 1_700_000_000_000, deviceCount: 2, appKey: 'dsh2.abc.def', entryUrl: 'https://lan.test/mobile-access/pc' },
+        { id: other, createdAt: 1_700_000_100_000, lastUsedAt: 1_700_000_200_000, deviceCount: 1, appKey: 'dsh2.ghi.jkl', entryUrl: 'https://remote.test/mobile-access/pc' },
+        { id: 'not-an-id', label: 'dropped', createdAt: 1, deviceCount: 1, appKey: 'x', entryUrl: 'https://x.test/pc' },
+        { id, label: 'duplicate', createdAt: 2, deviceCount: 1, appKey: 'x', entryUrl: 'https://x.test/pc' },
+        { id: 'ffffffffffffffff', label: 'javascript:', createdAt: -5, deviceCount: -2, appKey: 'k', entryUrl: 'javascript:alert(1)' },
+        null,
+      ],
+    })
+    expect(links.map(link => link.id)).toEqual([id, other, 'ffffffffffffffff'])
+    expect(links[0]).toEqual({
+      id,
+      label: 'Alice',
+      createdAt: 1_700_000_000_000,
+      deviceCount: 2,
+      appKey: 'dsh2.abc.def',
+      entryUrl: 'https://lan.test/mobile-access/pc',
+    })
+    // An unusable timestamp, count or URL is dropped rather than rendered as a lie.
+    expect(links[2]).toEqual({ id: 'ffffffffffffffff', label: 'javascript:', createdAt: 0, deviceCount: 0, appKey: 'k', entryUrl: '' })
+    expect(links[1]?.lastUsedAt).toBe(1_700_000_200_000)
+    expect(links[0]?.lastUsedAt).toBeUndefined()
+    expect(pcClientLinks({})).toEqual([])
+    expect(pcClientLinks({ links: 'lan' })).toEqual([])
+    // The newest link owns the fallback pairing code, whatever order the rows arrive in.
+    expect(newestPcClientLink(links)?.id).toBe(other)
+    expect(newestPcClientLink([links[1]!, links[0]!])?.id).toBe(other)
+    expect(newestPcClientLink([])).toBeUndefined()
+  })
+
+  it('copies the link the gateway returned and always appends a new one', () => {
     const text = source()
     expect(text).toContain("const appKey = typeof data.appKey === 'string' ? data.appKey : ''")
-    expect(text).toContain("const entryUrl = typeof data.entryUrl === 'string' ? data.entryUrl : ''")
-    expect(text).toContain("await showPcLink(appKey, entryUrl, regenerate ? t('pcLinkRegenerated') : t('pcLinkReady'))")
-    expect(text).toContain('JSON.stringify(regenerate ? { regenerate: true } : {})')
-    expect(text).toContain("pcPair.textContent = pcLinkActive ? t('pcCopyLink') : t('pcGenerateLink')")
-    expect(text).toContain('pcRegenerate.hidden = !pcLinkActive')
-    expect(text).toContain("(entryLink as Record<string, unknown>).active === true")
-    expect(text).toContain("pcRegenerate.addEventListener('click', () => { requestPcLink(true) })")
+    expect(text).toContain("const entryUrl = pcAssetUrl(data.entryUrl)")
+    expect(text).toContain("await copyPcText(entryUrl, t('pcLinkReady'), t('pairingLink'))")
+    // The name field is optional: a blank one asks the gateway for its default label.
+    expect(text).toContain("const label = pcLinkLabelInput.value.trim()")
+    expect(text).toContain("body: JSON.stringify(label === '' ? {} : { label })")
+    expect(text).toContain("pcPair.addEventListener('click', () => { createPcLink() })")
+    // Creating never replaces an existing link, so the button never changes meaning.
+    expect(text).not.toContain('regenerate')
+    expect(text).not.toContain('pcLinkActive')
     // The five-minute framing and the local window request are gone from this tab.
     expect(text).not.toContain('pcKeyExpires')
     expect(text).not.toContain('pcPairExpiry')

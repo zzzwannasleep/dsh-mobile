@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { ENTRY_LINK_ID_PATTERN, deriveEntryLinkId } from './entry-link.js'
 import type { DeviceSnapshot, DeviceStore, StoredDevice } from './storage.js'
 
 /** Stable error categories converted to deliberately terse HTTP responses. */
@@ -22,10 +23,17 @@ export interface AccessControllerOptions {
   /**
    * Optional durable entry secret accepted by {@link AccessController.pair} in
    * place of a short pairing window. It is reusable, so a copied entry link keeps
-   * working until the owner regenerates it; only its digest is retained here.
+   * working until the owner revokes it; only its digest is retained here. Its
+   * identifier is derived from the secret, exactly like a migrated stored link.
    */
   readonly entrySecret?: string
   readonly now?: () => number
+}
+
+/** One durable entry link as the gateway knows it: an identifier and a bearer secret. */
+export interface EntryLinkCredential {
+  readonly id: string
+  readonly secret: string
 }
 
 /** Values issued once after pairing; only digests survive the response. */
@@ -36,6 +44,8 @@ export interface PairingResult {
   readonly sessionToken: string
   readonly csrfToken: string
   readonly sessionExpiresAt: number
+  /** The durable entry link this device came through, when it used one. */
+  readonly entryLinkId?: string
 }
 
 /** Values issued after renewal with the persistent HttpOnly device Cookie. */
@@ -69,6 +79,8 @@ export interface DeviceSummary {
   readonly createdAt: number
   readonly expiresAt: number
   readonly lastSeenAt: number
+  /** The entry link this device came through; absent for a one-time code. */
+  readonly entryLinkId?: string
   readonly revokedAt?: number
 }
 
@@ -195,6 +207,7 @@ function publicDevice(device: StoredDevice): DeviceSummary {
     createdAt: device.createdAt,
     expiresAt: device.expiresAt,
     lastSeenAt: device.lastSeenAt,
+    ...(device.entryLinkId === undefined ? {} : { entryLinkId: device.entryLinkId }),
     ...(device.revokedAt === undefined ? {} : { revokedAt: device.revokedAt }),
   })
 }
@@ -205,7 +218,8 @@ export class AccessController {
   private readonly pairLimiter: BoundedRateLimiter
   private devices: StoredDevice[] = []
   private pairingWindow: PairingWindow | undefined
-  private entryDigest: Buffer | undefined
+  /** Digest of every installed durable entry link, keyed by its public identifier. */
+  private readonly entryLinks = new Map<string, Buffer>()
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly sessionEndedListeners = new Set<(authorization: SessionAuthorization, reason: SessionEndReason) => void>()
   private mutation: Promise<void> = Promise.resolve()
@@ -215,7 +229,9 @@ export class AccessController {
 
   constructor(private readonly store: DeviceStore, private readonly options: AccessControllerOptions) {
     this.now = options.now ?? Date.now
-    this.entryDigest = options.entrySecret === undefined ? undefined : digest(options.entrySecret)
+    if (options.entrySecret !== undefined) {
+      this.setEntryLinks([{ id: deriveEntryLinkId(options.entrySecret), secret: options.entrySecret }])
+    }
     this.pairLimiter = new BoundedRateLimiter(
       options.maxPairingAttempts,
       options.rateLimitWindowMs,
@@ -313,35 +329,87 @@ export class AccessController {
   }
 
   /**
-   * Install or clear the durable entry secret without touching the device store.
+   * Install the durable entry links without touching the device store.
    *
-   * The gateway loads the persisted secret and calls this after construction, so
-   * a link the owner sent last month still pairs after a DSH restart.
+   * The gateway loads the persisted list and calls this after construction, so a
+   * link the owner sent last month still pairs after a DSH restart. Replacing the
+   * whole set is deliberate: the caller owns the persisted list, and a link that is
+   * no longer in it stops authorizing anything immediately.
    */
-  setEntrySecret(secret: string | undefined): void {
-    if (secret === undefined || secret === '') {
-      this.entryDigest = undefined
-      return
+  setEntryLinks(links: readonly EntryLinkCredential[]): void {
+    const next = new Map<string, Buffer>()
+    for (const link of links) {
+      if (!ENTRY_LINK_ID_PATTERN.test(link.id) || typeof link.secret !== 'string'
+        || link.secret === '' || link.secret.length > 512 || next.has(link.id)) {
+        throw new AccessError(400, 'invalid_request')
+      }
+      next.set(link.id, digest(link.secret))
     }
-    if (secret.length > 512) throw new AccessError(400, 'invalid_request')
-    this.entryDigest = digest(secret)
+    this.entryLinks.clear()
+    for (const [id, digestValue] of next) this.entryLinks.set(id, digestValue)
   }
 
-  /** Whether a durable entry link is installed; the secret itself never leaves the gateway. */
-  entryLinkStatus(): { readonly active: boolean } {
-    return Object.freeze({ active: this.entryDigest !== undefined })
+  /** Install or clear a single durable entry secret, for a caller that holds one. */
+  setEntrySecret(secret: string | undefined): void {
+    this.setEntryLinks(secret === undefined || secret === ''
+      ? []
+      : [{ id: deriveEntryLinkId(secret), secret }])
+  }
+
+  /** How many durable entry links are installed; the secrets never leave the gateway. */
+  entryLinkStatus(): { readonly active: boolean; readonly count: number } {
+    return Object.freeze({ active: this.entryLinks.size > 0, count: this.entryLinks.size })
   }
 
   /**
-   * Whether a presented token is the durable entry secret. Never consumes it.
+   * Which durable entry link a presented token is, if any. Never consumes it.
    *
-   * The pair route uses this to tell a reusable link from a one-time code: a
-   * reusable link may refresh an already-bound device, a code may not.
+   * The pair route uses this both to tell a reusable link from a one-time code - a
+   * reusable link may refresh an already-bound device, a code may not - and to record
+   * which link a new device came through.
    */
+  matchEntryLink(token: string): string | undefined {
+    if (this.entryLinks.size === 0 || token.length > 512) return undefined
+    return this.matchEntryLinkSecret(normalizePairingToken(token))
+  }
+
+  /** Whether a presented token is one of the durable entry secrets. */
   matchesEntrySecret(token: string): boolean {
-    if (this.entryDigest === undefined || token.length > 512) return false
-    const secret = normalizePairingToken(token)
-    return secret.length <= 512 && matchesDigest(secret, this.entryDigest)
+    return this.matchEntryLink(token) !== undefined
+  }
+
+  private matchEntryLinkSecret(secret: string): string | undefined {
+    if (secret.length > 512) return undefined
+    for (const [id, digestValue] of this.entryLinks) {
+      if (matchesDigest(secret, digestValue)) return id
+    }
+    return undefined
+  }
+
+  /**
+   * Remove one link and every device that entered through it.
+   *
+   * Revoking an invitation must cut off the people who accepted it, so the devices
+   * bound to this link are deleted and their Sessions end with reason `revoked`,
+   * exactly like a direct device revocation. Devices that paired with a one-time
+   * code, and devices from releases that stored no link, are untouched.
+   */
+  async revokeEntryLink(linkId: string): Promise<number> {
+    this.requireInitialized()
+    return this.exclusive(async () => {
+      this.entryLinks.delete(linkId)
+      const now = this.now()
+      const removed = this.devices.filter(device => device.entryLinkId === linkId)
+      if (removed.length === 0) return 0
+      const next = this.devices.filter(device => device.entryLinkId !== linkId)
+      await this.store.save(this.snapshot(next))
+      this.devices = next
+      const removedIds = new Set(removed.map(device => device.id))
+      for (const [key, session] of this.sessions) {
+        if (removedIds.has(session.deviceId)) this.removeSession(key, 'revoked')
+      }
+      return removed.filter(device => device.expiresAt > now).length
+    })
   }
 
   /** Consume the pairing window exactly once and persist only the device-token digest. */
@@ -355,11 +423,11 @@ export class AccessController {
     return this.exclusive(async () => {
       const window = this.pairingWindow
       const windowMatches = window !== undefined && window.expiresAt > now && matchesDigest(secret, window.digest)
-      // The durable entry link is a reusable bearer secret, so pairing through it
-      // never consumes anything: the owner's copied link keeps working until it is
-      // regenerated. The short window keeps its one-time semantics.
-      const entryMatches = this.entryDigest !== undefined && matchesDigest(secret, this.entryDigest)
-      if (!windowMatches && !entryMatches) {
+      // A durable entry link is a reusable bearer secret, so pairing through it never
+      // consumes anything: a copied link keeps working until the owner revokes it. The
+      // short window keeps its one-time semantics.
+      const entryLinkId = this.matchEntryLinkSecret(secret)
+      if (!windowMatches && entryLinkId === undefined) {
         if (window !== undefined && window.expiresAt <= now) this.pairingWindow = undefined
         throw new AccessError(401, 'authentication_failed')
       }
@@ -375,6 +443,7 @@ export class AccessController {
         createdAt: now,
         expiresAt: now + this.options.deviceTtlMs,
         lastSeenAt: now,
+        ...(entryLinkId === undefined ? {} : { entryLinkId }),
       })
       const retained = this.devices.filter(candidate => candidate.revokedAt === undefined && candidate.expiresAt > now)
       const next = [...retained, device]
@@ -385,6 +454,7 @@ export class AccessController {
         ...session,
         deviceToken,
         deviceExpiresAt: device.expiresAt,
+        ...(entryLinkId === undefined ? {} : { entryLinkId }),
       })
     })
   }
@@ -450,6 +520,20 @@ export class AccessController {
     return Object.freeze({ deviceId: device.id, deviceExpiresAt: device.expiresAt })
   }
 
+  /**
+   * Refuse a device whose entry link is gone.
+   *
+   * A revoked link removes its devices outright, so this only fires when the state
+   * files disagree: the link file was lost, replaced or edited, or the two files were
+   * written by different releases. Failing closed keeps an invitation the owner
+   * believes is withdrawn from staying alive for the device lifetime.
+   */
+  private assertEntryLinkActive(device: StoredDevice): void {
+    if (device.entryLinkId !== undefined && !this.entryLinks.has(device.entryLinkId)) {
+      throw new AccessError(401, 'device_revoked')
+    }
+  }
+
   private requireDevice(deviceToken: string, now: number): StoredDevice {
     if (deviceToken.length > 512) throw new AccessError(401, 'authentication_failed')
     const tokenDigest = digest(deviceToken)
@@ -457,6 +541,7 @@ export class AccessController {
     if (device === undefined) throw new AccessError(401, 'authentication_failed')
     if (device.revokedAt !== undefined) throw new AccessError(401, 'device_revoked')
     if (device.expiresAt <= now) throw new AccessError(401, 'device_expired')
+    this.assertEntryLinkActive(device)
     return device
   }
 
@@ -466,6 +551,7 @@ export class AccessController {
     if (device === undefined) throw new AccessError(401, 'authentication_failed')
     if (device.revokedAt !== undefined) throw new AccessError(401, 'device_revoked')
     if (device.expiresAt <= now) throw new AccessError(401, 'device_expired')
+    this.assertEntryLinkActive(device)
     return device
   }
 
@@ -478,7 +564,8 @@ export class AccessController {
     const key = digestHex(sessionToken)
     const session = this.sessions.get(key)
     const device = session === undefined ? undefined : this.devices.find(candidate => candidate.id === session.deviceId)
-    if (session === undefined || device === undefined || device.revokedAt !== undefined || device.expiresAt <= now) {
+    if (session === undefined || device === undefined || device.revokedAt !== undefined || device.expiresAt <= now
+      || (device.entryLinkId !== undefined && !this.entryLinks.has(device.entryLinkId))) {
       if (session !== undefined) this.removeSession(session.key, 'expired')
       throw new AccessError(401, 'authentication_failed')
     }

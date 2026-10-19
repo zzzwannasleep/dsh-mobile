@@ -33,7 +33,15 @@ import {
 } from './access.js'
 import type { ResolvedGatewayConfig } from './config.js'
 import { ClientModulePreferenceStore, parseExcludedClientModules, type ClientModuleEntry, type ClientModulePreferenceView } from './client-module-preferences.js'
-import { JsonEntryLinkStore, createEntryLinkSecret } from './entry-link.js'
+import {
+  ENTRY_LINK_ID_PATTERN,
+  JsonEntryLinkStore,
+  MAX_ENTRY_LINKS,
+  createEntryLinkId,
+  createEntryLinkSecret,
+  normalizeEntryLinkLabel,
+  type EntryLinkRecord,
+} from './entry-link.js'
 import { cleanFrontendExclusions } from './client-module-clean.js'
 import { renderClientModuleRecoveryPage } from './client-module-recovery.js'
 import { ensureMobileCompatibility, MOBILE_COMPAT_PATH } from './mobile-compat-bootstrap.js'
@@ -1252,9 +1260,11 @@ export class MobileAccessGateway {
   private readonly clientModuleOperations = new Set<AbortController>()
   private readonly clientModuleTasks = new Set<Promise<ClientModulePreferenceView>>()
   private readonly clientModuleRevocations = new Set<Promise<void>>()
-  /** Durable PC entry link; the raw secret is only ever returned to the loopback admin. */
+  /** Durable PC entry links; the raw secrets are only ever returned to the loopback admin. */
   private readonly entryLinkStore: JsonEntryLinkStore
-  private entryLinkSecret: string | undefined
+  private entryLinks: readonly EntryLinkRecord[] = []
+  /** Serializes every link-file write so a lastUsedAt touch cannot drop a just-created link. */
+  private entryLinkWrite: Promise<void> = Promise.resolve()
 
   constructor(
     readonly config: ResolvedGatewayConfig,
@@ -1326,16 +1336,14 @@ export class MobileAccessGateway {
     if (this.started || this.server !== undefined) throw new Error('mobile-access gateway cannot be started twice')
     this.started = true
     await this.access.initialize()
-    // Install the durable entry link before the listener accepts traffic. A file
+    // Install the durable entry links before the listener accepts traffic. A file
     // that cannot be read must not take mobile access down with it: warn, keep
     // serving, and let the panel offer a fresh link.
     try {
-      this.entryLinkSecret = await this.entryLinkStore.load()
-      this.access.setEntrySecret(this.entryLinkSecret)
+      this.applyEntryLinks((await this.entryLinkStore.load()).links)
     } catch {
-      this.entryLinkSecret = undefined
-      this.access.setEntrySecret(undefined)
-      process.emitWarning('DSH Mobile: the stored PC entry link could not be read; generate a new link.', { code: 'DSH_MOBILE_ENTRY_LINK_INVALID' })
+      this.applyEntryLinks([])
+      process.emitWarning('DSH Mobile: the stored PC entry links could not be read; create a new link.', { code: 'DSH_MOBILE_ENTRY_LINK_INVALID' })
     }
     try {
       await this.clientModulePreferences.initialize()
@@ -1682,7 +1690,8 @@ export class MobileAccessGateway {
     // through it must not register a fresh device every time. When the request already
     // carries a device this browser owns, refresh that device's session instead. A
     // one-time code keeps its original semantics, and a stale binding falls through.
-    if (this.access.matchesEntrySecret(body.token)
+    const reusedLinkId = this.access.matchEntryLink(body.token)
+    if (reusedLinkId !== undefined
       && this.renewLimiter.take(request.socket.remoteAddress ?? 'unknown', Date.now())) {
       const cookies = browserAuthCookies(request.headers.cookie)
       const bindings = this.tlsEnabled ? cookies.get(HOST_DEVICE_COOKIE) : undefined
@@ -1715,6 +1724,9 @@ export class MobileAccessGateway {
         }
       }
       if (reused !== undefined) {
+        // The link worked again: remember when, without letting that write decide
+        // whether the browser gets its session.
+        await this.touchEntryLink(reusedLinkId)
         this.setSessionCookies(response, reused, Date.now())
         if (reusedExpiry !== undefined) this.setBrowserDeviceBinding(response, reused.deviceId, reusedExpiry)
         sendJson(response, 200, {
@@ -1728,6 +1740,8 @@ export class MobileAccessGateway {
       }
     }
     const result = await this.access.pair(request.socket.remoteAddress ?? 'unknown', body.token, body.label as string | undefined)
+    // Only a durable link carries an id; a one-time code leaves nothing to record.
+    await this.touchEntryLink(result.entryLinkId)
     const now = Date.now()
     this.setSessionCookies(response, result, now)
     const sessionCookies = response.getHeader('Set-Cookie') as string[]
@@ -3428,6 +3442,80 @@ export class MobileAccessGateway {
     }
   }
 
+  /** Install one link list on the access controller and remember it for the admin routes. */
+  private applyEntryLinks(links: readonly EntryLinkRecord[]): void {
+    this.entryLinks = Object.freeze([...links])
+    this.access.setEntryLinks(this.entryLinks.map(link => ({ id: link.id, secret: link.secret })))
+  }
+
+  /**
+   * Run one link-store mutation after every earlier one.
+   *
+   * The admin routes and the `lastUsedAt` touch all rewrite the whole file, so two
+   * writes that interleave would lose a record: appending a link while a touch saves
+   * the list it read a moment earlier would drop the new link. The chain keeps each
+   * write ordered, and a failed task never blocks the next one.
+   */
+  private serializeEntryLinkWrite<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.entryLinkWrite.then(task, task)
+    this.entryLinkWrite = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /** `dsh1`/`dsh2` is what tells an old client whether our private CA is pinned. */
+  private entryLinkAppKey(secret: string): string {
+    const requiresRemoteCa = this.config.pairingCaFile !== undefined && !this.config.discovery
+    return `dsh${requiresRemoteCa ? '2' : '1'}.${this.config.instanceId}.${secret}`
+  }
+
+  /**
+   * The owner-facing view of one link, served only on the loopback admin route.
+   *
+   * `deviceCount` counts the live devices that entered through this link, so the
+   * panel can say how much revoking one would cut off.
+   */
+  private entryLinkView(link: EntryLinkRecord): Record<string, unknown> {
+    const now = Date.now()
+    const appKey = this.entryLinkAppKey(link.secret)
+    return {
+      id: link.id,
+      label: link.label,
+      createdAt: link.createdAt,
+      ...(link.lastUsedAt === undefined ? {} : { lastUsedAt: link.lastUsedAt }),
+      deviceCount: this.access.listDevices().filter(device => device.entryLinkId === link.id
+        && device.revokedAt === undefined && device.expiresAt > now).length,
+      appKey,
+      entryUrl: `${this.address().origin}${PC_ENTRY_PATH}#key=${appKey}`,
+    }
+  }
+
+  /**
+   * Record that a durable link was just used.
+   *
+   * The device has already paired, so a failed write must never fail the request: the
+   * error becomes a warning and the response is unaffected. The write is awaited so the
+   * panel's next list read already shows the touch, and it goes through the shared write
+   * chain so it cannot drop a link the owner created in the same moment. A link revoked
+   * while the pair was in flight is simply left alone.
+   */
+  private async touchEntryLink(linkId: string | undefined): Promise<void> {
+    if (linkId === undefined) return
+    const lastUsedAt = Date.now()
+    try {
+      await this.serializeEntryLinkWrite(async () => {
+        const index = this.entryLinks.findIndex(link => link.id === linkId)
+        const current = index === -1 ? undefined : this.entryLinks[index]
+        if (current === undefined) return
+        const links = [...this.entryLinks]
+        links[index] = Object.freeze({ ...current, lastUsedAt })
+        await this.entryLinkStore.save({ version: 2, links })
+        this.applyEntryLinks(links)
+      })
+    } catch {
+      process.emitWarning('DSH Mobile: the entry link last-used time could not be saved.', { code: 'DSH_MOBILE_ENTRY_LINK_TOUCH_FAILED' })
+    }
+  }
+
   /** Loopback-only DSH WebServer route for opening pairing and managing devices. */
   localAdminRoute(
     prefix: string = LOCAL_ADMIN_PREFIX,
@@ -3500,29 +3588,69 @@ export class MobileAccessGateway {
             }, false)
             return
           }
+          if (request.method === 'GET' && target.decodedPathname === `${prefix}/links`) {
+            sendJson(response, 200, { links: this.entryLinks.map(link => this.entryLinkView(link)) }, false)
+            return
+          }
           if (request.method === 'POST' && target.decodedPathname === `${prefix}/link`) {
             const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
-            if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') throw new HttpError(400, 'bad_request')
-            const created = body.regenerate === true || this.entryLinkSecret === undefined
-            if (created) {
-              const secret = createEntryLinkSecret()
-              await this.entryLinkStore.save(secret)
-              this.entryLinkSecret = secret
-              this.access.setEntrySecret(secret)
+            const rawLabel = body.label
+            if (rawLabel !== undefined && typeof rawLabel !== 'string') throw new HttpError(400, 'bad_request')
+            let label: string
+            try {
+              // An absent or blank field means "no name given" and takes the default.
+              label = normalizeEntryLinkLabel(rawLabel)
+            } catch {
+              throw new HttpError(400, 'bad_request')
             }
-            // A durable link is reusable, so the app key is the secret itself; the
-            // dsh1/dsh2 prefix only tells an old client whether our CA is pinned.
-            const requiresRemoteCa = this.config.pairingCaFile !== undefined && !this.config.discovery
-            const appKey = `dsh${requiresRemoteCa ? '2' : '1'}.${this.config.instanceId}.${this.entryLinkSecret as string}`
-            const entryUrl = `${this.address().origin}${PC_ENTRY_PATH}#key=${appKey}`
-            sendJson(response, created ? 201 : 200, { appKey, entryUrl, created }, false)
+            // Every call appends one link; there is no "regenerate the only link" mode
+            // any more, so a friend's copy keeps working while the owner adds another.
+            const link = await this.serializeEntryLinkWrite(async () => {
+              if (this.entryLinks.length >= MAX_ENTRY_LINKS) throw new HttpError(409, 'entry_link_limit')
+              const created: EntryLinkRecord = Object.freeze({
+                id: createEntryLinkId(),
+                label,
+                secret: createEntryLinkSecret(),
+                createdAt: Date.now(),
+              })
+              const links = Object.freeze([...this.entryLinks, created])
+              await this.entryLinkStore.save({ version: 2, links })
+              this.applyEntryLinks(links)
+              return created
+            })
+            const view = this.entryLinkView(link)
+            sendJson(response, 201, { created: true, appKey: view.appKey, entryUrl: view.entryUrl, link: view }, false)
             return
           }
           if (request.method === 'POST' && target.decodedPathname === `${prefix}/link/revoke`) {
-            await this.entryLinkStore.clear()
-            this.entryLinkSecret = undefined
-            this.access.setEntrySecret(undefined)
-            sendJson(response, 200, { revoked: true }, false)
+            const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+            if (body.all === true) {
+              const result = await this.serializeEntryLinkWrite(async () => {
+                const revokedLinks = this.entryLinks.length
+                const ids = this.entryLinks.map(link => link.id)
+                await this.entryLinkStore.clear()
+                this.applyEntryLinks([])
+                let devicesRevoked = 0
+                for (const id of ids) devicesRevoked += await this.access.revokeEntryLink(id)
+                return { devicesRevoked, revokedLinks }
+              })
+              sendJson(response, 200, { revoked: true, ...result }, false)
+              return
+            }
+            if (typeof body.linkId !== 'string' || !ENTRY_LINK_ID_PATTERN.test(body.linkId)) {
+              throw new HttpError(400, 'bad_request')
+            }
+            const linkId = body.linkId
+            const devicesRevoked = await this.serializeEntryLinkWrite(async () => {
+              const links = this.entryLinks.filter(link => link.id !== linkId)
+              if (links.length === this.entryLinks.length) throw new HttpError(404, 'not_found')
+              // Persist first, so a failed write leaves a link that still works instead
+              // of one that only the running process has forgotten.
+              await this.entryLinkStore.save({ version: 2, links })
+              this.applyEntryLinks(links)
+              return this.access.revokeEntryLink(linkId)
+            })
+            sendJson(response, 200, { revoked: true, devicesRevoked }, false)
             return
           }
           if (request.method === 'POST' && target.decodedPathname === `${prefix}/devices/revoke`) {

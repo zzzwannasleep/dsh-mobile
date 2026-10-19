@@ -630,6 +630,78 @@ export function pcClientInfo(data: Readonly<Record<string, unknown>>): PcClientI
   }
 }
 
+export interface PcClientLink {
+  readonly id: string
+  /** Empty when the gateway reported no usable label; the tab then shows its own default. */
+  readonly label: string
+  /** Zero when the gateway reported no usable timestamp. */
+  readonly createdAt: number
+  readonly lastUsedAt?: number
+  readonly deviceCount: number
+  readonly appKey: string
+  readonly entryUrl: string
+}
+
+/**
+ * Mirrors `ENTRY_LINK_ID_PATTERN` in `src/entry-link.ts`. That module is server-only
+ * (it reads node:crypto), so the browser bundle cannot import the constant.
+ */
+const PC_ENTRY_LINK_ID_PATTERN = /^[a-f\d]{16}$/u
+/** Mirrors `MAX_ENTRY_LINKS` in `src/entry-link.ts`, for the limit message only. */
+const PC_ENTRY_LINK_LIMIT = 16
+/** How long a revoke button stays armed before it falls back to its normal label. */
+const PC_REVOKE_CONFIRM_MS = 5_000
+/** The gateway caps a label at 64 characters; the tab only needs a display bound. */
+const PC_ENTRY_LINK_LABEL_MAX = 64
+const PC_ENTRY_LINK_SECRET_MAX = 512
+
+function pcLinkText(value: unknown, maximum: number): string {
+  if (typeof value !== 'string') return ''
+  const text = value.replace(/[\u0000-\u001f\u007f]/gu, '').trim()
+  return text.length > maximum ? text.slice(0, maximum) : text
+}
+
+function pcLinkTime(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0
+}
+
+/**
+ * Reduce the loopback link list to the rows the tab may render. A row without a
+ * usable id is dropped, because revoke addresses a link by that id alone.
+ */
+export function pcClientLinks(data: Readonly<Record<string, unknown>>): readonly PcClientLink[] {
+  const links: PcClientLink[] = []
+  const seen = new Set<string>()
+  if (!Array.isArray(data.links)) return links
+  for (const value of data.links) {
+    if (typeof value !== 'object' || value === null) continue
+    const entry = value as { id?: unknown; label?: unknown; createdAt?: unknown; lastUsedAt?: unknown; deviceCount?: unknown; appKey?: unknown; entryUrl?: unknown }
+    if (typeof entry.id !== 'string' || !PC_ENTRY_LINK_ID_PATTERN.test(entry.id) || seen.has(entry.id)) continue
+    seen.add(entry.id)
+    const entryUrl = pcAssetUrl(entry.entryUrl)
+    const lastUsedAt = pcLinkTime(entry.lastUsedAt)
+    links.push({
+      id: entry.id,
+      label: pcLinkText(entry.label, PC_ENTRY_LINK_LABEL_MAX),
+      createdAt: pcLinkTime(entry.createdAt),
+      ...(lastUsedAt === 0 ? {} : { lastUsedAt }),
+      deviceCount: typeof entry.deviceCount === 'number' && Number.isSafeInteger(entry.deviceCount) && entry.deviceCount > 0 ? entry.deviceCount : 0,
+      appKey: pcLinkText(entry.appKey, PC_ENTRY_LINK_SECRET_MAX),
+      entryUrl: entryUrl !== undefined && !entryUrl.startsWith('/') ? entryUrl : '',
+    })
+  }
+  return links
+}
+
+/** The newest link owns the fallback pairing code the tab shows. */
+export function newestPcClientLink(links: readonly PcClientLink[]): PcClientLink | undefined {
+  let newest: PcClientLink | undefined
+  for (const link of links) {
+    if (newest === undefined || link.createdAt >= newest.createdAt) newest = link
+  }
+  return newest
+}
+
 async function requestJson(
   path: string,
   init?: RequestInit,
@@ -1209,18 +1281,20 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const pcPair = element('button', 'dsh-mobile-control__primary'); pcPair.type = 'button'; pcPair.textContent = t('pcGenerateLink'); pcPair.disabled = true
   const pcPackage = element('button', 'dsh-mobile-control__secondary'); pcPackage.type = 'button'; pcPackage.textContent = t('pcDownloadPackage'); pcPackage.disabled = true
   pcActions.append(pcPair, pcPackage)
+  // A name is optional: the empty field asks the gateway for its default label, so
+  // the owner can hand out several links without naming each one first.
+  const pcLinkLabelInput = element('input', 'dsh-mobile-control__pc-link-input')
+  pcLinkLabelInput.type = 'text'
+  pcLinkLabelInput.maxLength = PC_ENTRY_LINK_LABEL_MAX
+  pcLinkLabelInput.placeholder = t('pcLinkLabelPlaceholder')
+  pcLinkLabelInput.setAttribute('aria-label', t('pcLinkLabelPlaceholder'))
   // The link is a standing invitation, not a five-minute window, so the note states
   // the rule instead of counting down to an expiry.
   const pcDurableNote = element('p', 'dsh-mobile-control__component-note'); pcDurableNote.textContent = t('pcLinkDurable')
+  const pcLinksHeading = element('h3', 'dsh-mobile-control__section-title'); pcLinksHeading.textContent = t('pcEntryLinkLabel')
+  const pcLinkList = element('div', 'dsh-mobile-control__pc-links')
+  const pcLinksEmpty = element('p', 'dsh-mobile-control__component-note'); pcLinksEmpty.textContent = t('pcLinkListEmpty'); pcLinksEmpty.hidden = true
   const pcPairResult = element('div', 'dsh-mobile-control__pc-pair'); pcPairResult.hidden = true
-  const pcPairLinkRow = element('div', 'dsh-mobile-control__pc-pair-row')
-  const pcPairLinkLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairLinkLabel.textContent = t('pcEntryLinkLabel')
-  const pcPairLinkValueRow = element('div', 'dsh-mobile-control__pc-pair-value-row')
-  const pcPairLinkValue = element('code', 'dsh-mobile-control__pc-pair-value')
-  const pcPairLinkCopy = element('button', 'dsh-mobile-control__pc-copy'); pcPairLinkCopy.type = 'button'; pcPairLinkCopy.textContent = t('pcCopyUrl')
-  pcPairLinkCopy.addEventListener('click', () => { void copyPcText(pcPairLinkValue.textContent ?? '', t('pcLinkReady'), t('pairingLink')) })
-  pcPairLinkValueRow.append(pcPairLinkValue, pcPairLinkCopy)
-  pcPairLinkRow.append(pcPairLinkLabel, pcPairLinkValueRow)
   const pcPairKeyRow = element('div', 'dsh-mobile-control__pc-pair-row')
   const pcPairKeyLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairKeyLabel.textContent = t('pcAppKeyLabel')
   const pcPairKeyValueRow = element('div', 'dsh-mobile-control__pc-pair-value-row')
@@ -1229,9 +1303,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   pcPairKeyCopy.addEventListener('click', () => { void copyPcText(pcPairKeyValue.textContent ?? '', t('pcKeyCopied'), t('pairingKey')) })
   pcPairKeyValueRow.append(pcPairKeyValue, pcPairKeyCopy)
   pcPairKeyRow.append(pcPairKeyLabel, pcPairKeyValueRow)
-  const pcRegenerate = element('button', 'dsh-mobile-control__secondary'); pcRegenerate.type = 'button'; pcRegenerate.textContent = t('pcRegenerateLink'); pcRegenerate.hidden = true
-  pcRegenerate.addEventListener('click', () => { requestPcLink(true) })
-  pcPairResult.append(pcPairLinkRow, pcPairKeyRow, pcRegenerate)
+  pcPairResult.append(pcPairKeyRow)
   const pcCertificate = element('p', 'dsh-mobile-control__component-note dsh-mobile-control__pc-certificate'); pcCertificate.hidden = true
   const pcCertificateNote = element('span'); pcCertificateNote.textContent = `${t('pcCertificateNote')} `
   const pcCertificateLink = element('a', 'dsh-mobile-control__text-link'); pcCertificateLink.textContent = t('pcDownloadCertificate'); pcCertificateLink.setAttribute('download', 'dsh-mobile-ca.cer'); pcCertificateLink.rel = 'noopener'
@@ -1241,24 +1313,23 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     const step = element('li'); step.textContent = t(stepKey); pcSteps.append(step)
   }
   const pcStatus = element('p', 'dsh-mobile-control__status'); pcStatus.setAttribute('role', 'status'); pcStatus.setAttribute('aria-live', 'polite')
-  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcActions, pcDurableNote, pcPairResult, pcCertificate, pcSteps, pcStatus)
+  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcLinkLabelInput, pcActions, pcDurableNote, pcLinksHeading, pcLinkList, pcLinksEmpty, pcPairResult, pcCertificate, pcSteps, pcStatus)
   let pcChannels: readonly PcClientChannel[] = []
   let pcActiveChannel: 'lan' | 'remote' | '' = ''
   let pcPackagePath = PC_PACKAGE_PATH_FALLBACK
   let pcBusy = false
   let pcPackageBusy = false
-  /** Whether the selected channel already holds a durable entry link. */
-  let pcLinkActive = false
+  let pcLinks: readonly PcClientLink[] = []
+  /** Whether the current channel has answered a link request yet. */
+  let pcLinksLoaded = false
   const pcChannelName = (channel: 'lan' | 'remote'): string => channel === 'lan' ? t('lan') : t('remote')
   const syncPcControls = (): void => {
     const available = pcActiveChannel !== ''
     pcPair.disabled = !available || pcBusy
     pcPackage.disabled = !available || pcPackageBusy
-    pcPair.textContent = pcLinkActive ? t('pcCopyLink') : t('pcGenerateLink')
+    pcLinkLabelInput.disabled = !available || pcBusy
     pcPair.setAttribute('aria-busy', String(pcBusy))
     pcPackage.setAttribute('aria-busy', String(pcPackageBusy))
-    pcRegenerate.disabled = !available || pcBusy
-    pcRegenerate.hidden = !pcLinkActive
   }
   /** Copy one PC value, or show it for manual copying when the clipboard is denied. */
   const copyPcText = async (value: string, copied: string, kind: string): Promise<void> => {
@@ -1286,7 +1357,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
         pcActiveChannel = entry.channel
         renderPcChannels()
         syncPcControls()
-        refreshPcLinkState(entry.channel)
+        loadPcLinks(entry.channel)
       })
       const copy = element('button', 'dsh-mobile-control__pc-copy'); copy.type = 'button'; copy.textContent = t('pcCopyUrl')
       copy.setAttribute('aria-label', t('pcCopyUrlAria', { channel: pcChannelName(entry.channel) }))
@@ -1306,7 +1377,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     if (info.certificateUrl !== undefined) pcCertificateLink.href = info.certificateUrl
     renderPcChannels()
     syncPcControls()
-    if (pcActiveChannel !== '') refreshPcLinkState(pcActiveChannel)
+    if (pcActiveChannel !== '') loadPcLinks(pcActiveChannel)
   }
   const loadPcInfo = (): void => {
     pcStatus.classList.remove('is-key')
@@ -1315,46 +1386,154 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       pcStatus.textContent = t('pcInfoFailed', { error: String(error) })
     })
   }
-  /** Ask the selected channel whether it already holds a durable entry link. */
-  const refreshPcLinkState = (channel: 'lan' | 'remote'): void => {
-    void controlRequestJson(`/api/mobile-access/${channel}/status`).then(data => {
-      if (pcActiveChannel !== channel) return
-      const entryLink = data.entryLink
-      pcLinkActive = typeof entryLink === 'object' && entryLink !== null
-        && (entryLink as Record<string, unknown>).active === true
-      syncPcControls()
-    }, () => {
-      // A channel that is not running cannot report its link; keep the current label.
-      if (pcActiveChannel !== channel) return
-      syncPcControls()
-    })
+  // Revoking is destructive and irreversible, so the first click only arms the row:
+  // the owner gets five seconds to change their mind, and a second click on the same
+  // row is what actually revokes the link.
+  let pcPendingRevoke: { readonly id: string; readonly button: HTMLButtonElement; readonly timer: number } | undefined
+  const setPcRevokeConfirm = (button: HTMLButtonElement, confirming: boolean): void => {
+    button.textContent = confirming ? t('pcLinkRevokeConfirm') : t('pcLinkRevoke')
+    button.classList.toggle('is-danger', confirming)
+    if (confirming) button.dataset.confirm = 'true'
+    else delete button.dataset.confirm
   }
-  /** Show one entry link and put it on the clipboard, so no code has to be typed. */
-  const showPcLink = async (appKey: string, entryUrl: string, copied: string): Promise<void> => {
-    pcPairLinkValue.textContent = entryUrl
-    pcPairKeyValue.textContent = appKey
-    pcPairResult.hidden = false
-    await copyPcText(entryUrl, copied, t('pairingLink'))
+  const resetPcRevokeConfirm = (): void => {
+    const pending = pcPendingRevoke
+    pcPendingRevoke = undefined
+    if (pending === undefined) return
+    window.clearTimeout(pending.timer)
+    setPcRevokeConfirm(pending.button, false)
   }
-  const requestPcLink = (regenerate: boolean): void => {
+  const armPcRevoke = (link: PcClientLink, button: HTMLButtonElement): void => {
+    if (pcPendingRevoke?.id === link.id) {
+      resetPcRevokeConfirm()
+      revokePcLink(link)
+      return
+    }
+    resetPcRevokeConfirm()
+    setPcRevokeConfirm(button, true)
+    const timer = window.setTimeout(() => {
+      if (pcPendingRevoke?.button === button) resetPcRevokeConfirm()
+    }, PC_REVOKE_CONFIRM_MS)
+    pcPendingRevoke = { id: link.id, button, timer }
+  }
+  const revokePcLink = (link: PcClientLink): void => {
     if (pcBusy || pcActiveChannel === '') return
     const channel = pcActiveChannel
     pcBusy = true
     syncPcControls()
     pcStatus.classList.remove('is-key')
-    pcStatus.textContent = t('pcGeneratingLink')
-    // The durable link is issued and stored by the channel's gateway, so every panel
-    // asks for the same link and only an explicit regeneration replaces it.
+    pcStatus.textContent = t('loadingStatus')
+    void controlRequestJson(`/api/mobile-access/${channel}/link/revoke`, {
+      method: 'POST',
+      body: JSON.stringify({ linkId: link.id }),
+    }).then(data => {
+      // The gateway reports how many devices the revocation cut off, and the owner is
+      // told the same number, because those devices disappear from the device list too.
+      const devicesRevoked = typeof data.devicesRevoked === 'number' && Number.isSafeInteger(data.devicesRevoked) && data.devicesRevoked > 0
+        ? data.devicesRevoked
+        : 0
+      pcStatus.classList.remove('is-key')
+      pcStatus.textContent = devicesRevoked > 0 ? t('pcLinkRevokedDevices', { count: devicesRevoked }) : t('pcLinkRevoked')
+      loadPcLinks(channel)
+    }, error => {
+      const message = error instanceof Error ? error.message : String(error)
+      pcStatus.textContent = message === 'entry_link_limit'
+        ? t('pcLinkLimit', { max: PC_ENTRY_LINK_LIMIT })
+        : t('requestFailed', { error: message })
+    }).finally(() => {
+      pcBusy = false
+      syncPcControls()
+    })
+  }
+  /** Render one row per link, so every person can be handed their own revocable link. */
+  const renderPcLinks = (): void => {
+    resetPcRevokeConfirm()
+    pcLinkList.replaceChildren()
+    for (const link of pcLinks) {
+      const row = element('div', 'dsh-mobile-control__pc-link')
+      row.dataset.linkId = link.id
+      const head = element('div', 'dsh-mobile-control__pc-link-head')
+      const label = element('span', 'dsh-mobile-control__pc-link-label')
+      label.textContent = link.label === '' ? t('pcLinkDefaultLabel') : link.label
+      const copy = element('button', 'dsh-mobile-control__pc-copy')
+      copy.type = 'button'
+      copy.dataset.action = 'copy'
+      copy.textContent = t('pcCopyUrl')
+      copy.setAttribute('aria-label', t('pcCopyUrlAria', { channel: link.label === '' ? t('pcLinkDefaultLabel') : link.label }))
+      copy.disabled = link.entryUrl === ''
+      copy.addEventListener('click', () => { void copyPcText(link.entryUrl, t('pcUrlCopied'), t('pairingLink')) })
+      const revoke = element('button', 'dsh-mobile-control__pc-revoke')
+      revoke.type = 'button'
+      revoke.dataset.action = 'revoke'
+      revoke.textContent = t('pcLinkRevoke')
+      revoke.addEventListener('click', () => { armPcRevoke(link, revoke) })
+      head.append(label, copy, revoke)
+      const url = element('code', 'dsh-mobile-control__pc-link-url'); url.textContent = link.entryUrl
+      const meta = element('div', 'dsh-mobile-control__pc-link-meta')
+      if (link.createdAt > 0) {
+        const created = element('span'); created.textContent = t('pcLinkCreatedMeta', { time: formatTime(link.createdAt) })
+        meta.append(created)
+      }
+      const used = element('span')
+      used.textContent = link.lastUsedAt === undefined ? t('pcLinkUnusedMeta') : t('pcLinkUsedMeta', { time: formatTime(link.lastUsedAt) })
+      const devices = element('span'); devices.textContent = t('pcLinkDeviceCount', { count: link.deviceCount })
+      meta.append(used, devices)
+      row.append(head, url, meta)
+      pcLinkList.append(row)
+    }
+    pcLinkList.hidden = pcLinks.length === 0
+    // The empty note is a statement about the server, so it waits for an answer: an
+    // unanswered request must not read as "you have no links".
+    pcLinksEmpty.hidden = !pcLinksLoaded || pcLinks.length > 0
+    // The fallback pairing code belongs to the newest link, because that is the one a
+    // friend who cannot open the link would be typing in.
+    const newest = newestPcClientLink(pcLinks)
+    pcPairResult.hidden = newest === undefined || newest.appKey === ''
+    pcPairKeyValue.textContent = newest?.appKey ?? ''
+  }
+  /** Read the selected channel's links; the list is the only place a link is revoked from. */
+  const loadPcLinks = (channel: 'lan' | 'remote'): void => {
+    pcLinks = []
+    pcLinksLoaded = false
+    renderPcLinks()
+    void controlRequestJson(`/api/mobile-access/${channel}/links`).then(data => {
+      if (pcActiveChannel !== channel) return
+      pcLinks = pcClientLinks(data)
+      pcLinksLoaded = true
+      renderPcLinks()
+    }, error => {
+      if (pcActiveChannel !== channel) return
+      pcStatus.classList.remove('is-key')
+      pcStatus.textContent = t('pcLinksFailed', { error: error instanceof Error ? error.message : String(error) })
+    })
+  }
+  /** Append one link and put it on the clipboard, so no code has to be typed. */
+  const createPcLink = (): void => {
+    if (pcBusy || pcActiveChannel === '') return
+    const channel = pcActiveChannel
+    const label = pcLinkLabelInput.value.trim()
+    pcBusy = true
+    syncPcControls()
+    pcStatus.classList.remove('is-key')
+    pcStatus.textContent = t('pcLinkCreating')
+    // A named link is the point of the list: the label is what tells the owner which
+    // friend holds it, and the gateway fills in its own default when none is given.
     void controlRequestJson(`/api/mobile-access/${channel}/link`, {
       method: 'POST',
-      body: JSON.stringify(regenerate ? { regenerate: true } : {}),
+      body: JSON.stringify(label === '' ? {} : { label }),
     }).then(async data => {
       const appKey = typeof data.appKey === 'string' ? data.appKey : ''
-      const entryUrl = typeof data.entryUrl === 'string' ? data.entryUrl : ''
-      if (appKey === '' || entryUrl === '') { pcStatus.textContent = t('keyGenerationFailed'); return }
-      pcLinkActive = true
-      await showPcLink(appKey, entryUrl, regenerate ? t('pcLinkRegenerated') : t('pcLinkReady'))
-    }, error => { pcStatus.textContent = t('requestFailed', { error: String(error) }) }).finally(() => {
+      const entryUrl = pcAssetUrl(data.entryUrl)
+      if (appKey === '' || entryUrl === undefined || entryUrl.startsWith('/')) { pcStatus.textContent = t('keyGenerationFailed'); return }
+      pcLinkLabelInput.value = ''
+      await copyPcText(entryUrl, t('pcLinkReady'), t('pairingLink'))
+      loadPcLinks(channel)
+    }, error => {
+      const message = error instanceof Error ? error.message : String(error)
+      pcStatus.textContent = message === 'entry_link_limit'
+        ? t('pcLinkLimit', { max: PC_ENTRY_LINK_LIMIT })
+        : t('requestFailed', { error: message })
+    }).finally(() => {
       pcBusy = false
       syncPcControls()
     })
@@ -1386,7 +1565,13 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       syncPcControls()
     })
   }
-  pcPair.addEventListener('click', () => { requestPcLink(false) })
+  pcPair.addEventListener('click', () => { createPcLink() })
+  // Typing a name and pressing Enter is the same action as pressing the button.
+  pcLinkLabelInput.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    createPcLink()
+  })
   pcPackage.addEventListener('click', downloadPcPackage)
   syncPcControls()
   header.append(title, headerActions); actions.append(toggle, pair, linkPair)
@@ -3645,7 +3830,7 @@ export const CONTROL_STYLES = `
 
 .dsh-mobile-control__origin-warning{margin:12px 0;padding:10px 12px;border-left:3px solid var(--dsw-alias-state-warn-primary,#a56810);border-radius:4px;background:var(--dsw-alias-bg-layer-1,#f3f5f8);color:var(--dsw-alias-label-primary,#384152);font-size:12px;line-height:1.6}
 /* PC 端 tab: one selectable entry per available channel, each with its own copy action. */
-.dsh-mobile-control__pc-channels{display:grid;gap:8px;margin:0 0 12px}.dsh-mobile-control__pc-channels[hidden],.dsh-mobile-control__pc-certificate[hidden],.dsh-mobile-control__pc-pair[hidden]{display:none}
+.dsh-mobile-control__pc-channels{display:grid;gap:8px;margin:0 0 12px}.dsh-mobile-control__pc-channels[hidden],.dsh-mobile-control__pc-certificate[hidden],.dsh-mobile-control__pc-pair[hidden],.dsh-mobile-control__pc-links[hidden]{display:none}
 .dsh-mobile-control__pc-channel{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:8px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#fff)}
 .dsh-mobile-control__pc-channel.is-active{border-color:var(--dsw-alias-label-primary-bluish,#2563eb);box-shadow:0 0 0 1px var(--dsw-alias-label-primary-bluish,#2563eb) inset}
 .dsh-mobile-control__pc-channel-choice{display:flex;min-width:0;flex-direction:column;gap:3px;align-items:flex-start;min-height:44px;padding:6px 8px;border:0;border-radius:9px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
@@ -3654,6 +3839,18 @@ export const CONTROL_STYLES = `
 .dsh-mobile-control__pc-channel-url{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,#606873);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .dsh-mobile-control__pc-copy{box-sizing:border-box;min-width:44px;min-height:44px;padding:0 10px;border:1px solid var(--dsw-alias-border-l3,#cfd5dd);border-radius:10px;background:transparent;color:inherit;font:600 12px/1.2 system-ui;cursor:pointer}
 .dsh-mobile-control__pc-copy:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
+.dsh-mobile-control__pc-copy:disabled{cursor:not-allowed;opacity:.5}
+.dsh-mobile-control__pc-link-input{box-sizing:border-box;width:100%;min-height:44px;margin:0 0 10px;padding:9px 10px;border:1px solid var(--dsw-alias-border-l3,#cfd5dd);border-radius:10px;background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-primary,#16181d);font:14px/1.4 system-ui}
+.dsh-mobile-control__pc-link-input:disabled{cursor:not-allowed;opacity:.55}
+.dsh-mobile-control__pc-links{display:grid;gap:8px;margin:0 0 12px}
+.dsh-mobile-control__pc-link{display:grid;gap:6px;padding:10px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#fff)}
+.dsh-mobile-control__pc-link-head{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:6px}
+.dsh-mobile-control__pc-link-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary,#16181d);font:650 12px/1.3 system-ui}
+.dsh-mobile-control__pc-link-url{overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,#606873);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.dsh-mobile-control__pc-link-meta{display:flex;flex-wrap:wrap;gap:2px 10px;color:var(--dsw-alias-label-secondary,#606873);font-size:11px;line-height:1.5}
+.dsh-mobile-control__pc-revoke{box-sizing:border-box;min-width:44px;min-height:44px;padding:0 10px;border:1px solid var(--dsw-alias-border-l3,#cfd5dd);border-radius:10px;background:transparent;color:inherit;font:600 12px/1.2 system-ui;cursor:pointer}
+.dsh-mobile-control__pc-revoke:hover{background:var(--dsw-alias-interactive-bg-hover,#f1f3f6)}
+.dsh-mobile-control__pc-revoke.is-danger{border-color:var(--dsw-alias-state-error-primary,#dc2626);color:var(--dsw-alias-state-error-primary,#dc2626)}
 .dsh-mobile-control__pc-pair{display:grid;gap:7px;margin:0 0 12px;padding:10px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#f8fafc)}
 .dsh-mobile-control__pc-pair-row{display:grid;gap:2px;min-width:0}
 .dsh-mobile-control__pc-pair-value-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px}

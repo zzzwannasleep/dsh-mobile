@@ -207,17 +207,46 @@ async function openPairing(adminPort) {
   return payload
 }
 
-/** Create (or regenerate) the durable entry link through the panel's loopback route. */
-async function createLink(adminPort, body = '{}') {
+/** Append one durable entry link through the panel's loopback route. */
+async function createLink(adminPort, label) {
   const response = await adminRequest(adminPort, `${ADMIN}/lan/link`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body,
+    body: JSON.stringify(label === undefined ? {} : { label }),
   })
   assert.equal(response.status, 201, `link create returned ${String(response.status)}: ${response.body}`)
   const payload = JSON.parse(response.body)
   assert.equal(payload.created, true)
+  assert.equal(typeof payload.link.id, 'string')
   return payload
+}
+
+/** Every durable link the local channel holds, in insertion order. */
+async function listLinks(adminPort) {
+  const response = await adminRequest(adminPort, `${ADMIN}/lan/links`)
+  assert.equal(response.status, 200, `link list: ${response.body}`)
+  return JSON.parse(response.body).links
+}
+
+/** Revoke one link, or every link with `{ all: true }`, and return the payload. */
+async function revokeLink(adminPort, body, expectedStatus = 200) {
+  const response = await adminRequest(adminPort, `${ADMIN}/lan/link/revoke`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  assert.equal(response.status, expectedStatus, `link revoke returned ${String(response.status)}: ${response.body}`)
+  return JSON.parse(response.body)
+}
+
+/** One link once the best-effort last-used write has landed, as the panel would see it. */
+async function waitForLink(adminPort, linkId, predicate, attempts = 40) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const link = (await listLinks(adminPort)).find(candidate => candidate.id === linkId)
+    if (link !== undefined && predicate(link)) return link
+    await new Promise(resolveWait => setTimeout(resolveWait, 50))
+  }
+  throw new Error(`link ${linkId} never satisfied the expectation`)
 }
 
 /** The local channel's status document, which is where the panel reads the link. */
@@ -651,10 +680,15 @@ try {
   assert.equal(windowCloser.status, 201, `closing the pairing window: ${windowCloser.body}`)
   assert.equal(gateway.access.pairingStatus().open, false, 'the durable scenarios run with no pairing window open')
 
-  const durableLink = await createLink(adminPort)
+  const durableLink = await createLink(adminPort, 'PC smoke durable link')
   assert.equal(durableLink.entryUrl, `${origin}${PC_ENTRY}#key=${durableLink.appKey}`)
   assert.match(durableLink.appKey, /^dsh1\.[a-f\d]{64}\.[A-Za-z0-9_-]{43}$/u)
-  assert.deepEqual((await channelStatus(adminPort)).entryLink, { active: true })
+  assert.equal(durableLink.link.label, 'PC smoke durable link')
+  assert.equal(durableLink.link.deviceCount, 0)
+  assert.deepEqual((await listLinks(adminPort)).map(link => link.id), [durableLink.link.id], 'the list holds the new link')
+  assert.deepEqual((await channelStatus(adminPort)).entryLink, { active: true, count: 1 })
+  assert.equal((await adminRequest(adminPort, `${ADMIN}/lan/links`)).body.includes(durableLink.appKey), true,
+    'the loopback list route is where the owner reads the app key')
   assert.equal((await adminRequest(adminPort, `${ADMIN}/pc/info`)).body.includes(durableLink.appKey), false,
     'pc/info never carries the link secret')
 
@@ -749,6 +783,60 @@ try {
     cases++
   } finally {
     await durableContext.close()
+  }
+
+  // ---------------------------- 3d. several links, each revoked on its own ----
+  // The owner keeps one link per person. A create call appends, the list reports
+  // every link with its own key, and revoking one leaves the other pairing.
+  {
+    const pairWithKey = async token => {
+      const body = JSON.stringify({ token, label: 'PC smoke link list' })
+      return await httpsRequest(port, `${AUTH}/auth/pair`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+        },
+        body,
+      })
+    }
+
+    const friendLink = await createLink(adminPort, 'PC smoke friend link')
+    assert.notEqual(friendLink.appKey, durableLink.appKey, 'a second call mints a second secret')
+    assert.notEqual(friendLink.link.id, durableLink.link.id, 'a second call mints a second id')
+    const twoLinks = await listLinks(adminPort)
+    assert.deepEqual(twoLinks.map(link => link.id), [durableLink.link.id, friendLink.link.id], 'links keep insertion order')
+    assert.equal(new Set(twoLinks.map(link => link.appKey)).size, 2, 'each link carries its own key')
+    assert.deepEqual((await channelStatus(adminPort)).entryLink, { active: true, count: 2 })
+
+    const friendPair = await pairWithKey(friendLink.appKey)
+    assert.equal(friendPair.status, 201, `the second link pairs: ${friendPair.body}`)
+    const usedLink = await waitForLink(adminPort, friendLink.link.id, link => link.lastUsedAt !== undefined)
+    assert.equal(usedLink.deviceCount, 1, 'the link that was used reports its device')
+    assert.ok(usedLink.lastUsedAt >= usedLink.createdAt, 'the used link records when it was last opened')
+
+    const revokedFriend = await revokeLink(adminPort, { linkId: friendLink.link.id })
+    assert.deepEqual(revokedFriend, { revoked: true, devicesRevoked: 1 }, 'revoking a link removes the device it carried')
+    assert.equal((await pairWithKey(friendLink.appKey)).status, 401, 'a revoked link never pairs again')
+    assert.equal((await pairWithKey(durableLink.appKey)).status, 201, 'the other link still pairs')
+    assert.deepEqual((await listLinks(adminPort)).map(link => link.id), [durableLink.link.id], 'only the revoked link leaves the list')
+    assert.deepEqual((await channelStatus(adminPort)).entryLink, { active: true, count: 1 })
+    assert.equal((await revokeLink(adminPort, { linkId: 'a'.repeat(16) }, 404)).error, 'not_found', 'an unknown id is a 404')
+    assert.equal((await adminRequest(adminPort, `${ADMIN}/lan/link/revoke`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ linkId: 'nope' }),
+    })).status, 400, 'a malformed id is a bad request')
+
+    const revokedAll = await revokeLink(adminPort, { all: true })
+    assert.equal(revokedAll.revoked, true)
+    assert.equal(revokedAll.revokedLinks, 1)
+    assert.ok(revokedAll.devicesRevoked >= 1, `revoking everything removes the devices it carried (${String(revokedAll.devicesRevoked)})`)
+    assert.deepEqual(await listLinks(adminPort), [])
+    assert.deepEqual((await channelStatus(adminPort)).entryLink, { active: false, count: 0 })
+    assert.equal((await pairWithKey(durableLink.appKey)).status, 401, 'no link pairs once the list is cleared')
+    console.log(`entry links: created 2, revoked 1 then all; devices removed ${String(revokedAll.devicesRevoked)}`)
+    cases++
   }
 
   // The PWA install path. Chromium refuses a service worker script fetched over a

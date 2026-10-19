@@ -11,6 +11,12 @@ export interface StoredDevice {
   readonly createdAt: number
   readonly expiresAt: number
   readonly lastSeenAt: number
+  /**
+   * The durable entry link this device paired through, if any. A device that used a
+   * one-time code has none, and revoking a link therefore never cuts off the phone
+   * flow. Devices paired before the link list existed also have none.
+   */
+  readonly entryLinkId?: string
   /** Legacy tombstone accepted on load; AccessController removes it during initialization. */
   readonly revokedAt?: number
 }
@@ -47,6 +53,10 @@ function parseDevice(value: unknown): StoredDevice {
   assertInteger(record.expiresAt, 'expiresAt')
   assertInteger(record.lastSeenAt, 'lastSeenAt')
   if (record.revokedAt !== undefined) assertInteger(record.revokedAt, 'revokedAt')
+  if (record.entryLinkId !== undefined
+    && (typeof record.entryLinkId !== 'string' || !/^[a-f\d]{16}$/u.test(record.entryLinkId))) {
+    throw new Error('device state contains an invalid entry link id')
+  }
   if (record.expiresAt <= record.createdAt || record.lastSeenAt < record.createdAt) {
     throw new Error('device state contains inconsistent timestamps')
   }
@@ -57,6 +67,7 @@ function parseDevice(value: unknown): StoredDevice {
     createdAt: record.createdAt,
     expiresAt: record.expiresAt,
     lastSeenAt: record.lastSeenAt,
+    ...(record.entryLinkId === undefined ? {} : { entryLinkId: record.entryLinkId }),
     ...(record.revokedAt === undefined ? {} : { revokedAt: record.revokedAt }),
   })
 }

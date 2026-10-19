@@ -235,9 +235,9 @@ describe('desktop PC entry page', () => {
 
   it('presents the durable link as the normal path and retires the two-minute framing', () => {
     const durable = {
-      zh: ['不需要输入任何配对码', '这条链接一直有效，直到主人在 DSH 里重新生成它'],
-      en: ['with no pairing code to type', 'The link keeps working until the owner regenerates it in DSH'],
-      it: ['senza digitare alcun codice di abbinamento', 'Il link resta valido finché il proprietario non lo rigenera in DSH'],
+      zh: ['不需要输入任何配对码', '这条链接一直有效，直到主人在 DSH 里撤销它'],
+      en: ['with no pairing code to type', 'The link keeps working until the owner revokes it in DSH'],
+      it: ['senza digitare alcun codice di abbinamento', 'Il link resta valido finché il proprietario non lo revoca in DSH'],
     } as const
 
     for (const locale of LOCALES) {
@@ -246,6 +246,10 @@ describe('desktop PC entry page', () => {
       expect(page).not.toContain('两分钟')
       expect(page).not.toContain('two minutes')
       expect(page).not.toContain('due minuti')
+      // Regenerating is retired everywhere: one link is now revoked, not replaced.
+      expect(page).not.toContain('重新生成它')
+      expect(page).not.toContain('regenerates it')
+      expect(page).not.toContain('lo rigenera')
     }
   })
 

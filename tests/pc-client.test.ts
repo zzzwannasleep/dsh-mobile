@@ -33,6 +33,7 @@ import { extractPairingToken } from '../src/auth-pages.js'
 import { HOST_DEVICE_COOKIE } from '../src/browser-auth-cookies.js'
 import { diagnosticControllerAction, MOBILE_CONTROL_MESSAGES } from '../src/client.js'
 import { Config, parseGatewayConfig, type PluginConfig } from '../src/config.js'
+import { MAX_ENTRY_LINKS } from '../src/entry-link.js'
 import { MobileAccessService } from '../src/extensions.js'
 import { MobileAccessGateway, type PcClientChannel, type PcClientSource } from '../src/gateway.js'
 import { assertLocalAdminTrust, LOCAL_ADMIN_PREFIX, DEVICE_COOKIE, SESSION_COOKIE } from '../src/http-security.js'
@@ -1057,47 +1058,142 @@ describe('PC client routes', () => {
   })
 })
 
-describe('durable PC entry link (task-13 + task-16)', () => {
+describe('durable PC entry links (task-13 + task-16 + task-23)', () => {
+  const LINKS_PATH = `${LOCAL_ADMIN_PREFIX}/lan/links`
   const LINK_PATH = `${LOCAL_ADMIN_PREFIX}/lan/link`
   const LINK_REVOKE_PATH = `${LOCAL_ADMIN_PREFIX}/lan/link/revoke`
   const LAN_STATUS_PATH = `${LOCAL_ADMIN_PREFIX}/lan/status`
   const LAN_DEVICES_PATH = `${LOCAL_ADMIN_PREFIX}/lan/devices`
 
-  it('issues one durable link, keeps it on repeat, regenerates and revokes it', async () => {
+  /** One row of the owner's link list, as `GET /links` returns it. */
+  interface LinkView {
+    readonly id: string
+    readonly label: string
+    readonly createdAt: number
+    readonly lastUsedAt?: number
+    readonly deviceCount: number
+    readonly appKey: string
+    readonly entryUrl: string
+  }
+
+  interface LinkCreated {
+    readonly created: boolean
+    readonly appKey: string
+    readonly entryUrl: string
+    readonly link: LinkView
+  }
+
+  const listLinks = async (fixture: { readonly adminPort: number }): Promise<readonly LinkView[]> =>
+    (JSON.parse((await adminGet(fixture, LINKS_PATH)).body) as { links: LinkView[] }).links
+
+  const createLink = async (fixture: { readonly adminPort: number }, body = '{}'): Promise<LinkCreated> => {
+    const response = await adminPost(fixture, LINK_PATH, body)
+    expect(response.status, response.body).toBe(201)
+    return JSON.parse(response.body) as LinkCreated
+  }
+
+  /**
+   * The list once the best-effort last-used write has landed.
+   *
+   * `handlePair` records the touch without delaying the pair response, so the panel
+   * sees it a moment later; polling is what the panel's own refresh does.
+   */
+  const waitForLinks = async (
+    fixture: { readonly adminPort: number },
+    predicate: (links: readonly LinkView[]) => boolean,
+  ): Promise<readonly LinkView[]> => {
+    let links: readonly LinkView[] = []
+    await vi.waitFor(async () => {
+      links = await listLinks(fixture)
+      expect(predicate(links)).toBe(true)
+    })
+    return links
+  }
+
+  it('appends one link per call and revokes one without touching the other', async () => {
     const fixture = await createFixture()
-    const first = await adminPost(fixture, LINK_PATH)
-    expect(first.status, first.body).toBe(201)
-    const created = JSON.parse(first.body) as { appKey: string; entryUrl: string; created: boolean }
-    expect(created.created).toBe(true)
+    expect(await listLinks(fixture)).toStrictEqual([])
+
+    const owner = await createLink(fixture, JSON.stringify({ label: 'Owner laptop' }))
+    expect(owner.created).toBe(true)
     // The app key is the durable secret itself, in the same shape as a pairing token.
-    expect(created.appKey).toMatch(/^dsh1\.[a-f\d]{64}\.[A-Za-z0-9_-]{43}$/u)
-    expect(created.entryUrl).toBe(`${fixture.origin}${PC_ENTRY_PATH}#key=${created.appKey}`)
+    expect(owner.appKey).toMatch(/^dsh1\.[a-f\d]{64}\.[A-Za-z0-9_-]{43}$/u)
+    expect(owner.entryUrl).toBe(`${fixture.origin}${PC_ENTRY_PATH}#key=${owner.appKey}`)
+    expect(owner.link.id).toMatch(/^[a-f\d]{16}$/u)
+    expect(owner.link).toMatchObject({ label: 'Owner laptop', deviceCount: 0, appKey: owner.appKey, entryUrl: owner.entryUrl })
+    expect(typeof owner.link.createdAt).toBe('number')
+    expect(owner.link).not.toHaveProperty('lastUsedAt')
 
-    // A second open is the same link, not a new one: 200 instead of 201.
-    const repeat = await adminPost(fixture, LINK_PATH)
-    expect(repeat.status, repeat.body).toBe(200)
-    expect(JSON.parse(repeat.body)).toStrictEqual({ appKey: created.appKey, entryUrl: created.entryUrl, created: false })
-    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true })
+    // A second call appends rather than replacing: two links, two secrets.
+    const friend = await createLink(fixture, JSON.stringify({ label: 'Friend' }))
+    expect(friend.link.id).not.toBe(owner.link.id)
+    expect(appKeySecret(friend.appKey)).not.toBe(appKeySecret(owner.appKey))
+    const listed = await listLinks(fixture)
+    expect(listed.map(link => link.id)).toStrictEqual([owner.link.id, friend.link.id])
+    expect(listed.map(link => link.label)).toStrictEqual(['Owner laptop', 'Friend'])
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true, count: 2 })
 
-    const regenerated = await adminPost(fixture, LINK_PATH, JSON.stringify({ regenerate: true }))
-    expect(regenerated.status, regenerated.body).toBe(201)
-    const next = JSON.parse(regenerated.body) as { appKey: string; entryUrl: string; created: boolean }
-    expect(next.created).toBe(true)
-    expect(appKeySecret(next.appKey)).not.toBe(appKeySecret(created.appKey))
-    expect((await pairBrowser(fixture, created.appKey)).status).toBe(401)
-    expect((await pairBrowser(fixture, next.appKey)).status).toBe(201)
+    // Pairing through one link is recorded on that link only.
+    expect((await pairBrowser(fixture, friend.appKey)).status).toBe(201)
+    const touched = await waitForLinks(fixture, links => links.find(link => link.id === friend.link.id)?.lastUsedAt !== undefined)
+    expect(touched.find(link => link.id === friend.link.id)?.deviceCount).toBe(1)
+    expect(touched.find(link => link.id === owner.link.id)?.deviceCount).toBe(0)
 
-    const revoked = await adminPost(fixture, LINK_REVOKE_PATH)
+    // Revoking one link leaves the other working.
+    const revoked = await adminPost(fixture, LINK_REVOKE_PATH, JSON.stringify({ linkId: owner.link.id }))
     expect(revoked.status, revoked.body).toBe(200)
-    expect(JSON.parse(revoked.body)).toStrictEqual({ revoked: true })
-    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: false })
-    expect((await pairBrowser(fixture, next.appKey)).status).toBe(401)
-    // Revoking twice is not an error, and creating again mints a third secret.
-    expect((await adminPost(fixture, LINK_REVOKE_PATH)).status).toBe(200)
-    const recreated = await adminPost(fixture, LINK_PATH)
-    expect(recreated.status).toBe(201)
-    expect(appKeySecret((JSON.parse(recreated.body) as { appKey: string }).appKey))
-      .not.toBe(appKeySecret(next.appKey))
+    expect(JSON.parse(revoked.body)).toStrictEqual({ revoked: true, devicesRevoked: 0 })
+    expect((await pairBrowser(fixture, owner.appKey)).status).toBe(401)
+    expect((await pairBrowser(fixture, friend.appKey)).status).toBe(201)
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true, count: 1 })
+    expect((await listLinks(fixture)).map(link => link.id)).toStrictEqual([friend.link.id])
+
+    // Revoking the link that was used removes the devices that entered through it.
+    const last = await adminPost(fixture, LINK_REVOKE_PATH, JSON.stringify({ linkId: friend.link.id }))
+    expect(last.status, last.body).toBe(200)
+    expect(JSON.parse(last.body)).toStrictEqual({ revoked: true, devicesRevoked: 2 })
+    expect((await pairBrowser(fixture, friend.appKey)).status).toBe(401)
+    const drained = JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body) as { entryLink: unknown; deviceCount: number }
+    expect(drained.entryLink).toStrictEqual({ active: false, count: 0 })
+    expect(drained.deviceCount).toBe(0)
+  })
+
+  it('caps the list, validates the label and ignores the retired regenerate flag', async () => {
+    const fixture = await createFixture()
+    // A label that is not a string, and one the store refuses, are both bad requests.
+    expect((await adminPost(fixture, LINK_PATH, JSON.stringify({ label: 42 }))).status).toBe(400)
+    expect((await adminPost(fixture, LINK_PATH, JSON.stringify({ label: 'x'.repeat(65) }))).status).toBe(400)
+    expect((await adminPost(fixture, LINK_PATH, JSON.stringify({ label: 'bad\u0000label' }))).status).toBe(400)
+    // An absent or empty name takes the default.
+    expect((await createLink(fixture)).link.label).toBe('Access link')
+    expect((await createLink(fixture, JSON.stringify({ label: '' }))).link.label).toBe('Access link')
+    // `regenerate` is retired: it is not a replacement switch, it appends like any
+    // other call, so the previously issued link keeps working.
+    const before = await listLinks(fixture)
+    const appended = await createLink(fixture, JSON.stringify({ regenerate: true }))
+    expect(appended.link.id).not.toBe(before[0]?.id)
+    expect((await listLinks(fixture)).map(link => link.id)).toStrictEqual([...before.map(link => link.id), appended.link.id])
+
+    for (let index = before.length + 1; index < MAX_ENTRY_LINKS; index += 1) {
+      expect((await createLink(fixture, JSON.stringify({ label: `Link ${String(index)}` }))).link.label).toBe(`Link ${String(index)}`)
+    }
+    expect(await listLinks(fixture)).toHaveLength(MAX_ENTRY_LINKS)
+    const overflow = await adminPost(fixture, LINK_PATH)
+    expect(overflow.status, overflow.body).toBe(409)
+    expect(JSON.parse(overflow.body)).toStrictEqual({ error: 'entry_link_limit' })
+    expect(await listLinks(fixture)).toHaveLength(MAX_ENTRY_LINKS)
+
+    // One call can clear the whole list.
+    const all = await adminPost(fixture, LINK_REVOKE_PATH, JSON.stringify({ all: true }))
+    expect(all.status, all.body).toBe(200)
+    expect(JSON.parse(all.body)).toStrictEqual({ revoked: true, devicesRevoked: 0, revokedLinks: MAX_ENTRY_LINKS })
+    expect(await listLinks(fixture)).toStrictEqual([])
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: false, count: 0 })
+
+    // An unknown id was a valid request; a malformed one never was.
+    expect((await adminPost(fixture, LINK_REVOKE_PATH, JSON.stringify({ linkId: 'a'.repeat(16) }))).status).toBe(404)
+    expect((await adminPost(fixture, LINK_REVOKE_PATH, JSON.stringify({ linkId: 'nope' }))).status).toBe(400)
+    expect((await adminPost(fixture, LINK_REVOKE_PATH, '{}')).status).toBe(400)
   })
 
   it('reuses a bound device on a durable open and never consumes the link', async () => {
@@ -1201,12 +1297,12 @@ describe('durable PC entry link (task-13 + task-16)', () => {
     const channels = await createChannelFixture()
     const remoteStatus = (): Promise<Record<string, unknown>> =>
       adminGet(channels, `${LOCAL_ADMIN_PREFIX}/remote/status`).then(result => JSON.parse(result.body) as Record<string, unknown>)
-    expect(JSON.parse((await adminGet(channels, `${LOCAL_ADMIN_PREFIX}/remote/status`)).body).entryLink).toStrictEqual({ active: false })
+    expect(JSON.parse((await adminGet(channels, `${LOCAL_ADMIN_PREFIX}/remote/status`)).body).entryLink).toStrictEqual({ active: false, count: 0 })
 
     const lanLink = JSON.parse((await adminPost(channels, LINK_PATH)).body) as { appKey: string; entryUrl: string }
-    expect(JSON.parse((await adminGet(channels, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true })
+    expect(JSON.parse((await adminGet(channels, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true, count: 1 })
     // Each channel owns its own link file, so the other answer is untouched.
-    expect((await remoteStatus()).entryLink).toStrictEqual({ active: false })
+    expect((await remoteStatus()).entryLink).toStrictEqual({ active: false, count: 0 })
 
     // The deviation from the task text: pc/info is answered by whichever gateway is
     // active, so it cannot report the selected channel's link and must not pretend to.
@@ -1225,7 +1321,7 @@ describe('durable PC entry link (task-13 + task-16)', () => {
     expect(appKeySecret(remoteLink.appKey)).not.toBe(appKeySecret(lanLink.appKey))
     expect((await pairBrowser(channels.remote, remoteLink.appKey)).status).toBe(201)
     expect((await pairBrowser(channels.lan, remoteLink.appKey)).status).toBe(401)
-    expect(JSON.parse((await adminGet(channels, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true })
+    expect(JSON.parse((await adminGet(channels, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true, count: 1 })
   })
 
   it('keeps the durable secret on the loopback route and out of every other surface', async () => {
@@ -1249,8 +1345,13 @@ describe('durable PC entry link (task-13 + task-16)', () => {
         },
         body: '{}',
       })).body,
+      // The list route is loopback-only too, even as a plain GET.
+      (await request(fixture.port, LINKS_PATH, { headers: { host: new URL(fixture.origin).host } })).body,
     ]
-    for (const body of surfaces) expect(body).not.toContain(secret)
+    for (const body of surfaces) {
+      expect(body).not.toContain(secret)
+      expect(body).not.toContain('"links"')
+    }
     const zip = await downloadPackage(fixture, '?channel=lan')
     expect(zip.rawBody.includes(Buffer.from(secret)), 'the package carries no secret').toBe(false)
 
@@ -1555,7 +1656,7 @@ describe('SakuraFrp trusted entry (子域绑定 + 自动 HTTPS)', () => {
     expect(isSakuraFrpRegistration('login to server error: dial tcp failed')).toBe(false)
   })
 
-  it('offers a durable link, not a countdown, on the PC tab', () => {
+  it('offers durable, independently revocable links, not a countdown, on the PC tab', () => {
     for (const locale of ['zh', 'en', 'it'] as const) {
       const copy = MOBILE_CONTROL_MESSAGES[locale] as Record<string, string>
       const pcCopy = Object.entries(copy).filter(([key]) => key.startsWith('pc'))
@@ -1565,13 +1666,27 @@ describe('SakuraFrp trusted entry (子域绑定 + 自动 HTTPS)', () => {
         // No five-minute or expiry-countdown wording survives on this tab.
         expect(value, `${locale}.${key}`).not.toMatch(/5\s*(分钟|minutes?|minuti)|五分钟|five[-\s]minutes?/iu)
       }
-      expect(copy.pcRegenerateLink, locale).toBeTruthy()
-      expect(copy.pcLinkDurable, locale).toMatch(/长期有效|stays valid|does not expire|resta valido|non scade/iu)
-      expect(copy.pcLinkReady, locale).toMatch(/长期有效|stays valid|does not expire|non scade/iu)
+      // The list model: a create button, a per-link name and a two-step revoke.
+      expect(copy.pcGenerateLink, locale).toBeTruthy()
+      expect(copy.pcLinkLabelPlaceholder, locale).toBeTruthy()
+      expect(copy.pcLinkRevoke, locale).toBeTruthy()
+      expect(copy.pcLinkRevokeConfirm, locale).toBeTruthy()
+      expect(copy.pcLinkDurable, locale).toMatch(/长期有效|stays valid|resta valido/iu)
+      expect(copy.pcLinkDurable, locale).toMatch(/撤销|revok|revoc/iu)
+      expect(copy.pcLinkReady, locale).toMatch(/已复制|copied|copiato/iu)
     }
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcRegenerateLink).toBe('重新生成链接')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateLink).toBe('生成访问链接')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcCopyLink).toBe('复制访问链接')
+    // The frozen strings the docs quote, and the retired single-link copy.
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateLink).toBe('生成新链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkDefaultLabel).toBe('访问链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkRevoke).toBe('撤销')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkRevokeConfirm).toBe('确认撤销')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkLimit).toContain('{max}')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkRevokedDevices).toContain('{count}')
+    for (const retired of ['pcRegenerateLink', 'pcCopyLink', 'pcLinkRegenerated'] as const) {
+      for (const locale of ['zh', 'en', 'it'] as const) {
+        expect(MOBILE_CONTROL_MESSAGES[locale], `${locale}.${retired}`).not.toHaveProperty(retired)
+      }
+    }
     expect(MOBILE_CONTROL_MESSAGES.zh.sakuraEntryMode).toBe('公网入口证书')
     expect(MOBILE_CONTROL_MESSAGES.zh.sakuraEntryModeTls).toBe('插件自签证书（需在电脑上安装）')
     expect(MOBILE_CONTROL_MESSAGES.zh.sakuraEntryModeAutoHttps).toBe('SakuraFrp 自动 HTTPS（无需安装）')

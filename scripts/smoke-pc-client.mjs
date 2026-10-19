@@ -207,6 +207,26 @@ async function openPairing(adminPort) {
   return payload
 }
 
+/** Create (or regenerate) the durable entry link through the panel's loopback route. */
+async function createLink(adminPort, body = '{}') {
+  const response = await adminRequest(adminPort, `${ADMIN}/lan/link`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  })
+  assert.equal(response.status, 201, `link create returned ${String(response.status)}: ${response.body}`)
+  const payload = JSON.parse(response.body)
+  assert.equal(payload.created, true)
+  return payload
+}
+
+/** The local channel's status document, which is where the panel reads the link. */
+async function channelStatus(adminPort) {
+  const response = await adminRequest(adminPort, `${ADMIN}/lan/status`)
+  assert.equal(response.status, 200, `lan status: ${response.body}`)
+  return JSON.parse(response.body)
+}
+
 try {
   // ---------------------------------------------------------------- fixture --
   const graph = {
@@ -617,6 +637,89 @@ try {
   } finally {
     await limitedContext.close()
   }
+  // ------------------------------------- 3c. the durable PC entry link ---------
+  // The panel hands the owner a link that never expires. These scenarios drive it
+  // through a real browser with no pairing window open at all, and record the
+  // request cookies the gateway can actually see, because that decides whether the
+  // gateway's reuse branch is reachable from a browser.
+  const pending = await openPairing(adminPort)
+  const windowCloser = await httpsRequest(port, `${AUTH}/auth/pair`, {
+    method: 'POST',
+    headers: { origin, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: JSON.stringify({ token: pending.appKey, label: 'smoke window closer' }),
+  })
+  assert.equal(windowCloser.status, 201, `closing the pairing window: ${windowCloser.body}`)
+  assert.equal(gateway.access.pairingStatus().open, false, 'the durable scenarios run with no pairing window open')
+
+  const durableLink = await createLink(adminPort)
+  assert.equal(durableLink.entryUrl, `${origin}${PC_ENTRY}#key=${durableLink.appKey}`)
+  assert.match(durableLink.appKey, /^dsh1\.[a-f\d]{64}\.[A-Za-z0-9_-]{43}$/u)
+  assert.deepEqual((await channelStatus(adminPort)).entryLink, { active: true })
+  assert.equal((await adminRequest(adminPort, `${ADMIN}/pc/info`)).body.includes(durableLink.appKey), false,
+    'pc/info never carries the link secret')
+
+  const durableContext = await browser.newContext({ ignoreHTTPSErrors: true })
+  try {
+    const openDurable = async () => {
+      const page = await durableContext.newPage()
+      let pairStatus = 0
+      let pairCookieHeader = Promise.resolve('')
+      page.on('response', response => {
+        try { if (new URL(response.url()).pathname === `${AUTH}/auth/pair`) pairStatus = response.status() } catch { /* ignore */ }
+      })
+      page.on('request', request => {
+        try {
+          // `headers()` omits Cookie by design; only `allHeaders()` carries it.
+          if (new URL(request.url()).pathname === `${AUTH}/auth/pair`) pairCookieHeader = request.allHeaders().then(headers => headers.cookie ?? '')
+        } catch { /* ignore */ }
+      })
+      await page.goto(durableLink.entryUrl, { waitUntil: 'domcontentloaded' })
+      await page.locator('#pair-form').waitFor({ state: 'visible', timeout: 15_000 })
+      assert.equal(await page.evaluate(() => location.hash), '', 'the durable link clears its fragment before submitting')
+      await page.locator('#pair-form button[type="submit"]').click()
+      await page.waitForURL(url => url.pathname === '/', { timeout: 15_000 })
+      const pairCookies = await pairCookieHeader
+      const cookies = await durableContext.cookies()
+      await page.close()
+      return { pairStatus, pairCookies, cookies }
+    }
+
+    const before = (await channelStatus(adminPort)).deviceCount
+    const first = await openDurable()
+    const afterFirst = (await channelStatus(adminPort)).deviceCount
+    assert.equal(first.pairStatus, 201, 'the first durable open pairs a device')
+    assert.equal(afterFirst, before + 1, 'the first durable open registers exactly one device')
+    // Keep every device-scoped cookie; drop only the session pair, which is what a
+    // returning friend's browser looks like.
+    for (const cookie of first.cookies) {
+      if (!cookie.name.toLowerCase().includes('device')) await durableContext.clearCookies({ name: cookie.name })
+    }
+    const second = await openDurable()
+    const afterSecond = (await channelStatus(adminPort)).deviceCount
+    const sentNames = second.pairCookies.split('; ')
+      .map(pair => pair.split('=', 1)[0])
+      .filter(name => name !== undefined && name !== '')
+    const keptNames = second.cookies.map(cookie => cookie.name).sort()
+    console.log(`durable link: first open ${String(first.pairStatus)}, second open ${String(second.pairStatus)}; devices ${String(before)} → ${String(afterFirst)} → ${String(afterSecond)}`)
+    console.log(`durable link: cookies kept for the second open: ${keptNames.join(', ') || '(none)'}`)
+    console.log(`durable link: Cookie header on the second /auth/pair: ${sentNames.join(', ') || '(none)'}`)
+    // The browser cannot send the narrow pairing token cookie to /auth/pair, so the
+    // gateway's reuse branch is unreachable here and each open adds a device.
+    assert.equal(sentNames.includes('dsh_ma_device'), false,
+      'the browser never sends dsh_ma_device (Path=/mobile-access/auth/renew) to /auth/pair')
+    assert.ok(sentNames.includes('__Host-dsh_ma_device_id'), 'the TLS entry does send its device id binding')
+    // Observed browser behaviour, reported to the Lead as a contradiction of the
+    // intended reuse: the token cookie is path-scoped to /mobile-access/auth/renew,
+    // so the reuse branch never sees it. If the gateway is later changed to make
+    // reuse reachable, these two assertions must flip to 200/reused and an unchanged
+    // device count.
+    assert.equal(second.pairStatus, 201, 'the repeated durable open answers 201, not a reuse')
+    assert.equal(afterSecond, before + 2, 'a repeated durable open registers another device')
+    cases++
+  } finally {
+    await durableContext.close()
+  }
+
   // The PWA install path. Chromium refuses a service worker script fetched over a
   // certificate the browser has only been told to ignore, so the root scope is
   // measured on a trustworthy loopback origin, where the browser registers the very
@@ -626,7 +729,9 @@ try {
     listenPort: 0,
     upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`,
     allowedCidrs: ['127.0.0.0/8'],
-    stateFile: resolve(directory, `${randomUUID()}.json`),
+    // Its own state directory: the entry-link file lives beside the device file, and
+    // this gateway must not share the TLS fixture's link.
+    stateFile: resolve(directory, 'plain', `${randomUUID()}.json`),
     customCssFile,
     customScriptFile,
     desktopCssFile,
@@ -635,6 +740,29 @@ try {
   }), new MemoryDeviceStore(), new MobileAccessService(new Context()))
   await plainGateway.start()
   const plainOrigin = plainGateway.address().origin
+  const plainRoutes = [
+    { prefix: `${ADMIN}/lan`, handler: plainGateway.localAdminRoute(`${ADMIN}/lan`, () => true).handler },
+    { prefix: `${ADMIN}/pc`, handler: plainGateway.localAdminRoute(`${ADMIN}/pc`, () => true, pcClient).handler },
+    { prefix: ADMIN, handler: plainGateway.localAdminRoute(ADMIN, () => true).handler },
+  ]
+  const plainAdmin = createServer((request, response) => {
+    const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
+    const route = plainRoutes.find(candidate => pathname === candidate.prefix || pathname.startsWith(`${candidate.prefix}/`))
+    if (route === undefined) {
+      response.writeHead(404, { 'content-type': 'application/json' })
+      response.end('{"error":"not_found"}')
+      return
+    }
+    Promise.resolve(route.handler(request, response)).catch(() => {
+      if (!response.headersSent) response.writeHead(500, { 'content-type': 'application/json' })
+      response.end('{"error":"handler_failed"}')
+    })
+  })
+  await new Promise((resolveListen, reject) => {
+    plainAdmin.once('error', reject)
+    plainAdmin.listen(0, '127.0.0.1', resolveListen)
+  })
+  const plainAdminPort = plainAdmin.address().port
   const plainContext = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   let plainWorker = { scopes: [], reason: '' }
   try {
@@ -647,9 +775,53 @@ try {
       `service worker scope: ${plainWorker.scopes.join(', ') || '(none)'} · ${plainWorker.reason}`)
     assert.ok(desktopObservation.worker.supported, 'the TLS origin is also a secure context')
     cases++
+
+    // The plain-HTTP half of the durable link: a non-secure origin cannot set the
+    // `__Host-` binding, so a returning browser sends nothing the reuse branch needs.
+    const plainLink = await createLink(plainAdminPort)
+    const plainOpen = async () => {
+      const page = await plainContext.newPage()
+      let pairStatus = 0
+      let pairCookieHeader = Promise.resolve('')
+      page.on('response', response => {
+        try { if (new URL(response.url()).pathname === `${AUTH}/auth/pair`) pairStatus = response.status() } catch { /* ignore */ }
+      })
+      page.on('request', request => {
+        try {
+          if (new URL(request.url()).pathname === `${AUTH}/auth/pair`) pairCookieHeader = request.allHeaders().then(headers => headers.cookie ?? '')
+        } catch { /* ignore */ }
+      })
+      await page.goto(plainLink.entryUrl, { waitUntil: 'domcontentloaded' })
+      await page.locator('#pair-form').waitFor({ state: 'visible', timeout: 15_000 })
+      await page.locator('#pair-form button[type="submit"]').click()
+      await page.waitForURL(url => url.pathname === '/', { timeout: 15_000 })
+      const cookieHeader = await pairCookieHeader
+      const cookies = await plainContext.cookies()
+      await page.close()
+      return { pairStatus, cookieHeader, cookies }
+    }
+    const plainBefore = JSON.parse((await adminRequest(plainAdminPort, `${ADMIN}/lan/status`)).body).deviceCount
+    const plainFirst = await plainOpen()
+    const plainSecond = await plainOpen()
+    const plainAfter = JSON.parse((await adminRequest(plainAdminPort, `${ADMIN}/lan/status`)).body).deviceCount
+    const plainCookieNames = plainSecond.cookies.map(cookie => cookie.name).sort()
+    console.log(`durable link (plain HTTP): opens ${String(plainFirst.pairStatus)} then ${String(plainSecond.pairStatus)}; devices ${String(plainBefore)} → ${String(plainAfter)}`)
+    console.log(`durable link (plain HTTP): jar ${plainCookieNames.join(', ') || '(none)'}; Cookie header ${plainSecond.cookieHeader || '(none)'}`)
+    assert.deepEqual(plainFirst.cookies.map(cookie => cookie.name).filter(name => name.startsWith('__Host-')), [],
+      'a plain-HTTP origin sets no __Host- cookie')
+    const plainSentNames = plainSecond.cookieHeader.split('; ')
+      .map(pair => pair.split('=', 1)[0])
+      .filter(name => name !== undefined && name !== '')
+    assert.equal(plainSentNames.includes('dsh_ma_device'), false,
+      'the plain-HTTP repeat open sends no dsh_ma_device token to /auth/pair either')
+    assert.equal(plainFirst.pairStatus, 201)
+    assert.equal(plainSecond.pairStatus, 201, 'the plain-HTTP repeat open also answers 201')
+    assert.equal(plainAfter, plainBefore + 2, 'the plain-HTTP repeat open registers another device too')
+    cases++
   } finally {
     await plainContext.close()
     await plainGateway.close()
+    await new Promise(resolveClose => plainAdmin.close(resolveClose))
   }
 
   // The replay of a consumed key must be refused and shown as a message.

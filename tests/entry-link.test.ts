@@ -368,12 +368,20 @@ describe('entry link admin route', () => {
       method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin,
     })
     expect(first.status).toBe(201)
-    const cookieHeader = first.setCookie.map(entry => entry.split(';')[0] as string).join('; ')
-    expect(cookieHeader).toContain('__Host-dsh_ma_device_id')
+    // A browser sends each Cookie only where its Path matches. The device token is
+    // pinned to the narrow renewal path, so /auth/pair receives the __Host- device id
+    // alone - the shape this test sends, not every Set-Cookie the response carried.
+    const isRenewPath = (entry: string): boolean => entry.toLowerCase().includes('path=/mobile-access/auth/renew')
+    const firstValue = (entry: string): string => entry.split(';')[0] as string
+    const everyPath = first.setCookie.filter(entry => !isRenewPath(entry)).map(firstValue).join('; ')
+    const renewPath = first.setCookie.filter(isRenewPath).map(firstValue).join('; ')
+    expect(everyPath).toContain('__Host-dsh_ma_device_id=')
+    expect(everyPath).not.toContain('dsh_ma_device=')
+    expect(renewPath).toContain('dsh_ma_device=')
     const before = (await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })).body.deviceCount
 
     const second = await json(externalPort, '/mobile-access/auth/pair', {
-      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: cookieHeader,
+      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: everyPath,
     })
     expect(second.status).toBe(200)
     expect(second.body.reused).toBe(true)
@@ -381,12 +389,45 @@ describe('entry link admin route', () => {
     const after = (await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/status`, { admin: true })).body.deviceCount
     expect(after).toBe(before)
 
+    // A caller that does send the token (the renewal path's own client) reuses too.
+    const viaToken = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: `${everyPath}; ${renewPath}`,
+    })
+    expect(viaToken.status).toBe(200)
+    expect(viaToken.body.reused).toBe(true)
+
     // A one-time code never takes the reuse path, and a stale binding still pairs.
     const stale = await json(externalPort, '/mobile-access/auth/pair', {
       method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: '__Host-dsh_ma_device_id=not-a-device',
     })
     expect(stale.status).toBe(201)
     expect(stale.body.reused).toBeUndefined()
+  })
+
+  it('cannot reuse a local-network device, which carries no binding the browser sends', async () => {
+    // A plain-HTTP entry issues no __Host- binding and keeps the device token on the
+    // narrow renewal path, so a repeat open has nothing the browser would send and
+    // pairs again. This is the documented limitation, not an accident of the fixture.
+    const { adminPort, externalPort } = await fixture()
+    const created = await json(adminPort, `${LOCAL_ADMIN_PREFIX}/lan/link`, { method: 'POST', body: '{}', admin: true })
+    const appKey = created.body.appKey as string
+    const origin = `http://127.0.0.1:${String(externalPort)}`
+
+    const first = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin,
+    })
+    expect(first.status).toBe(201)
+    const everyPath = first.setCookie
+      .filter(entry => !entry.toLowerCase().includes('path=/mobile-access/auth/renew'))
+      .map(entry => entry.split(';')[0] as string).join('; ')
+    expect(everyPath).not.toContain('__Host-dsh_ma_device_id')
+    expect(everyPath).not.toContain('dsh_ma_device=')
+
+    const second = await json(externalPort, '/mobile-access/auth/pair', {
+      method: 'POST', body: JSON.stringify({ token: appKey, label: 'Friend PC' }), origin, cookie: everyPath,
+    })
+    expect(second.status).toBe(201)
+    expect(second.body.reused).toBeUndefined()
   })
 
   it('never serves the link secret on the external listener', async () => {

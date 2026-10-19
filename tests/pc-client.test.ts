@@ -10,8 +10,9 @@
  * `Expand-Archive`) lives in `scripts/smoke-pc-client.mjs`; this file is the fast
  * in-process guard that runs in `npm test`.
  */
-import { spawnSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import {
   createServer,
   request as requestHttp,
@@ -21,17 +22,33 @@ import {
   type ServerResponse,
 } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { createServer as createHttpsServer } from 'node:https'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import { afterEach, describe, expect, it } from 'vitest'
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { normalizePairingToken } from '../src/access.js'
 import { extractPairingToken } from '../src/auth-pages.js'
-import { parseGatewayConfig } from '../src/config.js'
+import { diagnosticControllerAction, MOBILE_CONTROL_MESSAGES } from '../src/client.js'
+import { Config, parseGatewayConfig, type PluginConfig } from '../src/config.js'
 import { MobileAccessService } from '../src/extensions.js'
 import { MobileAccessGateway, type PcClientChannel, type PcClientSource } from '../src/gateway.js'
-import { LOCAL_ADMIN_PREFIX, DEVICE_COOKIE, SESSION_COOKIE } from '../src/http-security.js'
+import { assertLocalAdminTrust, LOCAL_ADMIN_PREFIX, DEVICE_COOKIE, SESSION_COOKIE } from '../src/http-security.js'
+import { apply as applyPlugin, inject as pluginInject } from '../src/plugin.js'
+import {
+  isSakuraFrpRegistration,
+  patchSakuraFrpConfigTarget,
+  probeSakuraFrpTrustedCertificate,
+  SakuraFrpController,
+  SakuraFrpSettingsStore,
+  validateSakuraFrpBoundDomain,
+  validateSakuraFrpEntryMode,
+  type SakuraFrpCertificateProbe,
+  type SakuraFrpTunnel,
+} from '../src/sakurafrp.js'
 import { MemoryDeviceStore } from '../src/storage.js'
+import { createTestTlsChain } from './tls-fixtures.js'
 
 const PC_ENTRY_PATH = '/mobile-access/pc'
 const PC_ENTRY_SCRIPT_PATH = '/mobile-access/pc.js'
@@ -66,6 +83,8 @@ interface PcFixtureOptions {
   readonly certificate?: { readonly name: string; readonly body: Buffer }
   /** Pairing attempts allowed per loopback source; raised for the multi-form tests. */
   readonly maxPairingAttempts?: number
+  /** Device cap, lowered to prove the durable link still respects it. */
+  readonly maxDevices?: number
 }
 
 interface OpenedPairing {
@@ -224,6 +243,7 @@ async function createFixture(options: PcFixtureOptions = {}): Promise<PcFixture>
   const gateway = new MobileAccessGateway(parseGatewayConfig(baseGatewayOptions(directory, upstreamPort, {
     // The pairing-form tests open many windows from one loopback address.
     maxPairingAttempts: options.maxPairingAttempts ?? 50,
+    ...(options.maxDevices === undefined ? {} : { maxDevices: options.maxDevices }),
   })), new MemoryDeviceStore(), new MobileAccessService(context))
   await gateway.start()
   cleanups.push(() => gateway.close())
@@ -268,13 +288,225 @@ async function createFixture(options: PcFixtureOptions = {}): Promise<PcFixture>
   }
 }
 
-function adminHeaders(fixture: PcFixture, extra: Record<string, string> = {}): Record<string, string> {
+interface ChannelFixture {
+  readonly adminPort: number
+  readonly lan: { readonly gateway: MobileAccessGateway; readonly origin: string; readonly port: number }
+  readonly remote: { readonly gateway: MobileAccessGateway; readonly origin: string; readonly port: number }
+}
+
+/**
+ * Two gateways with their own state directories, mounted the way `src/plugin.ts`
+ * mounts them: `/lan` for the local-network gateway and `/remote` for the public
+ * one, plus the shared `/pc` prefix answered by the LAN gateway. This is the shape
+ * the panel talks to, so the per-channel link answer can be checked for real.
+ */
+async function createChannelFixture(): Promise<ChannelFixture> {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-pc-channels-'))
+  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"ok":true}\n')
+  })
+  const upstreamPort = await listen(upstream)
+  cleanups.push(() => closeServer(upstream))
+  const build = async (name: 'lan' | 'remote'): Promise<ChannelFixture['lan']> => {
+    const stateDirectory = join(directory, name)
+    await mkdir(stateDirectory, { recursive: true })
+    const context = new Context()
+    cleanups.push(async () => { context.fiber.dispose() })
+    const gateway = new MobileAccessGateway(parseGatewayConfig(baseGatewayOptions(stateDirectory, upstreamPort, {
+      maxPairingAttempts: 50,
+    })), new MemoryDeviceStore(), new MobileAccessService(context))
+    await gateway.start()
+    cleanups.push(() => gateway.close())
+    return { gateway, origin: gateway.address().origin, port: gateway.address().port }
+  }
+  const lan = await build('lan')
+  const remote = await build('remote')
+  const pcClient: PcClientSource = {
+    channels: async () => [
+      { channel: 'lan', origin: lan.origin },
+      { channel: 'remote', origin: remote.origin },
+    ],
+    certificate: async () => undefined,
+  }
+  const routes = [
+    { prefix: `${LOCAL_ADMIN_PREFIX}/lan`, handler: lan.gateway.localAdminRoute(`${LOCAL_ADMIN_PREFIX}/lan`, () => true).handler },
+    { prefix: `${LOCAL_ADMIN_PREFIX}/remote`, handler: remote.gateway.localAdminRoute(`${LOCAL_ADMIN_PREFIX}/remote`, () => true).handler },
+    { prefix: `${LOCAL_ADMIN_PREFIX}/pc`, handler: lan.gateway.localAdminRoute(`${LOCAL_ADMIN_PREFIX}/pc`, () => true, pcClient).handler },
+    { prefix: LOCAL_ADMIN_PREFIX, handler: lan.gateway.localAdminRoute(LOCAL_ADMIN_PREFIX, () => true).handler },
+  ]
+  const admin = createServer((incoming, response) => {
+    const pathname = new URL(incoming.url ?? '/', 'http://127.0.0.1').pathname
+    const route = routes.find(candidate => pathname === candidate.prefix || pathname.startsWith(`${candidate.prefix}/`))
+    if (route === undefined) {
+      response.writeHead(404, { 'content-type': 'application/json' })
+      response.end('{"error":"not_found"}')
+      return
+    }
+    Promise.resolve(route.handler(incoming, response)).catch(() => {
+      if (!response.headersSent) response.writeHead(500, { 'content-type': 'application/json' })
+      response.end('{"error":"handler_failed"}')
+    })
+  })
+  const adminPort = await listen(admin)
+  cleanups.push(() => closeServer(admin))
+  return { adminPort, lan, remote }
+}
+
+/** A frpc config with a plugin target, so the trusted mode has something to rewrite. */
+const PATCHABLE_CONFIG = '[common]\nserver_addr = frp.example.com\n\n[proxy]\nplugin_local_addr = 127.0.0.1:3443\n'
+
+interface SakuraControllerFixture {
+  readonly controller: SakuraFrpController
+  readonly plainGateway: ReturnType<typeof vi.fn>
+  readonly trustedGateway: ReturnType<typeof vi.fn>
+  readonly probe: ReturnType<typeof vi.fn>
+  readonly editTarget: ReturnType<typeof vi.fn>
+}
+
+/**
+ * A SakuraFrp controller with a fake natfrp API and a fake frpc process, so the
+ * start-up decisions (entry mode, origin, config rewrite, certificate probe) can be
+ * observed without an account, a tunnel or a network.
+ */
+async function createSakuraController(settings: SakuraFrpSettingsStore, options: {
+  readonly remote: string
+  readonly config: string
+  readonly probe: () => Promise<SakuraFrpCertificateProbe>
+}): Promise<SakuraControllerFixture> {
+  const executable = join(settings.stateRoot, 'frpc.exe')
+  await writeFile(executable, 'fake-frpc', 'utf8')
+  const gateway = { close: async () => undefined }
+  const plainGateway = vi.fn(async () => gateway)
+  const trustedGateway = vi.fn(async () => gateway)
+  const probe = vi.fn(options.probe)
+  const editTarget = vi.fn(async () => undefined)
+  const api = {
+    listTunnels: async (): Promise<readonly SakuraFrpTunnel[]> => [{
+      id: 9,
+      name: 'dsh',
+      type: 'tcp',
+      node: 5,
+      online: true,
+      status: 1,
+      remote: options.remote,
+    }],
+    listNodes: async () => ({ '5': 'node-5.example.com' }),
+    editTunnelTarget: editTarget,
+    fetchTunnelConfig: async () => options.config,
+  }
+  const controller = new SakuraFrpController({
+    store: {
+      load: async () => ({ version: 1 as const, enabled: false }),
+      save: async () => undefined,
+    },
+    settings,
+    component: { executable },
+    createGateway: plainGateway as unknown as (origin: string, port: number) => Promise<MobileAccessGateway>,
+    createTrustedGateway: trustedGateway as unknown as (origin: string, port: number) => Promise<MobileAccessGateway>,
+    probeCertificate: probe,
+    api,
+    maxStartupRounds: 1,
+    startupTimeoutMs: 4_000,
+    spawnProcess: (): ChildProcessWithoutNullStreams => {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams
+      const stdout = new EventEmitter() as ChildProcessWithoutNullStreams['stdout']
+      const stderr = new EventEmitter() as ChildProcessWithoutNullStreams['stderr']
+      stdout.setEncoding = vi.fn() as unknown as ChildProcessWithoutNullStreams['stdout']['setEncoding']
+      stderr.setEncoding = vi.fn() as unknown as ChildProcessWithoutNullStreams['stderr']['setEncoding']
+      child.stdout = stdout
+      child.stderr = stderr
+      Object.assign(child, { exitCode: null, kill: () => true })
+      // frpc reports a successful registration on stdout; that line is what makes
+      // the controller confirm readiness.
+      setTimeout(() => { stdout.emit('data', 'start proxy success\n') }, 20)
+      return child
+    },
+  })
+  cleanups.push(() => controller.close())
+  return { controller, plainGateway, trustedGateway, probe, editTarget }
+}
+
+interface MountedPlugin {
+  readonly route: WebRoute
+  readonly directory: string
+}
+
+/** Boot the real plugin once and keep its admin route, as `tests/plugin.test.ts` does. */
+async function mountPlugin(): Promise<MountedPlugin> {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-pc-plugin-'))
+  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  let route: WebRoute | undefined
+  const context = new Context()
+  cleanups.push(async () => { context.fiber.dispose() })
+  context.provide('webServer', {
+    port: 3080,
+    collectIndexInjections: () => [],
+    register(candidate: WebRoute) {
+      route = candidate
+      return () => { if (route === candidate) route = undefined }
+    },
+  } as never)
+  context.provide('commands', { register() { return () => undefined } } as never)
+  context.provide('connection', {
+    authenticatedUrl: (baseUrl: string) => `${baseUrl}/?token=test-launch-token`,
+    requestRejection: () => 401,
+  } as never)
+  await context.plugin({ Config, inject: pluginInject, apply: applyPlugin }, {
+    listenPort: 0,
+    stateFile: join(directory, 'devices.json'),
+    controlFile: join(directory, 'control.json'),
+    customCssFile: join(directory, 'mobile.css'),
+    customScriptFile: join(directory, 'mobile.js'),
+    initiallyEnabled: false,
+    tls: { mode: 'disabled' },
+  } satisfies Partial<PluginConfig>)
+  if (route === undefined) throw new Error('the plugin did not register its admin route')
+  return { route, directory }
+}
+
+/** One request through the plugin's real admin route on a throwaway listener. */
+async function invokeRoute(mounted: MountedPlugin, method: 'GET' | 'POST', path: string, body = ''): Promise<{ status: number; body: string }> {
+  const server = createServer((incoming, response) => { void mounted.route.handler(incoming, response) })
+  const port = await listen(server)
+  try {
+    const result = await request(port, path, {
+      method,
+      headers: {
+        host: `127.0.0.1:${String(port)}`,
+        ...(method === 'POST'
+          ? { origin: `http://127.0.0.1:${String(port)}`, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' }
+          : {}),
+      },
+      ...(body === '' ? {} : { body }),
+    })
+    return { status: result.status, body: result.body }
+  } finally {
+    await closeServer(server)
+  }
+}
+
+function adminHeaders(target: { readonly adminPort: number }, extra: Record<string, string> = {}): Record<string, string> {
   return {
-    host: `127.0.0.1:${String(fixture.adminPort)}`,
-    origin: `http://127.0.0.1:${String(fixture.adminPort)}`,
+    host: `127.0.0.1:${String(target.adminPort)}`,
+    origin: `http://127.0.0.1:${String(target.adminPort)}`,
     'sec-fetch-site': 'same-origin',
     ...extra,
   }
+}
+
+/** One loopback admin request, as the DSH desktop panel sends it. */
+function adminPost(target: { readonly adminPort: number }, path: string, body = '{}'): Promise<HttpResult> {
+  return request(target.adminPort, path, {
+    method: 'POST',
+    headers: adminHeaders(target, { 'content-type': 'application/json' }),
+    body,
+  })
+}
+
+function adminGet(target: { readonly adminPort: number }, path: string): Promise<HttpResult> {
+  return request(target.adminPort, path, { headers: adminHeaders(target) })
 }
 
 async function openPairing(fixture: PcFixture): Promise<OpenedPairing> {
@@ -306,7 +538,11 @@ function appKeySecret(appKey: string): string {
   return appKey.split('.').slice(2).join('.')
 }
 
-async function pairBrowser(fixture: PcFixture, token: string): Promise<HttpResult> {
+async function pairBrowser(
+  fixture: { readonly port: number; readonly origin: string },
+  token: string,
+  extra: Record<string, string> = {},
+): Promise<HttpResult> {
   return request(fixture.port, '/mobile-access/auth/pair', {
     method: 'POST',
     headers: {
@@ -314,6 +550,7 @@ async function pairBrowser(fixture: PcFixture, token: string): Promise<HttpResul
       origin: fixture.origin,
       'sec-fetch-site': 'same-origin',
       'content-type': 'application/json',
+      ...extra,
     },
     body: JSON.stringify({ token, label: 'PC client fixture' }),
   })
@@ -793,5 +1030,552 @@ describe('PC client routes', () => {
     // The three languages really differ, so no locale silently reuses English.
     const rendered = locales.map(locale => JSON.stringify(MOBILE_CONTROL_MESSAGES[locale]))
     expect(new Set(rendered).size).toBe(3)
+  })
+})
+
+describe('durable PC entry link (task-13 + task-16)', () => {
+  const LINK_PATH = `${LOCAL_ADMIN_PREFIX}/lan/link`
+  const LINK_REVOKE_PATH = `${LOCAL_ADMIN_PREFIX}/lan/link/revoke`
+  const LAN_STATUS_PATH = `${LOCAL_ADMIN_PREFIX}/lan/status`
+  const LAN_DEVICES_PATH = `${LOCAL_ADMIN_PREFIX}/lan/devices`
+
+  it('issues one durable link, keeps it on repeat, regenerates and revokes it', async () => {
+    const fixture = await createFixture()
+    const first = await adminPost(fixture, LINK_PATH)
+    expect(first.status, first.body).toBe(201)
+    const created = JSON.parse(first.body) as { appKey: string; entryUrl: string; created: boolean }
+    expect(created.created).toBe(true)
+    // The app key is the durable secret itself, in the same shape as a pairing token.
+    expect(created.appKey).toMatch(/^dsh1\.[a-f\d]{64}\.[A-Za-z0-9_-]{43}$/u)
+    expect(created.entryUrl).toBe(`${fixture.origin}${PC_ENTRY_PATH}#key=${created.appKey}`)
+
+    // A second open is the same link, not a new one: 200 instead of 201.
+    const repeat = await adminPost(fixture, LINK_PATH)
+    expect(repeat.status, repeat.body).toBe(200)
+    expect(JSON.parse(repeat.body)).toStrictEqual({ appKey: created.appKey, entryUrl: created.entryUrl, created: false })
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true })
+
+    const regenerated = await adminPost(fixture, LINK_PATH, JSON.stringify({ regenerate: true }))
+    expect(regenerated.status, regenerated.body).toBe(201)
+    const next = JSON.parse(regenerated.body) as { appKey: string; entryUrl: string; created: boolean }
+    expect(next.created).toBe(true)
+    expect(appKeySecret(next.appKey)).not.toBe(appKeySecret(created.appKey))
+    expect((await pairBrowser(fixture, created.appKey)).status).toBe(401)
+    expect((await pairBrowser(fixture, next.appKey)).status).toBe(201)
+
+    const revoked = await adminPost(fixture, LINK_REVOKE_PATH)
+    expect(revoked.status, revoked.body).toBe(200)
+    expect(JSON.parse(revoked.body)).toStrictEqual({ revoked: true })
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: false })
+    expect((await pairBrowser(fixture, next.appKey)).status).toBe(401)
+    // Revoking twice is not an error, and creating again mints a third secret.
+    expect((await adminPost(fixture, LINK_REVOKE_PATH)).status).toBe(200)
+    const recreated = await adminPost(fixture, LINK_PATH)
+    expect(recreated.status).toBe(201)
+    expect(appKeySecret((JSON.parse(recreated.body) as { appKey: string }).appKey))
+      .not.toBe(appKeySecret(next.appKey))
+  })
+
+  it('reuses a bound device on a durable open and never consumes the link', async () => {
+    const fixture = await createFixture()
+    const { appKey } = JSON.parse((await adminPost(fixture, LINK_PATH)).body) as { appKey: string }
+
+    const first = await pairBrowser(fixture, appKey)
+    expect(first.status, first.body).toBe(201)
+    const firstBody = JSON.parse(first.body) as { deviceId: string; reused?: boolean }
+    expect(firstBody.reused).toBeUndefined()
+    const deviceToken = cookiesByName(first.headers).get(DEVICE_COOKIE) ?? ''
+    expect(deviceToken, 'the narrow device cookie is issued').not.toBe('')
+
+    // White-box: this asserts the *server branch* when the request really carries the
+    // narrow `dsh_ma_device` token. A browser is not sent that cookie on /auth/pair
+    // (its Path is /mobile-access/auth/renew), so scripts/smoke-pc-client.mjs records
+    // the browser-visible outcome instead: 201 and a new device on every open. That
+    // gap is reported to the Lead; the assertions below describe the server, not a
+    // reachable browser flow.
+    const second = await pairBrowser(fixture, appKey, { cookie: `${DEVICE_COOKIE}=${deviceToken}` })
+    expect(second.status, second.body).toBe(200)
+    expect(JSON.parse(second.body)).toMatchObject({ paired: true, reused: true, deviceId: firstBody.deviceId })
+    expect(cookiesByName(second.headers).has(SESSION_COOKIE)).toBe(true)
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).deviceCount).toBe(1)
+
+    // The documented plain-HTTP limitation: no `__Host-` binding exists at all, so a
+    // browser never sends anything the reuse branch could use.
+    const withoutBinding = await pairBrowser(fixture, appKey)
+    expect(withoutBinding.status).toBe(201)
+    expect((JSON.parse(withoutBinding.body) as { reused?: boolean }).reused).toBeUndefined()
+    expect(JSON.parse((await adminGet(fixture, LAN_STATUS_PATH)).body).deviceCount).toBe(2)
+
+    // A one-time code never takes the reuse path, even carrying the same binding.
+    const opened = await openPairing(fixture)
+    const byCode = await pairBrowser(fixture, opened.token, { cookie: `${DEVICE_COOKIE}=${deviceToken}` })
+    expect(byCode.status, byCode.body).toBe(201)
+    expect((JSON.parse(byCode.body) as { reused?: boolean }).reused).toBeUndefined()
+
+    // A stale binding falls through to a normal pair instead of failing.
+    const stale = await pairBrowser(fixture, appKey, { cookie: `${DEVICE_COOKIE}=stale-device-token` })
+    expect(stale.status, stale.body).toBe(201)
+
+    // A revoked device falls through too: the link itself is still valid.
+    const staleId = (JSON.parse(stale.body) as { deviceId: string }).deviceId
+    expect((await adminPost(fixture, `${LOCAL_ADMIN_PREFIX}/lan/devices/revoke`, JSON.stringify({ deviceId: staleId }))).status).toBe(200)
+    expect((await pairBrowser(fixture, appKey)).status).toBe(201)
+  })
+
+  it('keeps the device cap and the rate limit in front of the durable link', async () => {
+    const capped = await createFixture({ maxDevices: 1 })
+    const { appKey } = JSON.parse((await adminPost(capped, LINK_PATH)).body) as { appKey: string }
+    expect((await pairBrowser(capped, appKey)).status).toBe(201)
+    // A second, unbound open would be a new device, so the cap answers 409.
+    const overCap = await pairBrowser(capped, appKey)
+    expect(overCap.status, overCap.body).toBe(409)
+    expect(JSON.parse(overCap.body)).toStrictEqual({ error: 'device_limit' })
+
+    const limited = await createFixture({ maxPairingAttempts: 2 })
+    const limitedKey = (JSON.parse((await adminPost(limited, LINK_PATH)).body) as { appKey: string }).appKey
+    expect((await pairBrowser(limited, limitedKey)).status).toBe(201)
+    // A wrong token is still 401, and the third attempt from the same source is 429:
+    // the durable link shares the pairing budget and never bypasses it.
+    expect((await pairBrowser(limited, `${appKeyInstance(limitedKey)}.${'A'.repeat(43)}`)).status).toBe(401)
+    expect((await pairBrowser(limited, limitedKey)).status).toBe(429)
+  })
+
+  it('reports the link per channel while the shared pc/info carries none', async () => {
+    const channels = await createChannelFixture()
+    const remoteStatus = (): Promise<Record<string, unknown>> =>
+      adminGet(channels, `${LOCAL_ADMIN_PREFIX}/remote/status`).then(result => JSON.parse(result.body) as Record<string, unknown>)
+    expect(JSON.parse((await adminGet(channels, `${LOCAL_ADMIN_PREFIX}/remote/status`)).body).entryLink).toStrictEqual({ active: false })
+
+    const lanLink = JSON.parse((await adminPost(channels, LINK_PATH)).body) as { appKey: string; entryUrl: string }
+    expect(JSON.parse((await adminGet(channels, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true })
+    // Each channel owns its own link file, so the other answer is untouched.
+    expect((await remoteStatus()).entryLink).toStrictEqual({ active: false })
+
+    // The deviation from the task text: pc/info is answered by whichever gateway is
+    // active, so it cannot report the selected channel's link and must not pretend to.
+    const info = JSON.parse((await adminGet(channels, PC_INFO_PATH)).body) as Record<string, unknown>
+    expect(info).not.toHaveProperty('link')
+    expect(info).not.toHaveProperty('entryLink')
+    expect(Object.keys(info).sort()).toStrictEqual(['certificate', 'channels', 'entryPath', 'packagePath'])
+    expect(info.channels).toStrictEqual([
+      { channel: 'lan', origin: channels.lan.origin, entryUrl: `${channels.lan.origin}${PC_ENTRY_PATH}` },
+      { channel: 'remote', origin: channels.remote.origin, entryUrl: `${channels.remote.origin}${PC_ENTRY_PATH}` },
+    ])
+
+    // A link created on the local network never opens the public entry.
+    expect((await pairBrowser(channels.remote, lanLink.appKey)).status).toBe(401)
+    const remoteLink = JSON.parse((await adminPost(channels, `${LOCAL_ADMIN_PREFIX}/remote/link`)).body) as { appKey: string }
+    expect(appKeySecret(remoteLink.appKey)).not.toBe(appKeySecret(lanLink.appKey))
+    expect((await pairBrowser(channels.remote, remoteLink.appKey)).status).toBe(201)
+    expect((await pairBrowser(channels.lan, remoteLink.appKey)).status).toBe(401)
+    expect(JSON.parse((await adminGet(channels, LAN_STATUS_PATH)).body).entryLink).toStrictEqual({ active: true })
+  })
+
+  it('keeps the durable secret on the loopback route and out of every other surface', async () => {
+    const fixture = await createFixture()
+    const link = JSON.parse((await adminPost(fixture, LINK_PATH)).body) as { appKey: string; entryUrl: string }
+    const secret = appKeySecret(link.appKey)
+    expect((await pairBrowser(fixture, link.appKey)).status).toBe(201)
+
+    const surfaces = [
+      (await adminGet(fixture, LAN_STATUS_PATH)).body,
+      (await adminGet(fixture, LAN_DEVICES_PATH)).body,
+      (await adminGet(fixture, PC_INFO_PATH)).body,
+      // The external listener proxies the admin path upstream: it must never answer it.
+      (await request(fixture.port, LINK_PATH, {
+        method: 'POST',
+        headers: {
+          host: new URL(fixture.origin).host,
+          origin: fixture.origin,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+        body: '{}',
+      })).body,
+    ]
+    for (const body of surfaces) expect(body).not.toContain(secret)
+    const zip = await downloadPackage(fixture, '?channel=lan')
+    expect(zip.rawBody.includes(Buffer.from(secret)), 'the package carries no secret').toBe(false)
+
+    // On disk the raw secret exists only in the owner-only link file.
+    const holders: string[] = []
+    const walk = async (directory: string, prefix = ''): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const name = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+        if (entry.isDirectory()) { await walk(join(directory, entry.name), name); continue }
+        if ((await readFile(join(directory, entry.name))).includes(Buffer.from(secret))) holders.push(name)
+      }
+    }
+    await walk(fixture.directory)
+    expect(holders).toStrictEqual(['entry-link.json'])
+
+    // The route itself is loopback-only and refuses a foreign authority, a
+    // cross-site fetch, an Origin-less write and an unexpected query.
+    expect((await request(fixture.adminPort, LINK_PATH, {
+      method: 'POST',
+      headers: { ...adminHeaders(fixture, { 'content-type': 'application/json' }), host: 'public.example.test' },
+      body: '{}',
+    })).status).toBe(403)
+    expect((await request(fixture.adminPort, LINK_PATH, {
+      method: 'POST',
+      headers: { ...adminHeaders(fixture, { 'content-type': 'application/json' }), 'sec-fetch-site': 'cross-site' },
+      body: '{}',
+    })).status).toBe(403)
+    expect((await request(fixture.adminPort, LINK_PATH, {
+      method: 'POST',
+      headers: { host: `127.0.0.1:${String(fixture.adminPort)}`, 'content-type': 'application/json' },
+      body: '{}',
+    })).status).toBe(403)
+    expect((await request(fixture.adminPort, `${LINK_PATH}?x=1`, {
+      method: 'POST',
+      headers: adminHeaders(fixture, { 'content-type': 'application/json' }),
+      body: '{}',
+    })).status).toBe(400)
+
+    // A non-loopback peer never reaches the handler at all.
+    const forge = (remoteAddress: string, host: string, browser = true): void => assertLocalAdminTrust({
+      method: 'POST',
+      headers: browser
+        ? { host, origin: `http://${host}`, 'sec-fetch-site': 'same-origin' }
+        : { host },
+      socket: { remoteAddress },
+    } as unknown as IncomingMessage, true)
+    expect(() => { forge('203.0.113.9', `127.0.0.1:${String(fixture.adminPort)}`) }).toThrow(/forbidden/u)
+    expect(() => { forge('::ffff:127.0.0.1', 'public.example.test') }).toThrow(/forbidden/u)
+    expect(() => { forge('127.0.0.1', `127.0.0.1:${String(fixture.adminPort)}`, false) }).toThrow(/forbidden/u)
+    expect(() => { forge('127.0.0.1', `127.0.0.1:${String(fixture.adminPort)}`) }).not.toThrow()
+  })
+})
+
+describe('SakuraFrp trusted entry (子域绑定 + 自动 HTTPS)', () => {
+  async function settingsFixture(): Promise<{ readonly settings: SakuraFrpSettingsStore; readonly directory: string }> {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-sakura-settings-'))
+    cleanups.push(() => rm(directory, { recursive: true, force: true }))
+    const settings = new SakuraFrpSettingsStore(join(directory, 'sakurafrp'), directory)
+    await settings.initialize()
+    return { settings, directory }
+  }
+
+  it('round-trips the entry mode and the bound subdomain without exposing the token', async () => {
+    const { settings, directory } = await settingsFixture()
+    expect(settings.status()).toStrictEqual({
+      tokenSet: false,
+      entryMode: 'tls',
+      storagePath: join(directory, 'sakurafrp'),
+    })
+    await settings.configure({ token: 'sk-token-abcdefgh', tunnelId: 42 })
+    expect(settings.status()).toMatchObject({ tokenSet: true, tunnelId: 42, entryMode: 'tls' })
+    expect(settings.status()).not.toHaveProperty('boundDomain')
+
+    const auto = await settings.configure({ entryMode: 'autoHttps', boundDomain: 'dsh.demo.nyat.app' })
+    expect(auto).toMatchObject({ entryMode: 'autoHttps', boundDomain: 'dsh.demo.nyat.app' })
+    expect(JSON.stringify(auto)).not.toContain('sk-token-abcdefgh')
+    expect(settings.status()).not.toHaveProperty('token')
+
+    // A fresh store on the same directory reads the same settings back.
+    const reloaded = new SakuraFrpSettingsStore(join(directory, 'sakurafrp'), directory)
+    await reloaded.initialize()
+    expect(reloaded.settings()).toStrictEqual({
+      token: 'sk-token-abcdefgh',
+      tunnelId: 42,
+      entryMode: 'autoHttps',
+      boundDomain: 'dsh.demo.nyat.app',
+    })
+    // Switching back to the default mode keeps the binding but not the mode.
+    expect(await reloaded.configure({ entryMode: 'tls' }))
+      .toMatchObject({ entryMode: 'tls', boundDomain: 'dsh.demo.nyat.app' })
+    expect(await reloaded.purge()).toMatchObject({ entryMode: 'tls', tokenSet: false })
+
+    // A settings file written before the field existed keeps the raw-TCP behaviour.
+    await mkdir(join(directory, 'legacy'), { recursive: true })
+    const legacy = new SakuraFrpSettingsStore(join(directory, 'legacy'), directory)
+    await writeFile(join(directory, 'legacy', 'settings.json'), JSON.stringify({ version: 1, token: 'sk-legacy-token-01', tunnelId: 7 }), 'utf8')
+    await legacy.initialize()
+    expect(legacy.status()).toMatchObject({ tokenSet: true, tunnelId: 7, entryMode: 'tls' })
+  })
+
+  it('rejects an unsupported mode and a malformed bound subdomain', async () => {
+    const { settings } = await settingsFixture()
+    await expect(settings.configure({ entryMode: 'https' })).rejects.toThrow(/sakurafrp_entry_mode_invalid/u)
+    await expect(settings.configure({ entryMode: 'autohttps' })).rejects.toThrow(/sakurafrp_entry_mode_invalid/u)
+    for (const domain of [
+      'UPPER.nyat.app', 'nyat.app.', '-bad.nyat.app', 'bad-.nyat.app', 'nodot',
+      'a..b', `${'x'.repeat(64)}.nyat.app`, 'under_score.nyat.app', 'https://dsh.nyat.app',
+      'dsh.nyat.app:443', 'dsh .nyat.app',
+    ]) {
+      await expect(settings.configure({ boundDomain: domain }), domain).rejects.toThrow(/sakurafrp_bound_domain_invalid/u)
+    }
+    expect(validateSakuraFrpEntryMode('tls')).toBe('tls')
+    expect(validateSakuraFrpEntryMode('autoHttps')).toBe('autoHttps')
+    expect(() => validateSakuraFrpEntryMode(undefined)).toThrow(/sakurafrp_entry_mode_invalid/u)
+    expect(validateSakuraFrpBoundDomain('dsh.demo.nyat.app')).toBe('dsh.demo.nyat.app')
+    expect(validateSakuraFrpBoundDomain('a.bc')).toBe('a.bc')
+    // A blank field means "leave it as it was", never a silent mode change.
+    expect(settings.status().entryMode).toBe('tls')
+  })
+
+  it('rewrites both fetched frpc config shapes and refuses an unsupported one', () => {
+    expect(patchSakuraFrpConfigTarget('[common]\nserver_addr = frp.example.com\n\n[proxy]\nplugin_local_addr = 127.0.0.1:3443\n', 41_000))
+      .toBe('[common]\nserver_addr = frp.example.com\n\n[proxy]\nplugin_local_addr = 127.0.0.1:41000\n')
+    expect(patchSakuraFrpConfigTarget('serverAddr = "frp.example.com"\n[[proxies]]\nlocalAddr = "127.0.0.1:3443" # natfrp\n', 41_000))
+      .toBe('serverAddr = "frp.example.com"\n[[proxies]]\nlocalAddr = "127.0.0.1:41000" # natfrp\n')
+    // Without a plugin address the proxy's own local target is moved instead.
+    expect(patchSakuraFrpConfigTarget('[proxy]\nlocal_ip = 192.168.1.5\nlocal_port = 3443\r\n', 41_000))
+      .toBe('[proxy]\nlocal_ip = 127.0.0.1\nlocal_port = 41000\r\n')
+    // A config that forwards nowhere is a named failure, never a silent no-op.
+    expect(() => patchSakuraFrpConfigTarget('serverAddr = "frp.example.com"\n', 41_000)).toThrow(/sakurafrp_config_unsupported/u)
+    expect(() => patchSakuraFrpConfigTarget('[proxy]\nlocal_port = 3443\n', 0)).toThrow(/sakurafrp_config_unsupported/u)
+    expect(() => patchSakuraFrpConfigTarget('[proxy]\nlocal_port = 3443\n', 70_000)).toThrow(/sakurafrp_config_unsupported/u)
+  })
+
+  it('derives the public origin from the bound subdomain, collapsing port 443', async () => {
+    for (const [remote, expected] of [['443', 'https://dsh.demo.nyat.app'], ['1919', 'https://dsh.demo.nyat.app:1919']] as const) {
+      const { settings } = await settingsFixture()
+      await settings.configure({ token: 'sk-token-abcdefgh', tunnelId: 9, entryMode: 'autoHttps', boundDomain: 'dsh.demo.nyat.app' })
+      const fixture = await createSakuraController(settings, { remote, config: PATCHABLE_CONFIG, probe: async () => 'trusted' })
+      await fixture.controller.initialize()
+      await fixture.controller.setEnabled(true)
+      await vi.waitFor(() => expect(fixture.controller.status().state).toBe('ready'))
+      expect(fixture.controller.status().origin, `remote port ${remote}`).toBe(expected)
+      expect(fixture.controller.status()).toMatchObject({ trustedEntry: true, trustedCertificate: true })
+      // The trusted mode terminates TLS in frpc, so the plaintext ingress is used.
+      expect(fixture.plainGateway).not.toHaveBeenCalled()
+      // The fetched config is rewritten onto that ingress, and the tunnel's local
+      // target is moved there through the official edit API.
+      const patched = await readFile(settings.configFile, 'utf8')
+      const target = /plugin_local_addr = 127\.0\.0\.1:(\d{4,5})/u.exec(patched)
+      expect(target, patched).not.toBeNull()
+      const ingressPort = Number((target as RegExpExecArray)[1])
+      expect(fixture.trustedGateway).toHaveBeenCalledWith(expected, ingressPort)
+      expect(fixture.editTarget).toHaveBeenCalledWith('sk-token-abcdefgh', 9, '127.0.0.1', ingressPort)
+      await fixture.controller.close()
+    }
+  })
+
+  it('claims a trusted certificate only when the public handshake verifies', async () => {
+    const outcomes = [
+      { probe: async (): Promise<SakuraFrpCertificateProbe> => 'trusted', state: 'ready', extra: { trustedCertificate: true } },
+      { probe: async (): Promise<SakuraFrpCertificateProbe> => 'unreachable', state: 'ready', extra: {} },
+    ] as const
+    for (const outcome of outcomes) {
+      const { settings } = await settingsFixture()
+      await settings.configure({ token: 'sk-token-abcdefgh', tunnelId: 9, entryMode: 'autoHttps', boundDomain: 'dsh.demo.nyat.app' })
+      const fixture = await createSakuraController(settings, { remote: '443', config: PATCHABLE_CONFIG, probe: outcome.probe })
+      await fixture.controller.initialize()
+      await fixture.controller.setEnabled(true)
+      await vi.waitFor(() => expect(fixture.controller.status().state).toBe(outcome.state))
+      expect(fixture.controller.status()).toMatchObject({ origin: 'https://dsh.demo.nyat.app', trustedEntry: true, ...outcome.extra })
+      if (Object.keys(outcome.extra).length === 0) {
+        expect(fixture.controller.status()).not.toHaveProperty('trustedCertificate')
+      }
+      await fixture.controller.close()
+    }
+
+    // An untrusted public certificate fails the entry with its own code, and the
+    // configured (not probed) trusted claim stays visible so the panel can say why.
+    const { settings } = await settingsFixture()
+    await settings.configure({ token: 'sk-token-abcdefgh', tunnelId: 9, entryMode: 'autoHttps', boundDomain: 'dsh.demo.nyat.app' })
+    const untrusted = await createSakuraController(settings, { remote: '443', config: PATCHABLE_CONFIG, probe: async () => 'untrusted' })
+    await untrusted.controller.initialize()
+    await untrusted.controller.setEnabled(true)
+    await vi.waitFor(() => expect(untrusted.controller.status().state).toBe('error'))
+    expect(untrusted.controller.status()).toMatchObject({
+      state: 'error',
+      errorCode: 'sakurafrp_certificate_untrusted',
+      trustedEntry: true,
+    })
+    expect(untrusted.controller.status()).not.toHaveProperty('trustedCertificate')
+    expect(untrusted.controller.status()).not.toHaveProperty('origin')
+    await untrusted.controller.close()
+
+    // autoHttps without a subdomain is refused before frpc is ever launched.
+    const missing = await settingsFixture()
+    await missing.settings.configure({ token: 'sk-token-abcdefgh', tunnelId: 9, entryMode: 'autoHttps' })
+    const noDomain = await createSakuraController(missing.settings, { remote: '443', config: PATCHABLE_CONFIG, probe: async () => 'trusted' })
+    await noDomain.controller.initialize()
+    await noDomain.controller.setEnabled(true)
+    expect(noDomain.controller.status()).toMatchObject({ state: 'unavailable', errorCode: 'sakurafrp_bound_domain_missing' })
+    expect(noDomain.trustedGateway).not.toHaveBeenCalled()
+
+    // The default mode never probes and writes the fetched config byte for byte.
+    const plain = await settingsFixture()
+    await plain.settings.configure({ token: 'sk-token-abcdefgh', tunnelId: 9 })
+    const tlsMode = await createSakuraController(plain.settings, { remote: '443', config: PATCHABLE_CONFIG, probe: async () => 'trusted' })
+    await tlsMode.controller.initialize()
+    await tlsMode.controller.setEnabled(true)
+    await vi.waitFor(() => expect(tlsMode.controller.status().state).toBe('ready'))
+    // The raw-TCP entry is derived from the node list, and the tunnel target keeps
+    // pointing at the plugin's own TLS listener.
+    expect(tlsMode.controller.status()).toMatchObject({ origin: 'https://node-5.example.com', trustedEntry: false })
+    expect(tlsMode.controller.status()).not.toHaveProperty('trustedCertificate')
+    expect(tlsMode.probe).not.toHaveBeenCalled()
+    expect(tlsMode.trustedGateway).not.toHaveBeenCalled()
+    // The fixture tunnel has no reusable local port, so the target is moved through
+    // the official API on a reserved loopback port; the config text itself is not
+    // rewritten in the raw-TCP mode.
+    expect(tlsMode.editTarget).toHaveBeenCalledTimes(1)
+    const editedPort = (tlsMode.editTarget.mock.calls[0] as unknown[])[3] as number
+    expect(tlsMode.editTarget).toHaveBeenCalledWith('sk-token-abcdefgh', 9, '127.0.0.1', editedPort)
+    expect(editedPort).toBeGreaterThanOrEqual(1024)
+    expect(editedPort).toBeLessThanOrEqual(65_535)
+    expect(editedPort).not.toBe(3443)
+    expect(await readFile(plain.settings.configFile, 'utf8')).toBe(PATCHABLE_CONFIG)
+    await tlsMode.controller.close()
+  })
+
+  it('ships no certificate for the trusted entry and says so in the package', async () => {
+    // Mirrors src/plugin.ts: in trusted mode the public certificate is natfrp's, so
+    // the package must not carry the plugin CA.
+    const trusted = await createFixture({
+      channels: [{ channel: 'remote', origin: 'https://dsh.demo.nyat.app' }],
+    })
+    const trustedInfo = JSON.parse((await adminGet(trusted, PC_INFO_PATH)).body) as { certificate: { available: boolean } }
+    expect(trustedInfo.certificate.available).toBe(false)
+    const trustedZip = await downloadPackage(trusted, '?channel=remote')
+    expect(trustedZip.status, trustedZip.body.slice(0, 200)).toBe(200)
+    const trustedNames = readStoredZip(trustedZip.rawBody).map(entry => entry.name)
+    expect(trustedNames).not.toContain('dsh-mobile-ca.cer')
+    expect(trustedNames).not.toContain('1-trust-certificate.cmd')
+    const readme = readStoredZip(trustedZip.rawBody).find(entry => /^README-.*\.txt$/u.test(entry.name))
+    expect(readme, 'the package carries a README').toBeDefined()
+    const readmeText = (readme as ZipEntryRead).body.toString('utf8')
+    expect(readmeText).toContain('https://dsh.demo.nyat.app')
+    expect(readmeText).toMatch(/no certificate/i)
+    expect(readmeText).not.toContain('dsh-mobile-ca.cer')
+    // The trust step is omitted entirely, so no step number points at a missing file.
+    expect(readmeText).not.toContain('1-trust-certificate.cmd')
+
+    // The raw-TCP channel still ships the CA and its trust script.
+    const certificate = { name: 'dsh-mobile-ca.cer', body: Buffer.from('der-fixture') }
+    const tlsChannel = await createFixture({
+      channels: [{ channel: 'remote', origin: 'https://192.0.2.10:3443' }],
+      certificate,
+    })
+    const tlsZip = await downloadPackage(tlsChannel, '?channel=remote')
+    expect(readStoredZip(tlsZip.rawBody).map(entry => entry.name)).toContain('dsh-mobile-ca.cer')
+  })
+
+  it('never reports a real handshake as trusted when the certificate is not', async () => {
+    // The probe is the only thing that turns a configured 自动 HTTPS into a trusted
+    // claim, so drive it against a live TLS listener with a certificate no platform
+    // trusts: an untrusted leaf must come back as 'untrusted', and a closed port as
+    // 'unreachable' — never as 'trusted'.
+    const { leafCert, leafKey } = createTestTlsChain({ dnsNames: ['dsh.demo.nyat.app'] })
+    const secure = createHttpsServer({ cert: leafCert, key: leafKey }, (_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/plain' })
+      response.end('ok')
+    })
+    const securePort = await listen(secure)
+    cleanups.push(() => closeServer(secure))
+    expect(await probeSakuraFrpTrustedCertificate(`https://127.0.0.1:${String(securePort)}`)).toBe('untrusted')
+
+    const closed = createServer(() => undefined)
+    const closedPort = await listen(closed)
+    await closeServer(closed)
+    expect(await probeSakuraFrpTrustedCertificate(`https://127.0.0.1:${String(closedPort)}`, 1_000)).toBe('unreachable')
+    expect(await probeSakuraFrpTrustedCertificate('not a url', 1_000)).toBe('unreachable')
+  })
+
+  it('names every new failure code in the panel and the diagnostics', () => {
+    const codes = [
+      'sakurafrp_bound_domain_missing',
+      'sakurafrp_bound_domain_invalid',
+      'sakurafrp_entry_mode_invalid',
+      'sakurafrp_config_unsupported',
+      'sakurafrp_certificate_untrusted',
+    ] as const
+    for (const code of codes) {
+      for (const locale of ['zh', 'en', 'it'] as const) {
+        const text = diagnosticControllerAction(code, locale, 'fallback')
+        expect(text, `${code} ${locale}`).not.toBe('fallback')
+        expect(text.length, `${code} ${locale}`).toBeGreaterThan(10)
+      }
+      // The zh guidance exists and is Chinese, not an English fallback.
+      expect(diagnosticControllerAction(code, 'zh', 'fallback')).toMatch(/[\u4e00-\u9fff]/u)
+    }
+    expect(diagnosticControllerAction('not_a_code', 'zh', 'fallback')).toBe('fallback')
+    expect(isSakuraFrpRegistration('start proxy success')).toBe(true)
+    expect(isSakuraFrpRegistration('login to server error: dial tcp failed')).toBe(false)
+  })
+
+  it('offers a durable link, not a countdown, on the PC tab', () => {
+    for (const locale of ['zh', 'en', 'it'] as const) {
+      const copy = MOBILE_CONTROL_MESSAGES[locale] as Record<string, string>
+      const pcCopy = Object.entries(copy).filter(([key]) => key.startsWith('pc'))
+      expect(pcCopy.length).toBeGreaterThan(10)
+      for (const [key, value] of pcCopy) {
+        expect(value.trim(), `${locale}.${key}`).not.toBe('')
+        // No five-minute or expiry-countdown wording survives on this tab.
+        expect(value, `${locale}.${key}`).not.toMatch(/5\s*(分钟|minutes?|minuti)|五分钟|five[-\s]minutes?/iu)
+      }
+      expect(copy.pcRegenerateLink, locale).toBeTruthy()
+      expect(copy.pcLinkDurable, locale).toMatch(/长期有效|stays valid|does not expire|resta valido|non scade/iu)
+      expect(copy.pcLinkReady, locale).toMatch(/长期有效|stays valid|does not expire|non scade/iu)
+    }
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcRegenerateLink).toBe('重新生成链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateLink).toBe('生成访问链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcCopyLink).toBe('复制访问链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.sakuraEntryMode).toBe('公网入口证书')
+    expect(MOBILE_CONTROL_MESSAGES.zh.sakuraEntryModeTls).toBe('插件自签证书（需在电脑上安装）')
+    expect(MOBILE_CONTROL_MESSAGES.zh.sakuraEntryModeAutoHttps).toBe('SakuraFrp 自动 HTTPS（无需安装）')
+    expect(MOBILE_CONTROL_MESSAGES.zh.sakuraBoundDomain).toBe('已绑定的子域名')
+    // The trusted and untrusted notes are distinct, so the card can pick by the probe.
+    for (const locale of ['zh', 'en', 'it'] as const) {
+      const copy = MOBILE_CONTROL_MESSAGES[locale] as Record<string, string>
+      expect(copy.sakuraTrustedNote, locale).not.toBe(copy.sakuraUntrustedNote)
+      expect(copy.sakuraUntrustedNote, locale).toMatch(/尚未|not verified|non risulta/iu)
+    }
+  })
+
+  it('answers the SakuraFrp configure route with the triple and never the token', async () => {
+    const mounted = await mountPlugin()
+    const token = 'sk-route-token-0123456789'
+    const saved = await invokeRoute(mounted, 'POST', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/token`, JSON.stringify({ token }))
+    expect(saved.status, saved.body).toBe(200)
+    expect(saved.body).not.toContain(token)
+
+    const configured = await invokeRoute(mounted, 'POST', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/configure`, JSON.stringify({
+      tunnelId: 114_514,
+      entryMode: 'autoHttps',
+      boundDomain: 'dsh.demo.nyat.app',
+    }))
+    expect(configured.status, configured.body).toBe(200)
+    const payload = JSON.parse(configured.body) as { providers: { sakurafrp: Record<string, unknown> } }
+    expect(payload.providers.sakurafrp).toMatchObject({
+      entryMode: 'autoHttps',
+      boundDomain: 'dsh.demo.nyat.app',
+      trustedEntry: true,
+    })
+    expect(payload.providers.sakurafrp.configuration).toMatchObject({
+      tokenSet: true,
+      tunnelId: 114_514,
+      entryMode: 'autoHttps',
+      boundDomain: 'dsh.demo.nyat.app',
+    })
+    expect(configured.body).not.toContain(token)
+    expect(configured.body).not.toContain('sk-route-token')
+
+    // A panel typo is a 400 with the code the card already translates.
+    const badDomain = await invokeRoute(mounted, 'POST', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/configure`, JSON.stringify({
+      tunnelId: 114_514,
+      entryMode: 'autoHttps',
+      boundDomain: 'Not A Domain',
+    }))
+    expect(badDomain.status).toBe(400)
+    expect(JSON.parse(badDomain.body)).toStrictEqual({ error: 'sakurafrp_bound_domain_invalid' })
+    const badMode = await invokeRoute(mounted, 'POST', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/configure`, JSON.stringify({
+      tunnelId: 114_514,
+      entryMode: 'https',
+    }))
+    expect(badMode.status).toBe(400)
+    expect(JSON.parse(badMode.body)).toStrictEqual({ error: 'sakurafrp_entry_mode_invalid' })
+    // A blank field keeps the stored value instead of resetting the mode.
+    const kept = await invokeRoute(mounted, 'POST', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/configure`, JSON.stringify({ tunnelId: 114_514 }))
+    expect(kept.status).toBe(200)
+    expect((JSON.parse(kept.body) as { providers: { sakurafrp: Record<string, unknown> } }).providers.sakurafrp)
+      .toMatchObject({ entryMode: 'autoHttps', boundDomain: 'dsh.demo.nyat.app' })
+    // The tunnel listing never echoes the token either.
+    const tunnels = await invokeRoute(mounted, 'GET', `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/tunnels`)
+    expect(tunnels.body).not.toContain(token)
   })
 })

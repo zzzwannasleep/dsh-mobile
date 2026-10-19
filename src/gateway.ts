@@ -28,6 +28,7 @@ import {
   AccessError,
   BoundedRateLimiter,
   type DeviceSummary,
+  type RenewalResult,
   type SessionAuthorization,
 } from './access.js'
 import type { ResolvedGatewayConfig } from './config.js'
@@ -128,6 +129,17 @@ const MOBILE_LAYOUT_PATH = `${AUTH_PREFIX}/mobile-layout.js`
 const MOBILE_BOOT_BATCH_PREFIX = `${AUTH_PREFIX}/mobile-boot/`
 const MAX_MOBILE_BOOT_BATCH_BYTES = 32 * 1024 * 1024
 const MAX_MOBILE_BOOT_ENTRY_BYTES = 8 * 1024 * 1024
+
+/**
+ * Both the gateway and the access controller signal an HTTP failure by status, but
+ * they use different error classes, so a reuse path that wants to swallow only a
+ * missing or revoked device binding must test both.
+ */
+function isUnauthorized(error: unknown): boolean {
+  return error instanceof HttpError || error instanceof AccessError
+    ? error.status === 401
+    : false
+}
 /**
  * Per-merged-batch byte budget. One upstream application batch can carry dozens
  * of client bundles whose combined size exceeds the hard batch cap; the layout
@@ -1668,33 +1680,51 @@ export class MobileAccessGateway {
     }
     // A durable entry link is opened again and again by the same computer, so pairing
     // through it must not register a fresh device every time. When the request already
-    // carries a valid device binding, refresh that device's session instead. A one-time
-    // code keeps its original semantics, and a stale binding falls through to pairing.
+    // carries a device this browser owns, refresh that device's session instead. A
+    // one-time code keeps its original semantics, and a stale binding falls through.
     if (this.access.matchesEntrySecret(body.token)
       && this.renewLimiter.take(request.socket.remoteAddress ?? 'unknown', Date.now())) {
       const cookies = browserAuthCookies(request.headers.cookie)
       const bindings = this.tlsEnabled ? cookies.get(HOST_DEVICE_COOKIE) : undefined
-      if (bindings === undefined || bindings.length === 1) {
+      const bound = bindings !== undefined && bindings.length === 1 ? bindings[0] : undefined
+      const deviceTokens = cookies.get(DEVICE_COOKIE) ?? []
+      // The device token Cookie is scoped to the narrow renewal path, so a browser
+      // never sends it to this route; the `__Host-` device id is sent everywhere.
+      // Either one identifies a device this browser already owns, so try the id that
+      // arrives and then the token, and fall through to a fresh pair when neither is
+      // usable. `reusedExpiry` is set only when a probe saw the token's own lifetime.
+      let reused: RenewalResult | undefined
+      let reusedExpiry: number | undefined
+      if (bound !== undefined) {
+        reused = await this.access.renewDevice(bound).catch(error => {
+          if (!isUnauthorized(error)) throw error
+          return undefined
+        })
+      }
+      if (reused === undefined && deviceTokens.length > 0) {
         try {
           const device = authenticatedCookie(
-            cookies.get(DEVICE_COOKIE) ?? [],
+            deviceTokens,
             token => this.access.authorizeDevice(token),
-            candidate => bindings === undefined || candidate.deviceId === bindings[0],
+            candidate => bound === undefined || candidate.deviceId === bound,
           )
-          const renewed = await this.access.renew(device.value)
-          this.setSessionCookies(response, renewed, Date.now())
-          this.setBrowserDeviceBinding(response, renewed.deviceId, device.result.deviceExpiresAt)
-          sendJson(response, 200, {
-            paired: true,
-            reused: true,
-            deviceId: renewed.deviceId,
-            csrfToken: renewed.csrfToken,
-            sessionExpiresAt: renewed.sessionExpiresAt,
-          }, this.tlsEnabled)
-          return
+          reused = await this.access.renew(device.value)
+          reusedExpiry = device.result.deviceExpiresAt
         } catch (error) {
-          if (!(error instanceof HttpError) || error.status !== 401) throw error
+          if (!isUnauthorized(error)) throw error
         }
+      }
+      if (reused !== undefined) {
+        this.setSessionCookies(response, reused, Date.now())
+        if (reusedExpiry !== undefined) this.setBrowserDeviceBinding(response, reused.deviceId, reusedExpiry)
+        sendJson(response, 200, {
+          paired: true,
+          reused: true,
+          deviceId: reused.deviceId,
+          csrfToken: reused.csrfToken,
+          sessionExpiresAt: reused.sessionExpiresAt,
+        }, this.tlsEnabled)
+        return
       }
     }
     const result = await this.access.pair(request.socket.remoteAddress ?? 'unknown', body.token, body.label as string | undefined)

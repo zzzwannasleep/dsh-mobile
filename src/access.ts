@@ -405,6 +405,28 @@ export class AccessController {
     })
   }
 
+  /**
+   * Exchange the device a browser already owns for a new Session, addressed by its
+   * id. A durable entry link is opened repeatedly from the same computer and the
+   * browser only sends its `__Host-` device id to the pair route - the device token
+   * Cookie is scoped to the narrow renewal path - so reuse keys off the id that
+   * actually arrives instead of registering a duplicate device every time.
+   */
+  async renewDevice(deviceId: string): Promise<RenewalResult> {
+    this.requireInitialized()
+    return this.exclusive(async () => {
+      const now = this.now()
+      const device = this.requireDeviceId(deviceId, now)
+      const index = this.devices.indexOf(device)
+      const updated: StoredDevice = Object.freeze({ ...device, lastSeenAt: now })
+      const next = [...this.devices]
+      next[index] = updated
+      await this.store.save(this.snapshot(next))
+      this.devices = next
+      return this.createSession(device.id, now, device.expiresAt)
+    })
+  }
+
   /** Validate a persistent device credential without consuming a Session slot. */
   async probe(deviceToken: string): Promise<DeviceProbeResult> {
     this.requireInitialized()
@@ -432,6 +454,15 @@ export class AccessController {
     if (deviceToken.length > 512) throw new AccessError(401, 'authentication_failed')
     const tokenDigest = digest(deviceToken)
     const device = this.devices.find(candidate => timingSafeEqual(Buffer.from(candidate.tokenDigest, 'hex'), tokenDigest))
+    if (device === undefined) throw new AccessError(401, 'authentication_failed')
+    if (device.revokedAt !== undefined) throw new AccessError(401, 'device_revoked')
+    if (device.expiresAt <= now) throw new AccessError(401, 'device_expired')
+    return device
+  }
+
+  private requireDeviceId(deviceId: string, now: number): StoredDevice {
+    if (deviceId.length > 512) throw new AccessError(401, 'authentication_failed')
+    const device = this.devices.find(candidate => candidate.id === deviceId)
     if (device === undefined) throw new AccessError(401, 'authentication_failed')
     if (device.revokedAt !== undefined) throw new AccessError(401, 'device_revoked')
     if (device.expiresAt <= now) throw new AccessError(401, 'device_expired')

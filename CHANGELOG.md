@@ -5,6 +5,7 @@ Notable changes are recorded here. GitHub Releases provide the downloadable pack
 ## Unreleased
 
 - Add a PC client so a friend can use the owner's DSH from a Windows browser: an always-available `/mobile-access/pc` entry page with certificate guidance and a pairing form, a downloadable `dsh-mobile-pc.zip` (trust-certificate and launcher scripts, Internet shortcut, localized README), a web app manifest with a pass-through service worker and icons for installing the page as a desktop app, a `desktop.css` / `desktop.js` customization layer applied only to non-touch browsers, and a `PC 端` tab in Mobile Access for entry addresses, pairing codes and the package download. [Guide](docs/PC_CLIENT.en.md).
+- The PC pairing code accepts the raw code, the app key (`dsh1.<instance>.<code>`) or the whole entry link, so the link copied from the `PC 端` tab can be pasted as-is; the default window is now 5 minutes (`pairingTtlMs`, 10 s–15 min), the first successful pair consumes the code, and a rejected code now names the actual cause: invalid, expired or already used, too many attempts, pairing window closed, or a request the gateway refused for network or origin reasons. The PC guide also explains why a self-signed SakuraFrp TCP entry needs a trusted certificate while a cloudflared named tunnel does not.
 
 ## 0.7.4 - 2026-10-13
 

@@ -255,6 +255,9 @@ try {
     publicAuthorities: [hostname],
     allowedCidrs: ['127.0.0.0/8'],
     stateFile: resolve(directory, `${randomUUID()}.json`),
+    // The scenarios below open many pairing windows from one loopback address, so
+    // the per-source attempt limit is raised for the fixture only.
+    maxPairingAttempts: 50,
     customCssFile,
     customScriptFile,
     desktopCssFile,
@@ -499,7 +502,7 @@ try {
       }
       await new Promise(resolveWait => setTimeout(resolveWait, 500))
       const seen = layerPaths.filter(path => requests.includes(path))
-      observations.push({ mode, touchPrimary, seen, layout, session: session.name, cookies: cookies.length, documentStatus, worker })
+      observations.push({ mode, touchPrimary, seen, layout, session: session.name, cookieNames: cookies.map(cookie => cookie.name), documentStatus, worker })
       cases++
     } finally {
       await context.close()
@@ -517,6 +520,103 @@ try {
   assert.equal(touchObservation.layout.columns.split(' ').length, 1, `touch layout: ${touchObservation.layout.columns}`)
   assert.ok(touchObservation.layout.guideBottom <= touchObservation.layout.formTop + 1,
     `touch layout stacks the guidance above the form (${String(touchObservation.layout.guideBottom)} <= ${String(touchObservation.layout.formTop)})`)
+
+  // ---------------------------------- 3b. every code form a person can paste ---
+  // The owner copies the app key or the whole entry link from the panel, so the page
+  // must accept both, and a code-less link must be explained instead of posted.
+  const submitCode = async (context, code) => {
+    const page = await context.newPage()
+    const posts = []
+    page.on('request', request => {
+      try {
+        const pathname = new URL(request.url()).pathname
+        if (pathname === `${AUTH}/auth/pair`) posts.push(pathname)
+      } catch { /* data: or about: */ }
+    })
+    await page.goto(`${origin}${PC_ENTRY}`, { waitUntil: 'domcontentloaded' })
+    await page.locator('#pair-form').waitFor({ state: 'visible', timeout: 15_000 })
+    if (code !== undefined) await page.fill('#pair-token', code)
+    await page.locator('#pair-form button[type="submit"]').click()
+    return { page, posts }
+  }
+
+  const zhContext = await browser.newContext({ ignoreHTTPSErrors: true, extraHTTPHeaders: { 'accept-language': 'zh-CN,zh;q=0.9' } })
+  let freshCodeTtlMs = 0
+  try {
+    const opened = await openPairing(adminPort)
+    const remaining = opened.expiresAt - Date.now()
+    freshCodeTtlMs = remaining
+    assert.ok(remaining > 4.5 * 60_000 && remaining <= 5 * 60_000 + 5_000, `a fresh code is valid for about five minutes (${String(Math.round(remaining / 1000))}s)`)
+    const { page } = await submitCode(zhContext, opened.appKey)
+    await page.waitForURL(url => url.pathname === '/', { timeout: 15_000 })
+    const afterAppKey = await zhContext.cookies(origin)
+    const appKeySession = afterAppKey.find(cookie => SESSION_COOKIE_NAMES.includes(cookie.name))
+    assert.ok(appKeySession, 'pasting the app key pairs the PC')
+    // The same code cannot pair a second time: the page now says invalid/expired/used.
+    const again = await submitCode(zhContext, opened.appKey)
+    await again.page.waitForFunction(() => {
+      const status = document.getElementById('pair-status')
+      return status !== null && status.textContent.trim() !== ''
+    }, undefined, { timeout: 15_000 })
+    const consumedMessage = (await again.page.locator('#pair-status').textContent()).trim()
+    assert.ok(consumedMessage.includes('配对码无效、已过期或已被使用'), `consumed-code message: ${consumedMessage}`)
+    const afterReplay = await zhContext.cookies(origin)
+    assert.equal(afterReplay.find(cookie => SESSION_COOKIE_NAMES.includes(cookie.name))?.value, appKeySession.value,
+      'a consumed code does not issue a new session')
+    cases++
+  } finally {
+    await zhContext.close()
+  }
+
+  const linkContext = await browser.newContext({ ignoreHTTPSErrors: true })
+  try {
+    const opened = await openPairing(adminPort)
+    const link = `${origin}${PC_ENTRY}#key=${opened.appKey}`
+    const { page } = await submitCode(linkContext, link)
+    await page.waitForURL(url => url.pathname === '/', { timeout: 15_000 })
+    const cookies = await linkContext.cookies(origin)
+    assert.ok(cookies.some(cookie => SESSION_COOKIE_NAMES.includes(cookie.name)), 'pasting the whole entry link pairs the PC')
+    // A link without a code is explained, never posted.
+    const bare = await submitCode(linkContext, `${origin}${PC_ENTRY}`)
+    await bare.page.waitForFunction(() => {
+      const status = document.getElementById('pair-status')
+      return status !== null && status.textContent.trim() !== ''
+    }, undefined, { timeout: 15_000 })
+    const bareMessage = (await bare.page.locator('#pair-status').textContent()).trim()
+    assert.ok(/invalid, expired or already used/i.test(bareMessage), `code-less link message: ${bareMessage}`)
+    assert.deepEqual(bare.posts, [], 'a link without a code never posts to the pairing route')
+    cases++
+  } finally {
+    await linkContext.close()
+  }
+
+  // The page must render the gateway's rate limit as "too many attempts". The
+  // gateway's own 429 is covered at HTTP level in tests/pc-client.test.ts; here the
+  // response is stubbed so the browser branch is deterministic.
+  const limitedContext = await browser.newContext({ ignoreHTTPSErrors: true })
+  try {
+    const opened = await openPairing(adminPort)
+    const page = await limitedContext.newPage()
+    await page.route(`**${AUTH}/auth/pair`, route => route.fulfill({
+      status: 429,
+      contentType: 'application/json',
+      body: '{"error":"rate_limited"}',
+    }))
+    await page.goto(`${origin}${PC_ENTRY}`, { waitUntil: 'domcontentloaded' })
+    await page.locator('#pair-form').waitFor({ state: 'visible', timeout: 15_000 })
+    await page.fill('#pair-token', opened.appKey)
+    await page.locator('#pair-form button[type="submit"]').click()
+    await page.waitForFunction(() => {
+      const status = document.getElementById('pair-status')
+      return status !== null && status.textContent.trim() !== ''
+    }, undefined, { timeout: 15_000 })
+    const limitedMessage = (await page.locator('#pair-status').textContent()).trim()
+    assert.ok(/too many attempts/i.test(limitedMessage), `429 message: ${limitedMessage}`)
+    assert.equal(new URL(page.url()).pathname, PC_ENTRY, 'a rate-limited submission stays on the entry page')
+    cases++
+  } finally {
+    await limitedContext.close()
+  }
   // The PWA install path. Chromium refuses a service worker script fetched over a
   // certificate the browser has only been told to ignore, so the root scope is
   // measured on a trustworthy loopback origin, where the browser registers the very
@@ -582,11 +682,11 @@ try {
       const status = document.getElementById('pair-status')
       return status !== null && status.textContent.trim() !== ''
     }, undefined, { timeout: 15_000 })
-    const message = await replayPage.locator('#pair-status').textContent()
+    const message = (await replayPage.locator('#pair-status').textContent()).trim()
     const replayCookies = await replayContext.cookies(origin)
     assert.ok(replayRequests.some(status => status === 401 || status === 403 || status === 404), `replay status: ${replayRequests.join(',')}`)
     assert.ok(!replayCookies.some(cookie => SESSION_COOKIE_NAMES.includes(cookie.name)), 'a replayed key sets no session Cookie')
-    assert.ok(message.trim() !== '', 'the replay shows a localized failure message')
+    assert.ok(/invalid, expired or already used/i.test(message), `the replay shows the rejected-code message: ${message}`)
     cases++
   } finally {
     await replayContext.close()
@@ -719,7 +819,8 @@ try {
   console.log(`PC client smoke passed (${String(cases)} HTTPS Chromium scenarios).`)
   console.log(`layers: desktop=${desktopObservation.seen.join(',')} touch=${touchObservation.seen.join(',')}`)
   console.log(`service worker: loopback scope=${plainWorker.scopes.join(',')} · TLS origin=${desktopObservation.worker.scopes.join(',') || `refused by Chromium (${desktopObservation.worker.reason.slice(0, 90)}…)`}`)
-  console.log(`pairing: session=${desktopObservation.session} desktopColumns=${desktopObservation.layout.columns} touchColumns=${touchObservation.layout.columns}`)
+  console.log(`pairing: session=${desktopObservation.session} cookies=${desktopObservation.cookieNames.join(',')} desktopColumns=${desktopObservation.layout.columns} touchColumns=${touchObservation.layout.columns}`)
+  console.log(`pairing code: fresh window ${String(Math.round(freshCodeTtlMs / 1000))}s; app key, entry link and single-use replay all exercised in the browser`)
   console.log(`adversarial: probedQuery=${String(probed.status)} foreignHost=${String(foreignHost.status)} reboundHost=${String(rebound.status)} crossSite=${String(crossSite.status)} externalAdmin=${String(externalInfo.status)}`)
 } finally {
   await browser?.close()

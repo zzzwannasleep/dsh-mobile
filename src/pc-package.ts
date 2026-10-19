@@ -4,9 +4,10 @@
  * The archive is written by hand (STORE records, CRC-32, fixed timestamps) so
  * the plugin needs no compression dependency and identical input produces
  * byte-identical output. It never carries a pairing token, a device secret or
- * an absolute local path: the pairing window only lasts about two minutes, so
- * the README tells the friend to ask the owner for a fresh code after the page
- * is open.
+ * an absolute local path: the pairing code is short-lived (5 minutes by
+ * default, `pairingTtlMs`) and single use, so the README tells the friend to
+ * open the page first and then ask the owner for a fresh code or the whole
+ * entry link.
  */
 
 /** Entry stored without compression inside the package ZIP. */
@@ -335,8 +336,11 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
     pair: {
       title: '输入配对码',
       body: [
-        '页面会要求输入配对码。配对码在生成后约两分钟内有效，所以请先打开页面，再向主人索取。',
-        '主人在 DSH Mobile 的“PC 端”里点“生成配对码”，把显示的配对码发给你。',
+        '页面会要求输入配对码。请先打开页面，再向主人索取：配对码默认 5 分钟内有效，而且只能使用一次（主人可以在插件设置里把它改成 10 秒到 15 分钟）。',
+        '配对码被第一台设备成功使用后即失效，所以第二台电脑，或同一台电脑上的第二个浏览器，需要请主人重新生成。',
+        '输入框接受三种写法：原始配对码、应用密钥（dsh1.<实例>.<配对码>，自签远程入口是 dsh2.<实例>.<配对码>）或整条 PC 入口链接（形如 https://…/mobile-access/pc#key=…）。直接打开主人发来的链接最省事，不必手动输入。',
+        '主人在 DSH Mobile 的“PC 端”里点“生成配对码”，把配对码或链接发给你。',
+        '如果页面提示“配对码无效、已过期或已被使用”，请再向主人要一个新的；如果提示请求来源被拒绝，说明这台电脑和主人的电脑不在同一网络，或链接地址不对。',
         '配对成功后这台电脑会被记住，以后打开不需要再次输入。',
       ],
     },
@@ -390,8 +394,11 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
     pair: {
       title: 'Enter the pairing code',
       body: [
-        'The page asks for a pairing code. A code stays valid for about two minutes, so open the page first and then ask the owner for one.',
-        'In DSH Mobile the owner opens the "PC" tab, clicks "Generate pairing code", and sends you the code.',
+        'The page asks for a pairing code. Open the page first, then ask the owner: a code is valid for 5 minutes by default and can be used only once (the owner can change the time from 10 seconds to 15 minutes).',
+        'The first device to pair consumes the code, so a second PC, or a second browser on the same PC, needs a freshly generated code.',
+        'The field accepts three forms: the raw code, the app key (dsh1.<instance>.<code>, or dsh2.<instance>.<code> for a self-signed remote entry) or the whole PC entry link (shaped like https://…/mobile-access/pc#key=…). Opening the link the owner sent you is the easiest path; there is nothing to type.',
+        'In DSH Mobile the owner opens the "PC" tab, clicks "Generate pairing code", and sends you the code or the link.',
+        'If the page says the code is invalid, expired or already used, ask the owner for a new one; if it says the request source was refused, this PC and the owner\'s computer are not on the same network, or the link address is wrong.',
         'After pairing, this PC is remembered and you do not need a new code next time.',
       ],
     },
@@ -445,8 +452,11 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
     pair: {
       title: 'Inserisci il codice di abbinamento',
       body: [
-        'La pagina chiede un codice di abbinamento. Il codice resta valido circa due minuti: apri prima la pagina, poi chiedilo al proprietario.',
-        'In DSH Mobile il proprietario apre la scheda "PC", fa clic su "Genera codice di abbinamento" e ti invia il codice.',
+        'La pagina chiede il codice di abbinamento. Apri prima la pagina e poi chiedilo al proprietario: il codice vale 5 minuti per impostazione predefinita e si usa una sola volta (il proprietario può cambiare la durata da 10 secondi a 15 minuti).',
+        'Il codice viene consumato dalla prima apparecchiatura che si abbina, quindi un secondo PC, o un secondo browser sullo stesso PC, ha bisogno di un codice nuovo.',
+        'Il campo accetta tre forme: il codice grezzo, la chiave di abbinamento (dsh1.<istanza>.<codice>, oppure dsh2.<istanza>.<codice> per un ingresso remoto autofirmato) o l\'intero link di ingresso al PC (del tipo https://…/mobile-access/pc#key=…). Aprire il link che ti ha inviato il proprietario è la via più semplice: non devi digitare nulla.',
+        'In DSH Mobile il proprietario apre la scheda "PC", fa clic su "Genera codice di abbinamento" e ti invia il codice o il link.',
+        'Se la pagina dice che il codice non è valido, è scaduto o è già stato usato, chiedine uno nuovo al proprietario; se dice che l\'origine della richiesta è stata rifiutata, questo PC e il computer del proprietario non sono sulla stessa rete, oppure l\'indirizzo del link è sbagliato.',
         'Dopo l\'abbinamento questo PC viene ricordato e non serve un nuovo codice.',
       ],
     },

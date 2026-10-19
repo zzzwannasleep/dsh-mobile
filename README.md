@@ -186,7 +186,7 @@ cloudflared 命名隧道使用 Cloudflare 账号令牌，能保留重启后不�
 
 ### PC 端（Windows 浏览器）
 
-朋友在自己的 Windows 电脑上不需要安装 DSH 或客户端程序：在 **移动访问 → PC 端** 点击 **生成配对码**、**下载 PC 安装包**，把 `dsh-mobile-pc.zip` 发给他；他解压后按需信任证书、运行启动脚本并输入配对码，就能在浏览器里使用同一份 DSH，浏览器支持时还可以把入口页安装成桌面应用。PC 使用独立的 `desktop.css` / `desktop.js` 定制层，与手机端的 `mobile.css` / `mobile.js` 互斥。完整步骤、证书与撤销说明见 [PC 端指南](docs/PC_CLIENT.md)。
+朋友在自己的 Windows 电脑上不需要安装 DSH 或客户端程序：在 **移动访问 → PC 端** 点击 **生成配对码**、**下载 PC 安装包**，把 `dsh-mobile-pc.zip` 发给他；他解压后按需信任证书、运行启动脚本并输入配对码，就能在浏览器里使用同一份 DSH，浏览器支持时还可以把入口页安装成桌面应用。配对码默认 5 分钟内有效、被第一台设备使用后即失效，直接发送面板里复制的 PC 入口链接最省事（输入框也接受配对码或应用密钥）；证书只在自签入口需要：cloudflared 命名隧道用 Cloudflare 边缘证书，SakuraFrp 只支持 TCP 隧道、由插件私有 CA 在本机终结 TLS。PC 使用独立的 `desktop.css` / `desktop.js` 定制层，与手机端的 `mobile.css` / `mobile.js` 互斥。完整步骤、证书与撤销说明见 [PC 端指南](docs/PC_CLIENT.md)。
 
 这是待发布功能，随下一个插件版本提供；现有局域网、远程通道与 Android App 不受影响。
 

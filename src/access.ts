@@ -132,6 +132,48 @@ function matchesDigest(value: string, expected: Buffer): boolean {
   return timingSafeEqual(digest(value), expected)
 }
 
+function readPairingParameter(source: string): string | undefined {
+  if (source === '') return undefined
+  for (const part of source.split('&')) {
+    const separator = part.indexOf('=')
+    if (separator <= 0) continue
+    const name = part.slice(0, separator)
+    if (name !== 'key' && name !== 'token') continue
+    const raw = part.slice(separator + 1)
+    try {
+      return decodeURIComponent(raw)
+    } catch {
+      return raw
+    }
+  }
+  return undefined
+}
+
+/**
+ * Accept one pairing secret in every form a person can realistically paste: the
+ * raw code, an app key (`dsh1.<instance>.<code>`) or an entry link that carries
+ * `key`/`token` in its fragment or query. Values that match none of those are
+ * returned trimmed, so an unrelated string still fails the digest comparison
+ * instead of being silently rewritten. Never throws.
+ */
+export function normalizePairingToken(value: string): string {
+  let candidate = value.trim()
+  if (candidate === '') return ''
+  const wrapped = /^["'`<([{]+([\s\S]*?)["'`>)\]}]+$/u.exec(candidate)
+  if (wrapped !== null) candidate = wrapped[1]!.trim()
+  const hash = candidate.indexOf('#')
+  const query = candidate.indexOf('?')
+  if (hash !== -1 || query !== -1) {
+    const fragment = hash === -1 ? '' : candidate.slice(hash + 1)
+    const search = query === -1 ? '' : candidate.slice(query + 1, hash === -1 ? undefined : hash)
+    const carried = readPairingParameter(fragment) ?? readPairingParameter(search)
+    if (carried !== undefined && carried !== '') candidate = carried
+  }
+  const appKey = /^dsh\d+\.[^.]+\.([\s\S]+)$/u.exec(candidate)
+  if (appKey !== null) candidate = appKey[1]!
+  return candidate.trim()
+}
+
 function normalizeLabel(value: string | undefined): string {
   const label = (value ?? 'Mobile device').normalize('NFC').trim()
   if (label.length < 1 || label.length > 64 || /[\u0000-\u001f\u007f]/u.test(label)) {
@@ -268,9 +310,11 @@ export class AccessController {
     const now = this.now()
     if (!this.pairLimiter.take(sourceKey, now)) throw new AccessError(429, 'rate_limited')
     if (token.length > 512) throw new AccessError(401, 'authentication_failed')
+    const secret = normalizePairingToken(token)
+    if (secret.length > 512) throw new AccessError(401, 'authentication_failed')
     return this.exclusive(async () => {
       const window = this.pairingWindow
-      if (window === undefined || window.expiresAt <= now || !matchesDigest(token, window.digest)) {
+      if (window === undefined || window.expiresAt <= now || !matchesDigest(secret, window.digest)) {
         if (window !== undefined && window.expiresAt <= now) this.pairingWindow = undefined
         throw new AccessError(401, 'authentication_failed')
       }

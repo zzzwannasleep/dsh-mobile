@@ -25,6 +25,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it } from 'vitest'
+import { normalizePairingToken } from '../src/access.js'
+import { extractPairingToken } from '../src/auth-pages.js'
 import { parseGatewayConfig } from '../src/config.js'
 import { MobileAccessService } from '../src/extensions.js'
 import { MobileAccessGateway, type PcClientChannel, type PcClientSource } from '../src/gateway.js'
@@ -62,6 +64,15 @@ interface PcFixture {
 interface PcFixtureOptions {
   readonly channels?: readonly PcClientChannel[]
   readonly certificate?: { readonly name: string; readonly body: Buffer }
+  /** Pairing attempts allowed per loopback source; raised for the multi-form tests. */
+  readonly maxPairingAttempts?: number
+}
+
+interface OpenedPairing {
+  readonly token: string
+  readonly appKey: string
+  readonly pairUrl: string
+  readonly expiresAt: number
 }
 
 interface ZipEntryRead {
@@ -182,6 +193,19 @@ function pngSize(body: Buffer): { readonly width: number; readonly height: numbe
   return { width: body.readUInt32BE(16), height: body.readUInt32BE(20) }
 }
 
+function baseGatewayOptions(directory: string, upstreamPort: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    listenHost: '127.0.0.1',
+    listenPort: 0,
+    upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`,
+    publicAuthorities: ['127.0.0.1'],
+    allowedCidrs: ['127.0.0.0/8'],
+    stateFile: join(directory, 'devices.json'),
+    tls: { mode: 'disabled' },
+    ...extra,
+  }
+}
+
 async function createFixture(options: PcFixtureOptions = {}): Promise<PcFixture> {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-pc-client-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -197,15 +221,10 @@ async function createFixture(options: PcFixtureOptions = {}): Promise<PcFixture>
   const desktopScriptFile = join(directory, 'desktop.js')
   await writeFile(desktopCssFile, ':root { --pc-layer-fixture: first; }\n', 'utf8')
   await writeFile(desktopScriptFile, 'window.dshMobile?.registerDesktop?.(() => undefined)\n', 'utf8')
-  const gateway = new MobileAccessGateway(parseGatewayConfig({
-    listenHost: '127.0.0.1',
-    listenPort: 0,
-    upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`,
-    publicAuthorities: ['127.0.0.1'],
-    allowedCidrs: ['127.0.0.0/8'],
-    stateFile: join(directory, 'devices.json'),
-    tls: { mode: 'disabled' },
-  }), new MemoryDeviceStore(), new MobileAccessService(context))
+  const gateway = new MobileAccessGateway(parseGatewayConfig(baseGatewayOptions(directory, upstreamPort, {
+    // The pairing-form tests open many windows from one loopback address.
+    maxPairingAttempts: options.maxPairingAttempts ?? 50,
+  })), new MemoryDeviceStore(), new MobileAccessService(context))
   await gateway.start()
   cleanups.push(() => gateway.close())
   // Mirror src/plugin.ts: the LAN control prefix, the PC prefix and the bare
@@ -258,14 +277,33 @@ function adminHeaders(fixture: PcFixture, extra: Record<string, string> = {}): R
   }
 }
 
-async function openPairing(fixture: PcFixture): Promise<{ readonly token: string; readonly appKey: string; readonly pairUrl: string }> {
+async function openPairing(fixture: PcFixture): Promise<OpenedPairing> {
   const result = await request(fixture.adminPort, PAIRING_OPEN_PATH, {
     method: 'POST',
     headers: adminHeaders(fixture, { 'content-type': 'application/json' }),
     body: '{}',
   })
   expect(result.status, `pairing open body: ${result.body}`).toBe(201)
-  return JSON.parse(result.body) as { token: string; appKey: string; pairUrl: string }
+  return JSON.parse(result.body) as OpenedPairing
+}
+
+/** Open a window with an explicit requested TTL, for the configured-ceiling probe. */
+async function openPairingWithTtl(fixture: PcFixture, ttlMs: number): Promise<HttpResult> {
+  return request(fixture.adminPort, PAIRING_OPEN_PATH, {
+    method: 'POST',
+    headers: adminHeaders(fixture, { 'content-type': 'application/json' }),
+    body: JSON.stringify({ ttlMs }),
+  })
+}
+
+/** The instance id inside `dsh<N>.<instance>.<token>`. */
+function appKeyInstance(appKey: string): string {
+  return appKey.split('.')[1] ?? ''
+}
+
+/** The secret inside `dsh<N>.<instance>.<token>`. */
+function appKeySecret(appKey: string): string {
+  return appKey.split('.').slice(2).join('.')
 }
 
 async function pairBrowser(fixture: PcFixture, token: string): Promise<HttpResult> {
@@ -616,13 +654,107 @@ describe('PC client routes', () => {
     expect(typeof parsed.legacy?.desktopScriptRevision).toBe('string')
     expect(typeof parsed.legacy?.desktopStyleRevision).toBe('string')
 
-    // The pairing token is single-use; the app key is never accepted as a token.
+    // The window is single-use: the same window cannot pair a second device, and
+    // the app key carries the same secret, so it is only a second *form*, not a
+    // second credential.
     const replay = await pairBrowser(fixture, opened.token)
-    expect(replay.status).toBeGreaterThanOrEqual(400)
+    expect(replay.status).toBe(401)
     expect(cookiesByName(replay.headers).has(SESSION_COOKIE)).toBe(false)
-    const appKeyAttempt = await pairBrowser(fixture, opened.appKey)
-    expect(appKeyAttempt.status).toBeGreaterThanOrEqual(400)
-    expect(cookiesByName(appKeyAttempt.headers).has(SESSION_COOKIE)).toBe(false)
+    const appKeyReplay = await pairBrowser(fixture, opened.appKey)
+    expect(appKeyReplay.status).toBe(401)
+    expect(cookiesByName(appKeyReplay.headers).has(SESSION_COOKIE)).toBe(false)
+  })
+
+  it('pairs with the app key, a whole entry link or a wrapped code, each exactly once', async () => {
+    const fixture = await createFixture()
+    const forms: ReadonlyArray<{ readonly name: string; readonly code: (opened: OpenedPairing) => string }> = [
+      { name: 'raw token', code: opened => opened.token },
+      { name: 'app key', code: opened => opened.appKey },
+      { name: 'entry link with #key', code: opened => `${fixture.origin}${PC_ENTRY_PATH}#key=${opened.appKey}` },
+      { name: 'entry link with #instance and #token', code: opened => `${fixture.origin}/mobile-access/pair#instance=${appKeyInstance(opened.appKey)}&token=${opened.token}` },
+      { name: 'query link', code: opened => `${fixture.origin}${PC_ENTRY_PATH}?token=${opened.token}` },
+      { name: 'quoted app key', code: opened => `"${opened.appKey}"` },
+      { name: 'padded app key', code: opened => `  ${opened.appKey}\n` },
+    ]
+    for (const form of forms) {
+      const opened = await openPairing(fixture)
+      const paired = await pairBrowser(fixture, form.code(opened))
+      expect(paired.status, `${form.name}: ${paired.body}`).toBe(201)
+      expect(cookiesByName(paired.headers).has(SESSION_COOKIE), form.name).toBe(true)
+      expect(cookiesByName(paired.headers).has(DEVICE_COOKIE), form.name).toBe(true)
+      const replay = await pairBrowser(fixture, form.code(opened))
+      expect(replay.status, `${form.name} replay: ${replay.body}`).toBe(401)
+    }
+  })
+
+  it('treats the instance id as a label and the secret as the credential', async () => {
+    const fixture = await createFixture()
+    const opened = await openPairing(fixture)
+    const wrongSecret = await pairBrowser(fixture, `dsh1.${appKeyInstance(opened.appKey)}.${'A'.repeat(43)}`)
+    expect(wrongSecret.status, `wrong secret: ${wrongSecret.body}`).toBe(401)
+    // A failed attempt must not consume the window that is still open.
+    expect((await pairBrowser(fixture, opened.token)).status).toBe(201)
+
+    const other = await openPairing(fixture)
+    const foreignInstance = await pairBrowser(fixture, `dsh9.some-other-instance.${appKeySecret(other.appKey)}`)
+    expect(foreignInstance.status, `foreign instance: ${foreignInstance.body}`).toBe(201)
+    expect(cookiesByName(foreignInstance.headers).has(SESSION_COOKIE)).toBe(true)
+  })
+
+  it('answers repeated pairing attempts with a 429 the entry page can explain', async () => {
+    const fixture = await createFixture({ maxPairingAttempts: 2 })
+    await openPairing(fixture)
+    expect((await pairBrowser(fixture, 'wrong-code-one')).status).toBe(401)
+    expect((await pairBrowser(fixture, 'wrong-code-two')).status).toBe(401)
+    expect((await pairBrowser(fixture, 'wrong-code-three')).status).toBe(429)
+    for (const [language, message] of [['zh-CN', '尝试次数过多'], ['en-US', 'Too many attempts'], ['it-IT', 'Troppi tentativi']] as const) {
+      const script = await request(fixture.port, PC_ENTRY_SCRIPT_PATH, {
+        headers: { host: new URL(fixture.origin).host, 'accept-language': language },
+      })
+      expect(script.status).toBe(200)
+      expect(script.body, language).toContain('429')
+      expect(script.body, language).toContain(message)
+    }
+  })
+
+  it('pins the five-minute pairing window and the configured ceiling', async () => {
+    const defaults = parseGatewayConfig(baseGatewayOptions(tmpdir(), 1)) as { pairingTtlMs: number }
+    expect(defaults.pairingTtlMs).toBe(300_000)
+    expect(() => parseGatewayConfig(baseGatewayOptions(tmpdir(), 1, { pairingTtlMs: 9_999 }))).toThrow()
+    expect(() => parseGatewayConfig(baseGatewayOptions(tmpdir(), 1, { pairingTtlMs: 900_001 }))).toThrow()
+    expect((parseGatewayConfig(baseGatewayOptions(tmpdir(), 1, { pairingTtlMs: 900_000 })) as { pairingTtlMs: number }).pairingTtlMs).toBe(900_000)
+
+    const fixture = await createFixture()
+    const opened = await openPairing(fixture)
+    const remaining = opened.expiresAt - Date.now()
+    expect(remaining).toBeGreaterThan(4.5 * 60_000)
+    expect(remaining).toBeLessThanOrEqual(5 * 60_000 + 5_000)
+    // A request may shorten the window but never exceed the configured value.
+    expect((await openPairingWithTtl(fixture, 300_000)).status).toBe(201)
+    expect((await openPairingWithTtl(fixture, 300_001)).status).toBe(400)
+    expect((await openPairingWithTtl(fixture, 9_999)).status).toBe(400)
+  })
+
+  it('extracts the code from every paste form and normalizes it server-side', () => {
+    const token = 'Zm9vYmFyLXRva2VuLTAxMjM0NTY3ODlBQkNERUY'
+    const appKey = `dsh1.${'a'.repeat(64)}.${token}`
+    const link = `https://192.168.1.7:3443${PC_ENTRY_PATH}#key=${appKey}`
+    expect(extractPairingToken(token)).toBe(token)
+    expect(extractPairingToken(appKey)).toBe(token)
+    expect(extractPairingToken(link)).toBe(token)
+    expect(extractPairingToken(`  ${link}\n`)).toBe(token)
+    expect(extractPairingToken(`"${appKey}"`)).toBe(token)
+    expect(extractPairingToken(`dsh2.${'b'.repeat(64)}.${token}`)).toBe(token)
+    // A link without a code yields nothing, so the page explains instead of posting.
+    expect(extractPairingToken(`https://192.168.1.7:3443${PC_ENTRY_PATH}`)).toBe('')
+    expect(extractPairingToken('')).toBe('')
+    expect(extractPairingToken('   ')).toBe('')
+    expect(normalizePairingToken(appKey)).toBe(token)
+    expect(normalizePairingToken(link)).toBe(token)
+    expect(normalizePairingToken(`<${link}>`)).toBe(token)
+    expect(normalizePairingToken(token)).toBe(token)
+    // An unrelated string is returned unchanged so the digest compare still fails.
+    expect(normalizePairingToken('not-a-code')).toBe('not-a-code')
   })
 
   it('keeps a revoked device refused on the mobile gateway origin', async () => {

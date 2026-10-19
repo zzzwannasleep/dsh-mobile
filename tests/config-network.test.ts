@@ -253,6 +253,20 @@ describe('gateway configuration', () => {
     })).toThrow(/sessionTtlMs must not exceed deviceTtlMs/)
   })
 
+  it('keeps the pairing window at five minutes by default and caps it at fifteen', () => {
+    const base = { stateFile, controlFile, initiallyEnabled: false, tls: { mode: 'disabled' as const } }
+    expect(parseGatewayConfig(base).pairingTtlMs).toBe(300_000)
+    expect(parseGatewayConfig({ ...base, pairingTtlMs: 10_000 }).pairingTtlMs).toBe(10_000)
+    expect(parseGatewayConfig({ ...base, pairingTtlMs: 900_000 }).pairingTtlMs).toBe(900_000)
+    for (const pairingTtlMs of [9_999, 900_001, 0, -1, 1.5, Number.NaN, '300000']) {
+      expect(() => parseGatewayConfig({ ...base, pairingTtlMs })).toThrow(/pairingTtlMs must be an integer from 10000 through 900000/u)
+    }
+    // The Loader schema exposes the same plain integer field, so the panel's config
+    // card cannot smuggle a value past the range check.
+    expect(Config({ ...base, pairingTtlMs: 900_000 }).pairingTtlMs).toBe(900_000)
+    expect(() => Config({ ...base, pairingTtlMs: -1 })).toThrow()
+  })
+
   it('accepts a loopback-only HTTP development listener', () => {
     const config = parseGatewayConfig({
       listenHost: '127.0.0.1',

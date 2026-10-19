@@ -761,6 +761,8 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   }
   const locale = selectedMobileControlLocale()
   const localeTag = locale === 'it' ? 'it-IT' : locale === 'zh' ? 'zh-CN' : 'en-US'
+  /** Locale-aware date and time for every expiry the panel shows. */
+  const formatTime = (ms: unknown): string => typeof ms === 'number' ? new Date(ms).toLocaleString(localeTag) : ''
   const t = controlTranslator(locale)
   const lifecycle = new AbortController()
   const controlRequestJson = (path: string, init?: RequestInit, timeoutMs?: number): Promise<Record<string, unknown>> => requestJson(path, { ...init, signal: lifecycle.signal }, timeoutMs)
@@ -1178,20 +1180,23 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const pcPair = element('button', 'dsh-mobile-control__primary'); pcPair.type = 'button'; pcPair.textContent = t('pcGenerateKey'); pcPair.disabled = true
   const pcPackage = element('button', 'dsh-mobile-control__secondary'); pcPackage.type = 'button'; pcPackage.textContent = t('pcDownloadPackage'); pcPackage.disabled = true
   pcActions.append(pcPair, pcPackage)
+  const pcSingleUse = element('p', 'dsh-mobile-control__component-note'); pcSingleUse.textContent = t('pcKeySingleUse')
   const pcPairResult = element('div', 'dsh-mobile-control__pc-pair'); pcPairResult.hidden = true
   const pcPairKeyRow = element('div', 'dsh-mobile-control__pc-pair-row')
   const pcPairKeyLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairKeyLabel.textContent = t('pcAppKeyLabel')
   const pcPairKeyValueRow = element('div', 'dsh-mobile-control__pc-pair-value-row')
   const pcPairKeyValue = element('code', 'dsh-mobile-control__pc-pair-value')
   const pcPairKeyCopy = element('button', 'dsh-mobile-control__pc-copy'); pcPairKeyCopy.type = 'button'; pcPairKeyCopy.textContent = t('pcCopyKey')
-  pcPairKeyCopy.addEventListener('click', () => { void copyPcText(pcPairKeyValue.textContent ?? '', t('pcKeyCopied'), t('pcAppKeyLabel')) })
+  pcPairKeyCopy.addEventListener('click', () => { void copyPcText(pcPairKeyValue.textContent ?? '', t('pcKeyCopied'), t('pairingKey')) })
   pcPairKeyValueRow.append(pcPairKeyValue, pcPairKeyCopy)
   pcPairKeyRow.append(pcPairKeyLabel, pcPairKeyValueRow)
   const pcPairLinkRow = element('div', 'dsh-mobile-control__pc-pair-row')
   const pcPairLinkLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairLinkLabel.textContent = t('pcEntryLinkLabel')
   const pcPairLinkValue = element('code', 'dsh-mobile-control__pc-pair-value')
   pcPairLinkRow.append(pcPairLinkLabel, pcPairLinkValue)
-  pcPairResult.append(pcPairKeyRow, pcPairLinkRow)
+  // The window is a single five-minute one, so its exact end belongs next to the code.
+  const pcPairExpiry = element('p', 'dsh-mobile-control__pc-pair-note'); pcPairExpiry.hidden = true
+  pcPairResult.append(pcPairKeyRow, pcPairLinkRow, pcPairExpiry)
   const pcCertificate = element('p', 'dsh-mobile-control__component-note dsh-mobile-control__pc-certificate'); pcCertificate.hidden = true
   const pcCertificateNote = element('span'); pcCertificateNote.textContent = `${t('pcCertificateNote')} `
   const pcCertificateLink = element('a', 'dsh-mobile-control__text-link'); pcCertificateLink.textContent = t('pcDownloadCertificate'); pcCertificateLink.setAttribute('download', 'dsh-mobile-ca.cer'); pcCertificateLink.rel = 'noopener'
@@ -1201,7 +1206,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     const step = element('li'); step.textContent = t(stepKey); pcSteps.append(step)
   }
   const pcStatus = element('p', 'dsh-mobile-control__status'); pcStatus.setAttribute('role', 'status'); pcStatus.setAttribute('aria-live', 'polite')
-  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcActions, pcPairResult, pcCertificate, pcSteps, pcStatus)
+  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcActions, pcSingleUse, pcPairResult, pcCertificate, pcSteps, pcStatus)
   let pcChannels: readonly PcClientChannel[] = []
   let pcActiveChannel: 'lan' | 'remote' | '' = ''
   let pcEntryPath = PC_ENTRY_PATH_FALLBACK
@@ -1245,7 +1250,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       })
       const copy = element('button', 'dsh-mobile-control__pc-copy'); copy.type = 'button'; copy.textContent = t('pcCopyUrl')
       copy.setAttribute('aria-label', t('pcCopyUrlAria', { channel: pcChannelName(entry.channel) }))
-      copy.addEventListener('click', () => { void copyPcText(entry.entryUrl, t('pcUrlCopied'), t('pcEntryLinkLabel')) })
+      copy.addEventListener('click', () => { void copyPcText(entry.entryUrl, t('pcUrlCopied'), t('pairingLink')) })
       row.append(choice, copy)
       pcChannelList.append(row)
     }
@@ -1286,10 +1291,15 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       const appKey = typeof data.appKey === 'string' ? data.appKey : ''
       if (appKey === '') { pcStatus.textContent = t('keyGenerationFailed'); return }
       const entryUrl = `${channelInfo.origin}${pcEntryPath}#key=${encodeURIComponent(appKey)}`
+      // The window ends at a server-chosen instant, so the panel shows that instant
+      // rather than assuming the configured default.
+      const expiresAt = typeof data.expiresAt === 'number' && Number.isFinite(data.expiresAt) && data.expiresAt > 0 ? data.expiresAt : 0
       pcPairKeyValue.textContent = appKey
       pcPairLinkValue.textContent = entryUrl
+      pcPairExpiry.textContent = expiresAt === 0 ? '' : t('pcKeyExpires', { time: formatTime(expiresAt) })
+      pcPairExpiry.hidden = expiresAt === 0
       pcPairResult.hidden = false
-      await copyPcText(entryUrl, t('pcKeyReady'), t('pcEntryLinkLabel'))
+      await copyPcText(entryUrl, t('pcKeyReady'), t('pairingLink'))
     }, error => { pcStatus.textContent = t('requestFailed', { error: String(error) }) }).finally(() => {
       pcBusy = false
       syncPcControls()
@@ -1611,7 +1621,6 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     })
   }
   toggle.addEventListener('click', () => { toggle.disabled = true; void controlRequestJson('/api/mobile-access/lan/control', { method: 'POST', body: JSON.stringify({ running: !running }) }).then(render, error => { status.textContent = t('requestFailed', { error: String(error) }) }).finally(() => { toggle.disabled = false }) })
-  const formatTime = (ms: unknown): string => typeof ms === 'number' ? new Date(ms).toLocaleString(localeTag) : ''
   const formatMegabytes = (bytes: number): string => new Intl.NumberFormat(localeTag, { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(bytes / 1024 / 1024)
   const renderDevices = (data: Record<string, unknown>): void => {
     const devices = Array.isArray(data.devices) ? data.devices as Record<string, unknown>[] : []
@@ -3564,6 +3573,7 @@ export const CONTROL_STYLES = `
 .dsh-mobile-control__pc-pair{display:grid;gap:7px;margin:0 0 12px;padding:10px;border:1px solid var(--dsw-alias-border-l2,#dbe1e8);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#f8fafc)}
 .dsh-mobile-control__pc-pair-row{display:grid;gap:2px;min-width:0}
 .dsh-mobile-control__pc-pair-value-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px}
+.dsh-mobile-control__pc-pair-note{margin:0;color:var(--dsw-alias-label-secondary,#606873);font-size:11px;line-height:1.5}
 .dsh-mobile-control__pc-pair-label{color:var(--dsw-alias-label-secondary,#606873);font-size:11px}
 .dsh-mobile-control__pc-pair-value{overflow-wrap:anywhere;color:var(--dsw-alias-label-primary,#16181d);font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .dsh-mobile-control__pc-certificate{margin:0 0 12px;overflow-wrap:anywhere}

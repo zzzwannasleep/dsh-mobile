@@ -11,6 +11,9 @@ interface AuthPageCopy {
   readonly pairing: string
   readonly pairFailed: string
   readonly pairingWindowClosed: string
+  readonly pairingCodeInvalid: string
+  readonly pairingSourceRefused: string
+  readonly pairingRateLimited: string
   readonly unavailable: string
   readonly reconnectTitle: string
   readonly reconnectHeading: string
@@ -24,7 +27,10 @@ const COPY: Record<AuthPageLocale, AuthPageCopy> = {
     lang: 'en', pairTitle: 'Pair DSH mobile access', pairHeading: 'Pair this device',
     pairingCode: 'Pairing code', deviceName: 'Device name', pair: 'Pair', pairing: 'Pairing…',
     pairFailed: 'Pairing failed',
-    pairingWindowClosed: 'This pairing code is no longer valid. The pairing window on the computer stays open for about two minutes — ask the owner for a fresh code.',
+    pairingWindowClosed: 'The pairing window on the computer is closed. It stays open for 5 minutes by default — ask the owner to open pairing again and send a fresh code.',
+    pairingCodeInvalid: 'This pairing code is invalid, expired or already used. Generate a new one in DSH (valid for 5 minutes by default and single use).',
+    pairingSourceRefused: 'The gateway refused where this request came from — this is not about the pairing code. Check that this PC and the host are on the same local network, or use the remote entry or the correct link address.',
+    pairingRateLimited: 'Too many attempts. Wait a moment and try again.',
     unavailable: 'The computer is unavailable.',
     reconnectTitle: 'Reconnect DSH mobile access', reconnectHeading: 'Reconnect this device',
     restoring: 'Restoring the secure Session…', noLongerPaired: 'This device is no longer paired. Open pairing on the computer, then pair it again.',
@@ -34,7 +40,10 @@ const COPY: Record<AuthPageLocale, AuthPageCopy> = {
     lang: 'zh-CN', pairTitle: '配对 DSH 移动访问', pairHeading: '配对此设备',
     pairingCode: '配对码', deviceName: '设备名称', pair: '配对', pairing: '正在配对…',
     pairFailed: '配对失败',
-    pairingWindowClosed: '这个配对码已失效。电脑上的配对窗口只开放约两分钟，请向电脑的主人要一个新的配对码。',
+    pairingWindowClosed: '电脑上的配对窗口已关闭。窗口默认只开放 5 分钟，请让电脑的主人重新打开配对，并发来一个新的配对码。',
+    pairingCodeInvalid: '配对码无效、已过期或已被使用。请在 DSH 里重新生成（默认 5 分钟有效，只能使用一次）。',
+    pairingSourceRefused: '网关拒绝了这次请求的来源（不是配对码的问题）：请确认这台电脑和主机在同一局域网，或改用远程入口/正确的链接地址。',
+    pairingRateLimited: '尝试次数过多，请稍等一会儿再试。',
     unavailable: '电脑当前不可用。',
     reconnectTitle: '重新连接 DSH 移动访问', reconnectHeading: '重新连接此设备',
     restoring: '正在恢复安全会话…', noLongerPaired: '此设备已不在配对列表中。请在电脑端打开配对，然后重新配对。',
@@ -44,7 +53,10 @@ const COPY: Record<AuthPageLocale, AuthPageCopy> = {
     lang: 'it-IT', pairTitle: 'Abbina accesso mobile DSH', pairHeading: 'Abbina questo dispositivo',
     pairingCode: 'Codice di abbinamento', deviceName: 'Nome dispositivo', pair: 'Abbina', pairing: 'Abbinamento…',
     pairFailed: 'Abbinamento non riuscito',
-    pairingWindowClosed: 'Questo codice di abbinamento non è più valido. La finestra di abbinamento sul computer resta aperta circa due minuti: chiedi al proprietario un nuovo codice.',
+    pairingWindowClosed: 'La finestra di abbinamento sul computer è chiusa. Resta aperta 5 minuti per impostazione predefinita: chiedi al proprietario di riaprire l’abbinamento e inviarti un nuovo codice.',
+    pairingCodeInvalid: 'Il codice di abbinamento non è valido, è scaduto o è già stato usato. Generane uno nuovo in DSH (valido 5 minuti per impostazione predefinita, monouso).',
+    pairingSourceRefused: 'Il gateway ha rifiutato l’origine di questa richiesta — non dipende dal codice di abbinamento. Verifica che questo PC e l’host siano sulla stessa rete locale, oppure usa l’ingresso remoto o l’indirizzo di link corretto.',
+    pairingRateLimited: 'Troppi tentativi. Attendi un momento e riprova.',
     unavailable: 'Il computer non è disponibile.',
     reconnectTitle: 'Riconnetti accesso mobile DSH', reconnectHeading: 'Riconnetti questo dispositivo',
     restoring: 'Ripristino della sessione sicura…', noLongerPaired: 'Questo dispositivo non è più abbinato. Apri l’abbinamento sul computer e ripeti la procedura.',
@@ -89,11 +101,11 @@ const PC_COPY: Record<AuthPageLocale, PcEntryCopy> = {
     trustWarning: 'Open the downloaded file and confirm the security prompt, then reopen this page.',
     trustWindows: 'Open the downloaded file, confirm the Windows security prompt, then close and reopen this tab.',
     codeTitle: 'Enter the pairing code',
-    codeBody: 'Ask the owner for the pairing code and type it on the right. It stays valid for about two minutes, so ask for a fresh one whenever it expires.',
+    codeBody: 'Ask the owner for the pairing code and paste it on the right. A code is valid for 5 minutes by default and can be used once, so ask for a fresh one whenever it expires.',
     installTitle: 'Install it as a desktop app (optional)',
     installBody: 'In Edge or Chrome open the ⋯ menu and choose Apps → Install this site as an app. When the browser offers the install, a button appears below the form.',
     formTitle: 'Pair this PC',
-    formHelp: 'Paste the code exactly as the owner sent it.',
+    formHelp: 'Paste the pairing code, the pairing key or the whole link the owner sent.',
     devicePlaceholder: 'This PC',
     installButton: 'Install as desktop app',
     installHint: 'Installing adds a Start-menu entry and an app window; nothing else on the computer changes.',
@@ -112,11 +124,11 @@ const PC_COPY: Record<AuthPageLocale, PcEntryCopy> = {
     trustWarning: '打开下载的文件并确认安全提示，然后重新打开本页面。',
     trustWindows: '打开下载的文件，确认 Windows 的安全提示，然后关闭并重新打开本标签页。',
     codeTitle: '输入配对码',
-    codeBody: '向电脑的主人索取配对码，填在右侧。配对码只有约两分钟有效期，过期后请再要一个新的。',
+    codeBody: '向电脑的主人索取配对码，粘贴在右侧。配对码默认 5 分钟内有效，且只能使用一次；过期后请再要一个新的。',
     installTitle: '可选：安装为桌面应用',
     installBody: '在 Edge 或 Chrome 中打开 ⋯ 菜单，选择“应用 → 将此站点作为应用安装”。浏览器支持安装时，表单下方会出现按钮。',
     formTitle: '配对此电脑',
-    formHelp: '请粘贴主人发给你的配对码。',
+    formHelp: '粘贴主人发来的配对码、配对密钥或整条链接都可以。',
     devicePlaceholder: '这台电脑',
     installButton: '安装为桌面应用',
     installHint: '安装后会多一个开始菜单入口和独立窗口，电脑上的其他内容不变。',
@@ -135,11 +147,11 @@ const PC_COPY: Record<AuthPageLocale, PcEntryCopy> = {
     trustWarning: 'Apri il file scaricato e conferma l’avviso di sicurezza, poi riapri questa pagina.',
     trustWindows: 'Apri il file scaricato, conferma l’avviso di sicurezza di Windows, poi chiudi e riapri questa scheda.',
     codeTitle: 'Inserisci il codice di abbinamento',
-    codeBody: 'Chiedi il codice al proprietario e scrivilo a destra. Dura circa due minuti: quando scade, chiedine uno nuovo.',
+    codeBody: 'Chiedi il codice di abbinamento al proprietario e incollalo a destra. Il codice vale 5 minuti per impostazione predefinita e si usa una sola volta: se scade, chiedine uno nuovo.',
     installTitle: 'Installa come app desktop (facoltativo)',
     installBody: 'In Edge o Chrome apri il menu ⋯ e scegli App → Installa questo sito come app. Quando il browser lo propone, sotto il modulo compare un pulsante.',
     formTitle: 'Abbina questo PC',
-    formHelp: 'Incolla il codice esattamente come lo ha inviato il proprietario.',
+    formHelp: 'Incolla il codice, la chiave di abbinamento o il link completo inviato dal proprietario.',
     devicePlaceholder: 'Questo PC',
     installButton: 'Installa come app desktop',
     installHint: 'L’installazione aggiunge una voce nel menu Start e una finestra dedicata; il resto del computer non cambia.',
@@ -188,6 +200,33 @@ export function parsePairFragment(hash: string): PairFragment {
     return { token: keyToken, instance: keyInstance }
   }
   return instance === '' ? {} : { instance }
+}
+
+/**
+ * Extract the raw pairing token from whatever a person pasted into the code field:
+ * the token itself, an app key (`dsh1.<instance>.<token>` / `dsh2.…`) or a link that
+ * carries `key`/`token` in its fragment or query. Surrounding whitespace and quotes are
+ * removed. An input that looks like a link but carries no code yields `''`, so the page
+ * can explain the code instead of posting a value that cannot match.
+ * The body stays self-contained apart from `parsePairFragment`, which `renderPairScript`
+ * embeds right next to it.
+ * @param input - the raw code-field value.
+ * @returns the token to submit, or `''` when the input carries no usable code.
+ */
+export function extractPairingToken(input: string): string {
+  const trimmed = input.trim()
+  const wrapped = /^["'`“”‘’]+([\s\S]*?)["'`“”‘’]+$/.exec(trimmed)
+  const candidate = (wrapped === null ? trimmed : wrapped[1] ?? '').trim()
+  if (candidate === '') return ''
+  const hash = candidate.indexOf('#')
+  const query = candidate.indexOf('?')
+  if (hash !== -1 || query !== -1) {
+    const embedded = parsePairFragment(candidate.slice(hash === -1 ? query : hash))
+    return embedded.token === undefined ? '' : embedded.token
+  }
+  const appKey = parsePairFragment(`#key=${candidate}`)
+  if (appKey.token !== undefined) return appKey.token
+  return candidate.includes('/') || candidate.includes(':') ? '' : candidate
 }
 
 /** Choose Chinese, Italian, or English from an HTTP Accept-Language header. */
@@ -400,6 +439,8 @@ export function renderPairScript(locale: AuthPageLocale): string {
   return `(() => {
   const parsePairFragment = ${parsePairFragment.toString()}
 
+  const extractPairingToken = ${extractPairingToken.toString()}
+
   const form = document.getElementById('pair-form')
   const token = document.getElementById('pair-token')
   const label = document.getElementById('device-label')
@@ -429,6 +470,11 @@ export function renderPairScript(locale: AuthPageLocale): string {
   if (!form || !token || !label || !status) return
   form.addEventListener('submit', async (event) => {
     event.preventDefault()
+    const code = extractPairingToken(token.value)
+    if (code === '') {
+      status.value = ${JSON.stringify(copy.pairingCodeInvalid)}
+      return
+    }
     status.value = ${JSON.stringify(copy.pairing)}
     const submit = form.querySelector('button[type="submit"]')
     if (submit) submit.disabled = true
@@ -437,9 +483,24 @@ export function renderPairScript(locale: AuthPageLocale): string {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ token: token.value, label: label.value || undefined }),
+        body: JSON.stringify({ token: code, label: label.value || undefined }),
       })
-      if (response.status === 401 || response.status === 403 || response.status === 404) {
+      if (response.status === 429) {
+        status.value = ${JSON.stringify(copy.pairingRateLimited)}
+        if (submit) submit.disabled = false
+        return
+      }
+      if (response.status === 401) {
+        status.value = ${JSON.stringify(copy.pairingCodeInvalid)}
+        if (submit) submit.disabled = false
+        return
+      }
+      if (response.status === 403) {
+        status.value = ${JSON.stringify(copy.pairingSourceRefused)}
+        if (submit) submit.disabled = false
+        return
+      }
+      if (response.status === 404) {
         status.value = ${JSON.stringify(copy.pairingWindowClosed)}
         if (submit) submit.disabled = false
         return

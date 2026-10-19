@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  extractPairingToken,
   parsePairFragment,
   renderLoginPage,
   renderLoginScript,
@@ -155,6 +156,12 @@ describe('desktop PC entry page', () => {
     expect(optional.match(/<li>/g)).toHaveLength(2)
   })
 
+  it('states the default 5-minute, single-use validity in the guidance', () => {
+    expect(renderPcEntryPage('zh', PC_OPTIONS)).toContain('配对码默认 5 分钟内有效，且只能使用一次')
+    expect(renderPcEntryPage('en', PC_OPTIONS)).toContain('valid for 5 minutes by default and can be used once')
+    expect(renderPcEntryPage('it', PC_OPTIONS)).toContain('vale 5 minuti per impostazione predefinita e si usa una sola volta')
+  })
+
   it('escapes configuration values placed in attributes', () => {
     const page = renderPcEntryPage('en', { ...PC_OPTIONS, certificateUrl: '/ca.cer?a=1&b="2"' })
 
@@ -218,6 +225,36 @@ describe('pairing fragment parsing', () => {
   })
 })
 
+describe('pairing field extraction', () => {
+  it('accepts the raw token, an app key and a link that carries the code', () => {
+    expect(extractPairingToken('abc123')).toBe('abc123')
+    expect(extractPairingToken('  abc123  ')).toBe('abc123')
+    expect(extractPairingToken('dsh1.5f2a.tok3n')).toBe('tok3n')
+    expect(extractPairingToken('dsh2.remote-9.tok3n')).toBe('tok3n')
+    expect(extractPairingToken('"abc123"')).toBe('abc123')
+    expect(extractPairingToken('"dsh1.inst.abc.def"')).toBe('abc.def')
+    expect(extractPairingToken('“dsh1.inst.tok”')).toBe('tok')
+    expect(extractPairingToken('https://192.168.1.7:3443/mobile-access/pc#key=dsh1.inst.tok')).toBe('tok')
+    expect(extractPairingToken('https://host/mobile-access/pair#token=raw')).toBe('raw')
+    expect(extractPairingToken('https://host/mobile-access/pc?token=raw')).toBe('raw')
+    expect(extractPairingToken('https://host/mobile-access/pc?instance=i&token=raw')).toBe('raw')
+  })
+
+  it('reports no code for empty input or a link without one', () => {
+    expect(extractPairingToken('')).toBe('')
+    expect(extractPairingToken('   ')).toBe('')
+    expect(extractPairingToken('""')).toBe('')
+    expect(extractPairingToken('#')).toBe('')
+    expect(extractPairingToken('#token=')).toBe('')
+    expect(extractPairingToken('https://host/mobile-access/pc')).toBe('')
+    expect(extractPairingToken('https://host/mobile-access/pc?foo=bar')).toBe('')
+  })
+
+  it('passes an unrelated single value through so the gateway decides', () => {
+    expect(extractPairingToken('not-a-code')).toBe('not-a-code')
+  })
+})
+
 describe('shared pairing script', () => {
   const script = renderPairScript('en')
 
@@ -230,12 +267,33 @@ describe('shared pairing script', () => {
     expect(script).toContain('location.replace(\'/\')')
   })
 
-  it('handles a closed pairing window and a network failure in the page language', () => {
+  it('gives every pairing failure its own message in the page language', () => {
+    const expected = {
+      zh: [
+        '配对码无效、已过期或已被使用。请在 DSH 里重新生成（默认 5 分钟有效，只能使用一次）。',
+        '网关拒绝了这次请求的来源（不是配对码的问题）：请确认这台电脑和主机在同一局域网，或改用远程入口/正确的链接地址。',
+        '尝试次数过多，请稍等一会儿再试。',
+        '电脑上的配对窗口已关闭。窗口默认只开放 5 分钟',
+      ],
+      en: ['invalid, expired or already used', 'refused where this request came from', 'Too many attempts', 'pairing window on the computer is closed'],
+      it: ['non è valido, è scaduto o è già stato usato', 'rifiutato l’origine di questa richiesta', 'Troppi tentativi', 'finestra di abbinamento sul computer è chiusa'],
+    } as const
     for (const locale of LOCALES) {
       const localized = renderPairScript(locale)
-      expect(localized).toContain('response.status === 401 || response.status === 403 || response.status === 404')
-      expect(localized).toContain(locale === 'zh' ? '这个配对码已失效' : locale === 'it' ? 'non è più valido' : 'is no longer valid')
+      expect(localized).toContain('if (response.status === 401)')
+      expect(localized).toContain('if (response.status === 403)')
+      expect(localized).toContain('if (response.status === 429)')
+      expect(localized).toContain('if (response.status === 404)')
+      for (const text of expected[locale]) expect(localized).toContain(text)
     }
+    // A refused source must never be reported as an expired code.
+    expect(renderPairScript('zh')).not.toContain('if (response.status === 403 || response.status === 404)')
+  })
+
+  it('normalizes the field value before posting and refuses to post an empty code', () => {
+    expect(script).toContain('const code = extractPairingToken(token.value)')
+    expect(script).toMatch(/if \(code === ''\) \{\n\s+status\.value = "This pairing code is invalid/)
+    expect(script).toContain('body: JSON.stringify({ token: code, label: label.value || undefined })')
   })
 
   it('registers the service worker only on a plain browser origin', () => {
@@ -254,15 +312,21 @@ describe('shared pairing script', () => {
     expect(script).toContain('installPrompt.prompt()')
   })
 
-  it('embeds a working copy of the exported fragment parser', () => {
-    const embedded = /const parsePairFragment = ([\s\S]*?)\n\n {2}const form =/.exec(script)
-    expect(embedded).not.toBeNull()
-    const runtimeParser = new Function(`return (${embedded?.[1] ?? ''})`)() as (hash: string) => {
+  it('embeds working copies of the exported fragment parser and extractor', () => {
+    const parser = /const parsePairFragment = ([\s\S]*?)\n\n {2}const extractPairingToken =/.exec(script)
+    const extractor = /const extractPairingToken = ([\s\S]*?)\n\n {2}const form =/.exec(script)
+    expect(parser).not.toBeNull()
+    expect(extractor).not.toBeNull()
+    const runtimeParser = new Function(`return (${parser?.[1] ?? ''})`)() as (hash: string) => {
       readonly token?: string
       readonly instance?: string
     }
-    const cases = ['#token=abc', '#key=dsh1.inst.tok', '#instance=i&token=t', '', '#foo=bar', '#key=dsh2.i.t']
-    for (const hash of cases) expect(runtimeParser(hash)).toEqual(parsePairFragment(hash))
+    const runtimeExtractor = new Function('parsePairFragment', `return (${extractor?.[1] ?? ''})`)(runtimeParser) as (input: string) => string
+
+    const fragments = ['#token=abc', '#key=dsh1.inst.tok', '#instance=i&token=t', '', '#foo=bar', '#key=dsh2.i.t']
+    for (const hash of fragments) expect(runtimeParser(hash)).toEqual(parsePairFragment(hash))
+    const pastes = ['abc123', 'dsh1.inst.tok', '"dsh1.inst.tok"', 'https://host/mobile-access/pc#key=dsh1.inst.tok', 'https://host/mobile-access/pc?token=raw', 'https://host/mobile-access/pc', '']
+    for (const value of pastes) expect(runtimeExtractor(value)).toBe(extractPairingToken(value))
   })
 })
 

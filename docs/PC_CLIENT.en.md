@@ -26,20 +26,20 @@ The friend's computer must be able to reach the entry address: the local network
 
 1. Open **Mobile Access** in the lower-left corner of DSH and enable the channel you need: **Local network** (simplest when the friend shares your network) or **Remote** (when the friend is outside it). The PC client reuses these channels and adds no listening port.
 2. Switch to the **PC** tab, which lists the available entry addresses (local network and remote) with copy buttons.
-3. Choose **Generate pairing code**: this opens a time-limited pairing window and shows the pairing code (the app key, shaped like `dsh1.…` or `dsh2.…`) and the PC entry link.
+3. Choose **Generate pairing code**: this opens a time-limited pairing window (5 minutes by default) and shows the pairing code (the app key, shaped like `dsh1.…` or `dsh2.…`) and a copyable PC entry link.
 4. Choose **Download PC installer** to get `dsh-mobile-pc.zip`; when the entry uses the plugin's private CA, the tab also offers a certificate download link and short desktop-app instructions.
-5. Send the package and the pairing code to the friend. The code is a short-lived credential, so the friend must use it inside its window; generate a fresh one when it expires. You can also send the **PC entry link** directly (the code is in the link's `#` fragment), and the friend does not have to type it.
+5. Send the package and the pairing code to the friend. The code is a one-time credential, valid for 5 minutes by default, and the first device to pair consumes it; a second device or a second browser needs a freshly generated code. The easiest path is to send the **PC entry link** directly: the code is in the link's `#` fragment, so the friend does not have to type it.
 
 > The package contains no secret: only instructions, the certificate when needed, and launcher scripts. Send the pairing code separately, do not put it in a file name, and do not keep it long-term.
 
-When the entry uses the plugin's private CA (local network and self-signed remote entries), the package carries the certificate and its trust script; a remote entry with a publicly trusted certificate (a Cloudflare named tunnel, for example) has neither.
+Whether an entry needs a certificate depends on the channel: a cloudflared named tunnel uses Cloudflare's edge certificate, which the browser already trusts, so it has no certificate step; local-network and self-signed SakuraFrp entries use the plugin's own private CA, so the package carries the certificate and its trust script. See [why a certificate is still needed](#why-a-certificate-is-still-needed) for the reason.
 
 ## On the friend's PC: open the client
 
 1. **Unzip**: extract `dsh-mobile-pc.zip` into any directory (for example `dsh-mobile-pc` on the Desktop). Do not open a single file from inside the archive: the launcher needs the certificate and instructions in the same directory.
 2. **Trust the certificate (only when required)**: when the package contains `1-trust-certificate.cmd` and `dsh-mobile-ca.cer`, double-click `1-trust-certificate.cmd` and confirm the prompt. It uses Windows' own `certutil` to add the certificate to the current user's Trusted Root Certification Authorities, needs no administrator rights, and changes nothing else on the system. When Windows shows "Windows protected your PC", choose More info, then Run anyway; if the script fails, right-click it and choose Run as administrator. A remote entry with a publicly trusted certificate has no such file; skip this step.
 3. **Run the launcher**: double-click `2-open-dsh.cmd`. When Edge or Chrome is found, it opens the PC entry page in an app window; otherwise the default browser opens it. The friend can also double-click `open-dsh.url` or open the entry address directly in a browser.
-4. **Enter the pairing code**: the entry page first lists the steps; type the code into the pairing form, optionally give the computer a recognizable device name, and submit. The pairing window is 120 seconds by default; when the page reports that the code is no longer valid, ask the computer for a freshly generated one. After pairing, the page moves to DSH and the browser remembers this computer.
+4. **Enter the pairing code**: the entry page first lists the steps; type the code into the pairing form, optionally give the computer a recognizable device name, and submit. The field accepts three forms: the raw code, the app key (`dsh1.<instance>.<code>`) or the whole PC entry link (`https://…/mobile-access/pc#key=…`), and pasting the link is the easiest. After pairing, the page moves to DSH and the browser remembers this computer; a rejected code now explains why (next section).
 5. **Optional: install as a desktop app**: a supporting browser shows an **Install as desktop app** button on the entry page (the browser menu's Apps → Install this site as an app does the same). The install adds a desktop or Start-menu entry that opens DSH directly at the same address instead of the entry page; it does not work offline and cannot open while the computer is unreachable.
 
 A friend who received only the entry link can follow the same path: on the entry page choose **Download the certificate** (the browser first warns that the address is not secure, which is expected), double-click the downloaded certificate file, close and reopen the tab, then enter the pairing code.
@@ -52,6 +52,29 @@ Package contents:
 | `1-trust-certificate.cmd`, `dsh-mobile-ca.cer` | Provided only when the entry uses the plugin's private CA |
 | `2-open-dsh.cmd` | Opens the PC entry page, preferring an Edge / Chrome app window |
 | `open-dsh.url` | An Internet shortcut to the entry address |
+
+## Why a code is rejected
+
+- The pairing code is a one-time credential: the first device to pair consumes it, so a second device, or a second browser on the same computer, needs a freshly generated code.
+- It is valid for 5 minutes by default (the `pairingTtlMs` plugin option, settable from 10 seconds to 15 minutes). After that the pairing window and the code stop working, while already paired devices are unaffected.
+- The field accepts three forms: the raw code, the app key (`dsh1.<instance>.<code>`, or `dsh2.…` for a self-signed remote entry) or the whole PC entry link. The link copied from the panel already contains the code, so paste it as-is instead of cutting it apart.
+- When pairing is rejected, the page distinguishes four cases:
+  - **The code is invalid, expired or already used** (401): ask the computer for a newly generated code.
+  - **The gateway rejected the source of this request** (403): this is not a code problem; make sure this computer and the host are on the same local network, or use the remote entry or the correct link address.
+  - **Too many attempts** (429): wait a moment and try again.
+  - **The pairing window is closed** (404): ask the computer for a new code.
+
+## Why a certificate is still needed
+
+A browser only trusts certificates it recognises, so whether a certificate step is needed depends on whose certificate the entry presents:
+
+| Channel | Certificate on the public entry | Certificate step |
+| --- | --- | --- |
+| cloudflared named tunnel | Cloudflare's edge certificate, already trusted by the browser | Not needed; the package contains no certificate |
+| SakuraFrp (TCP tunnels only) | The plugin terminates TLS locally with its private CA, so the browser sees that self-signed certificate | Needed; the package ships `1-trust-certificate.cmd` and `dsh-mobile-ca.cer` |
+| Local network entry | The plugin's private CA as well | Needed; install it from the entry page or the package |
+
+The SakuraFrp public entry looks like `https://<node-domain>:<port>`: the frp node's own certificate only covers its panel and domain on its standard port, not the tunnel port, so that address presents the plugin's self-signed certificate and the browser warns first. `1-trust-certificate.cmd` in the package exists for exactly that case.
 
 ## PC customization layer
 
@@ -71,8 +94,8 @@ The PC and the phone each have their own customization files, both under `$DSH_H
 
 ## Security boundary
 
-- **Certificate**: local-network and self-signed remote entries use the plugin's own private CA, and the browser must trust it first; otherwise it shows a "not secure" warning and a desktop-app install cannot start. `1-trust-certificate.cmd` in the package adds `dsh-mobile-ca.cer` to the current user's root store only, writes nothing system-wide, and needs no administrator rights. A remote entry with a publicly trusted certificate (a Cloudflare named tunnel, for example) skips this step; see the [named tunnel guide](CLOUDFLARE_TUNNEL.en.md) for that setup.
-- **The pairing window is short**: choosing **Generate pairing code** opens a single-use pairing window (120 seconds by default, adjustable in the plugin configuration between 10 seconds and 10 minutes). Once it closes, the pairing page and the code stop working, while already paired devices are unaffected; the window can be used successfully only once.
+- **Certificate**: local-network and self-signed SakuraFrp entries use the plugin's own private CA, and the browser must trust it first; otherwise it shows a "not secure" warning and a desktop-app install cannot start. `1-trust-certificate.cmd` in the package adds `dsh-mobile-ca.cer` to the current user's root store only, writes nothing system-wide, and needs no administrator rights. A cloudflared named tunnel uses Cloudflare's edge certificate and skips this step; see the [named tunnel guide](CLOUDFLARE_TUNNEL.en.md) for that setup, and [why a certificate is still needed](#why-a-certificate-is-still-needed) for the per-channel difference.
+- **The pairing window is short**: choosing **Generate pairing code** opens a single-use pairing window (5 minutes by default, adjustable in the plugin configuration between 10 seconds and 15 minutes). Once it closes, the pairing page and the code stop working, while already paired devices are unaffected; the code can be used successfully only once, and [why a code is rejected](#why-a-code-is-rejected) lists the details.
 - **The pairing code is a credential**: anyone holding it can pair their own device to your DSH. Send it only to people you know, ideally on its own, and never inside the package.
 - **A PC is a trusted device**: like a phone, a paired PC can operate DSH on the computer and must be treated as fully trusted. When the friend's computer no longer needs access, open the paired-device list for that channel under **Mobile Access** on the computer (**Manage paired devices** for the local network, **Manage remote devices** for remote access) and revoke it; revocation stops its access immediately and its old token then fails.
 - **Reachable only while you enable it**: the mobile gateway listens only while a channel is on; with local network and remote access off, even paired devices cannot connect.

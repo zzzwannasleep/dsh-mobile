@@ -317,10 +317,56 @@ describe('README', () => {
     expect(readme).toContain(ENTRY_URL)
     expect(readme).toContain('2-open-dsh.cmd')
     expect(readme).toContain('open-dsh.url')
-    expect(readme).toContain('about two minutes')
+    expect(readme).toContain('valid for 5 minutes by default')
     expect(readme).toContain('Install as a desktop app')
     expect(readme).not.toContain('1-trust-certificate.cmd')
     expect(readme).toContain('does not include a certificate file')
+  })
+
+  it('pins the 5-minute, single-use and three-forms wording in every locale', () => {
+    const expectations = {
+      zh: [
+        '默认 5 分钟内有效',
+        '只能使用一次',
+        '10 秒到 15 分钟',
+        '原始配对码',
+        'dsh1.<实例>.<配对码>',
+        'dsh2.<实例>.<配对码>',
+        'PC 入口链接',
+        '无效、已过期或已被使用',
+        '不在同一网络',
+      ],
+      en: [
+        'valid for 5 minutes by default',
+        'used only once',
+        '10 seconds to 15 minutes',
+        'raw code',
+        'dsh1.<instance>.<code>',
+        'dsh2.<instance>.<code>',
+        'PC entry link',
+        'invalid, expired or already used',
+        'not on the same network',
+      ],
+      it: [
+        '5 minuti per impostazione predefinita',
+        'una sola volta',
+        'da 10 secondi a 15 minuti',
+        'codice grezzo',
+        'dsh1.<istanza>.<codice>',
+        'dsh2.<istanza>.<codice>',
+        'link di ingresso al PC',
+        'non è valido, è scaduto o è già stato usato',
+        'non sono sulla stessa rete',
+      ],
+    } as const
+
+    for (const locale of ['zh', 'en', 'it'] as const) {
+      const readme = renderPcPackageReadme({ ...BASE, locale })
+      for (const text of expectations[locale]) expect(readme, `${locale}: ${text}`).toContain(text)
+      expect(readme, locale).not.toContain('两分钟')
+      expect(readme, locale).not.toContain('two minutes')
+      expect(readme, locale).not.toContain('due minuti')
+    }
   })
 
   it('adds the certificate step when a certificate is supplied', () => {
@@ -355,12 +401,16 @@ describe('package never leaks a secret', () => {
     const joined = files.map(entry => entry.body.toString('utf8')).join('\n')
 
     expect(joined).toContain(ENTRY_URL)
-    expect(joined).not.toContain('#')
+    // The README may describe the accepted forms, but it must never carry a real
+    // credential: the only `#` is the documented `#key=…` placeholder, and no
+    // `dsh1.`/`dsh2.` is followed by an instance and a code.
+    expect(joined.replaceAll('#key=…', '')).not.toContain('#')
+    expect(joined).not.toMatch(/dsh[12]\.[A-Za-z0-9_-]+\./u)
+    expect(joined).toContain('dsh1.<')
+    expect(joined).toContain('dsh2.<')
     expect(joined).not.toContain('token')
     expect(joined).not.toContain('Token')
     expect(joined).not.toContain('appKey')
-    expect(joined).not.toContain('dsh1.')
-    expect(joined).not.toContain('dsh2.')
     expect(joined).not.toMatch(/[A-Za-z]:\\/u)
     expect(joined).not.toContain('/Users/')
     expect(joined).not.toContain('/home/')

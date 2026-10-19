@@ -90,6 +90,7 @@ export interface PluginConfig {
     keyFile?: string
     caFile?: string
   }
+  /** Pairing window lifetime in milliseconds; defaults to 300000 and accepts 10000 through 900000. */
   pairingTtlMs?: number
   deviceTtlMs?: number
   sessionTtlMs?: number
@@ -417,7 +418,7 @@ export function parseGatewayConfig(raw: unknown): ResolvedGatewayConfig {
     tls,
     publicTls: tls.mode === 'provided',
     discovery: true,
-    pairingTtlMs: integer(value.pairingTtlMs, 'pairingTtlMs', 120_000, 10_000, 600_000),
+    pairingTtlMs: integer(value.pairingTtlMs, 'pairingTtlMs', 300_000, 10_000, 900_000),
     deviceTtlMs,
     sessionTtlMs,
     maxDevices: integer(value.maxDevices, 'maxDevices', 32, 1, 256),

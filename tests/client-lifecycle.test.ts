@@ -1530,17 +1530,65 @@ describe('PC 端 tab data', () => {
   it('has the PC copy in all three locales', () => {
     const keys = [
       'pc', 'pcAccess', 'pcIntro', 'pcNoChannels', 'pcCopyUrl', 'pcCopyUrlAria', 'pcUrlCopied', 'pcEntryLinkLabel',
-      'pcGenerateKey', 'pcGeneratingKey', 'pcKeyReady', 'pcAppKeyLabel', 'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage', 'pcPreparingPackage',
+      'pcGenerateKey', 'pcGeneratingKey', 'pcKeyReady', 'pcKeyExpires', 'pcKeySingleUse', 'pcAppKeyLabel',
+      'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage', 'pcPreparingPackage',
       'pcPackageReady', 'pcPackageFailed', 'pcChannelUnavailable', 'pcInfoFailed', 'pcDownloadCertificate',
       'pcCertificateNote', 'pcStepOpen', 'pcStepInstall', 'pcStepLaunch',
     ]
     for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
-      for (const key of keys) expect((catalog as Record<string, string>)[key], key).toBeTruthy()
+      for (const key of keys) {
+        const value = (catalog as Record<string, string>)[key] ?? ''
+        expect(value, key).not.toBe('')
+        expect(value.trim(), key).not.toBe('')
+      }
     }
     expect(MOBILE_CONTROL_MESSAGES.zh.pc).toBe('PC 端')
     expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateKey).toBe('生成配对码')
     expect(MOBILE_CONTROL_MESSAGES.zh.pcDownloadPackage).toBe('下载 PC 安装包')
-    expect((MOBILE_CONTROL_MESSAGES.en as Record<string, string>).pcKeyReady).toMatch(/short-lived/u)
-    expect((MOBILE_CONTROL_MESSAGES.it as Record<string, string>).pcKeyReady).toMatch(/dura poco/u)
+  })
+
+  it('freezes the pairing-window copy in every locale', () => {
+    // The docs and the panel must say the same thing: five minutes, single use.
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcKeyReady).toBe('配对链接已复制。有效期 5 分钟，且只能使用一次；请让朋友立刻打开。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcKeyExpires).toBe('有效期至 {time}，只能使用一次。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcKeySingleUse).toBe('配对码只能使用一次；如果已经用过，请重新生成。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcAppKeyLabel).toBe('配对码（可直接粘贴到入口页）')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcEntryLinkLabel).toBe('配对链接（推荐，直接打开）')
+    const en = MOBILE_CONTROL_MESSAGES.en as Record<string, string>
+    const it = MOBILE_CONTROL_MESSAGES.it as Record<string, string>
+    expect(en.pcKeyReady).toMatch(/5 minutes/u)
+    expect(en.pcKeyReady).toMatch(/only once/u)
+    expect(en.pcKeyExpires).toContain('{time}')
+    expect(en.pcKeySingleUse).toMatch(/generate a new one/u)
+    expect(it.pcKeyReady).toMatch(/5 minuti/u)
+    expect(it.pcKeyReady).toMatch(/una sola volta/u)
+    expect(it.pcKeyExpires).toContain('{time}')
+    expect(it.pcKeySingleUse).toMatch(/generalo di nuovo/u)
+    // The labels must stay unambiguous about which value goes where.
+    expect(en.pcAppKeyLabel).toMatch(/paste it into the entry page/u)
+    expect(en.pcEntryLinkLabel).toMatch(/open it directly/u)
+    expect(it.pcAppKeyLabel).toMatch(/incollarlo nella pagina di ingresso/u)
+    expect(it.pcEntryLinkLabel).toMatch(/aprilo direttamente/u)
+    // Only the expiry line takes an interpolation, so a stray placeholder cannot leak.
+    for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
+      const record = catalog as Record<string, string>
+      for (const key of ['pcKeyReady', 'pcKeySingleUse', 'pcAppKeyLabel', 'pcEntryLinkLabel']) {
+        expect(record[key], key).not.toContain('{')
+      }
+      expect(record.pcKeyExpires).toContain('{time}')
+    }
+  })
+
+  it('renders the server expiry under the pair result instead of assuming the default', () => {
+    const text = source()
+    expect(text).toContain("t('pcKeyExpires', { time: formatTime(expiresAt) })")
+    expect(text).toContain('const expiresAt = typeof data.expiresAt === \'number\' && Number.isFinite(data.expiresAt) && data.expiresAt > 0 ? data.expiresAt : 0')
+    expect(text).toContain('pcPairExpiry.hidden = expiresAt === 0')
+    expect(text).toContain("const pcSingleUse = element('p', 'dsh-mobile-control__component-note'); pcSingleUse.textContent = t('pcKeySingleUse')")
+    expect(text).toContain('pcPairResult.append(pcPairKeyRow, pcPairLinkRow, pcPairExpiry)')
+    // The window length stays a server-side default: the panel asks for the default
+    // window and only ever displays the instant the server returns.
+    expect(text).toContain("controlRequestJson(path, { method: 'POST', body: '{}' })")
+    expect(text).not.toContain('ttlMs')
   })
 })

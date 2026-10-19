@@ -21,6 +21,67 @@ const PC_OPTIONS = {
 
 const LOCALES = ['zh', 'en', 'it'] as const
 
+/**
+ * Drive the emitted pairing script in a minimal DOM, so a test can count the
+ * POSTs and watch where the page sends the browser. Only the elements the script
+ * really reads are provided; the install section and service worker stay absent.
+ */
+function runPairScript(options: {
+  readonly hash: string
+  readonly responseStatus?: number
+}): {
+  readonly posts: ReadonlyArray<{ readonly url: string; readonly body: string }>
+  readonly replacements: readonly string[]
+  readonly status: () => string
+  readonly tokenValue: () => string
+  readonly canSubmit: () => boolean
+  readonly submit: () => Promise<void>
+} {
+  const posts: Array<{ url: string; body: string }> = []
+  const replacements: string[] = []
+  let submitHandler: ((event: { readonly preventDefault: () => void }) => Promise<void>) | undefined
+  const token = { value: '' }
+  const label = { value: '' }
+  const status = { value: '' }
+  const form = {
+    addEventListener: (type: string, handler: (event: { readonly preventDefault: () => void }) => Promise<void>) => {
+      if (type === 'submit') submitHandler = handler
+    },
+    querySelector: () => ({ disabled: false }),
+  }
+  const elements: Record<string, unknown> = {
+    'pair-form': form,
+    'pair-token': token,
+    'device-label': label,
+    'pair-status': status,
+  }
+  const location = {
+    hash: options.hash,
+    pathname: '/mobile-access/pc',
+    search: '',
+    replace: (target: string) => { replacements.push(target) },
+  }
+  const document = {
+    documentElement: { dataset: {} as Record<string, string> },
+    getElementById: (id: string) => elements[id] ?? null,
+  }
+  const fetch = (url: string, init: { readonly body: string }) => {
+    posts.push({ url, body: init.body })
+    const responseStatus = options.responseStatus ?? 201
+    return Promise.resolve({ ok: responseStatus < 400, status: responseStatus })
+  }
+  const run = new Function('document', 'location', 'history', 'window', 'navigator', 'fetch', renderPairScript('en'))
+  run(document, location, { replaceState: () => {} }, { addEventListener: () => {} }, {}, fetch)
+  return {
+    posts,
+    replacements,
+    status: () => status.value,
+    tokenValue: () => token.value,
+    canSubmit: () => submitHandler !== undefined,
+    submit: async () => { await submitHandler?.({ preventDefault: () => {} }) },
+  }
+}
+
 describe('browser authentication page localization', () => {
   it('negotiates the supported languages and falls back to English', () => {
     expect(resolveAuthPageLocale('zh-CN,zh;q=0.9,en;q=0.8')).toBe('zh')
@@ -112,9 +173,9 @@ describe('desktop PC entry page', () => {
 
   it('localizes the guidance and the form for every supported language', () => {
     const expectations = {
-      zh: ['把这台电脑连接到 DSH', '先信任证书', '输入配对码', '安装为桌面应用', '配对码', '配对此电脑'],
-      en: ['Connect this PC to DSH', 'Trust the certificate first', 'Enter the pairing code', 'Install as desktop app', 'Pairing code', 'Pair this PC'],
-      it: ['Collega questo PC a DSH', 'Prima installa il certificato', 'Inserisci il codice di abbinamento', 'Installa come app desktop', 'Codice di abbinamento', 'Abbina questo PC'],
+      zh: ['把这台电脑连接到 DSH', '先信任证书', '打开主人发来的链接', '安装为桌面应用', '配对码', '配对码（备用）'],
+      en: ['Connect this PC to DSH', 'Trust the certificate first', 'Open the link the owner sent', 'Install as desktop app', 'Pairing code', 'Pairing code (fallback)'],
+      it: ['Collega questo PC a DSH', 'Prima installa il certificato', 'Apri il link inviato dal proprietario', 'Installa come app desktop', 'Codice di abbinamento', 'Codice di abbinamento (alternativa)'],
     } as const
 
     for (const locale of LOCALES) {
@@ -156,10 +217,43 @@ describe('desktop PC entry page', () => {
     expect(optional.match(/<li>/g)).toHaveLength(2)
   })
 
-  it('states the default 5-minute, single-use validity in the guidance', () => {
-    expect(renderPcEntryPage('zh', PC_OPTIONS)).toContain('配对码默认 5 分钟内有效，且只能使用一次')
-    expect(renderPcEntryPage('en', PC_OPTIONS)).toContain('valid for 5 minutes by default and can be used once')
-    expect(renderPcEntryPage('it', PC_OPTIONS)).toContain('vale 5 minuti per impostazione predefinita e si usa una sola volta')
+  it('states the fallback code validity once, with no window for the durable link to beat', () => {
+    const fallback = {
+      zh: '配对码有效期默认 5 分钟，且只能使用一次。',
+      en: 'A pairing code is valid for 5 minutes by default and can be used once.',
+      it: 'Il codice di abbinamento vale 5 minuti per impostazione predefinita e si usa una sola volta.',
+    } as const
+    const window = { zh: '5 分钟', en: '5 minutes', it: '5 minuti' } as const
+
+    for (const locale of LOCALES) {
+      const page = renderPcEntryPage(locale, PC_OPTIONS)
+      expect(page).toContain(fallback[locale])
+      // The fallback field is the only place the page still names a validity window.
+      expect(page.match(new RegExp(window[locale], 'g'))).toHaveLength(1)
+    }
+  })
+
+  it('presents the durable link as the normal path and retires the two-minute framing', () => {
+    const durable = {
+      zh: ['不需要输入任何配对码', '这条链接一直有效，直到主人在 DSH 里重新生成它'],
+      en: ['with no pairing code to type', 'The link keeps working until the owner regenerates it in DSH'],
+      it: ['senza digitare alcun codice di abbinamento', 'Il link resta valido finché il proprietario non lo rigenera in DSH'],
+    } as const
+
+    for (const locale of LOCALES) {
+      const page = renderPcEntryPage(locale, PC_OPTIONS)
+      for (const text of durable[locale]) expect(page).toContain(text)
+      expect(page).not.toContain('两分钟')
+      expect(page).not.toContain('two minutes')
+      expect(page).not.toContain('due minuti')
+    }
+  })
+
+  it('keeps the fallback field described for assistive technology', () => {
+    const page = renderPcEntryPage('en', PC_OPTIONS)
+
+    expect(page).toContain('aria-describedby="pair-token-help"')
+    expect(page).toContain('<p class="help" id="pair-token-help">')
   })
 
   it('escapes configuration values placed in attributes', () => {
@@ -327,6 +421,43 @@ describe('shared pairing script', () => {
     for (const hash of fragments) expect(runtimeParser(hash)).toEqual(parsePairFragment(hash))
     const pastes = ['abc123', 'dsh1.inst.tok', '"dsh1.inst.tok"', 'https://host/mobile-access/pc#key=dsh1.inst.tok', 'https://host/mobile-access/pc?token=raw', 'https://host/mobile-access/pc', '']
     for (const value of pastes) expect(runtimeExtractor(value)).toBe(extractPairingToken(value))
+  })
+})
+
+describe('a link that carries a token', () => {
+  const ENTRY_LINK = '#key=dsh1.instance1.tok3n'
+
+  it('posts the extracted token exactly once and then replaces the location with /', async () => {
+    const page = runPairScript({ hash: ENTRY_LINK })
+
+    // The token moves from the fragment into the field before any submission.
+    expect(page.tokenValue()).toBe('tok3n')
+    expect(page.replacements).toEqual([])
+    expect(page.canSubmit()).toBe(true)
+    await page.submit()
+    expect(page.posts).toHaveLength(1)
+    expect(page.posts[0]?.url).toBe('/mobile-access/auth/pair')
+    expect(page.posts[0]?.body).toBe('{"token":"tok3n"}')
+    expect(page.replacements).toEqual(['/'])
+  })
+
+  it('keeps the fallback form without a POST when the page carries no token', async () => {
+    const page = runPairScript({ hash: '' })
+
+    expect(page.replacements).toEqual([])
+    expect(page.canSubmit()).toBe(true)
+    await page.submit()
+    expect(page.posts).toHaveLength(0)
+    expect(page.status()).toContain('invalid, expired or already used')
+  })
+
+  it('reports a rejected POST instead of redirecting', async () => {
+    const page = runPairScript({ hash: ENTRY_LINK, responseStatus: 401 })
+
+    await page.submit()
+    expect(page.posts).toHaveLength(1)
+    expect(page.status()).toContain('invalid, expired or already used')
+    expect(page.replacements).toEqual([])
   })
 })
 

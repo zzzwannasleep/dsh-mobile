@@ -1514,24 +1514,27 @@ describe('PC 端 tab data', () => {
     expect(escaped.channels).toEqual([])
   })
 
-  it('routes pairing, the installer and the certificate through the frozen paths', () => {
+  it('routes the durable link, the installer and the certificate through the frozen paths', () => {
     const text = source()
-    expect(text).toContain("t('pcGenerateKey')")
+    expect(text).toContain("t('pcGenerateLink')")
     expect(text).toContain('/api/mobile-access/pc/info')
-    expect(text).toContain('/api/mobile-access/lan/pairing/open')
-    expect(text).toContain('/api/mobile-access/remote/pairing/open')
+    expect(text).toContain('`/api/mobile-access/${channel}/link`')
+    expect(text).toContain('`/api/mobile-access/${channel}/status`')
     expect(text).toContain('`${pcPackagePath}?channel=${encodeURIComponent(channel)}`')
     expect(text).toContain("anchor.download = 'dsh-mobile-pc.zip'")
-    expect(text).toContain('`${channelInfo.origin}${pcEntryPath}#key=${encodeURIComponent(appKey)}`')
     expect(text).toContain("pcTab.setAttribute('aria-pressed', String(view === 'pc'))")
     expect(text).toContain("switcher.hidden = view === 'diagnostics'")
+    // The link comes from the gateway, so the panel no longer rebuilds it from a
+    // channel origin, and the PC tab no longer opens a pairing window of its own.
+    expect(text).not.toContain('#key=${encodeURIComponent(appKey)}')
+    expect(text).not.toContain('/api/mobile-access/lan/pairing/open`')
   })
 
   it('has the PC copy in all three locales', () => {
     const keys = [
       'pc', 'pcAccess', 'pcIntro', 'pcNoChannels', 'pcCopyUrl', 'pcCopyUrlAria', 'pcUrlCopied', 'pcEntryLinkLabel',
-      'pcGenerateKey', 'pcGeneratingKey', 'pcKeyReady', 'pcKeyExpires', 'pcKeySingleUse', 'pcAppKeyLabel',
-      'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage', 'pcPreparingPackage',
+      'pcGenerateLink', 'pcCopyLink', 'pcGeneratingLink', 'pcRegenerateLink', 'pcLinkReady', 'pcLinkDurable',
+      'pcLinkRegenerated', 'pcAppKeyLabel', 'pcCopyKey', 'pcKeyCopied', 'pcDownloadPackage', 'pcPreparingPackage',
       'pcPackageReady', 'pcPackageFailed', 'pcChannelUnavailable', 'pcInfoFailed', 'pcDownloadCertificate',
       'pcCertificateNote', 'pcStepOpen', 'pcStepInstall', 'pcStepLaunch',
     ]
@@ -1543,52 +1546,107 @@ describe('PC 端 tab data', () => {
       }
     }
     expect(MOBILE_CONTROL_MESSAGES.zh.pc).toBe('PC 端')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateKey).toBe('生成配对码')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcGenerateLink).toBe('生成访问链接')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcCopyLink).toBe('复制访问链接')
     expect(MOBILE_CONTROL_MESSAGES.zh.pcDownloadPackage).toBe('下载 PC 安装包')
   })
 
-  it('freezes the pairing-window copy in every locale', () => {
-    // The docs and the panel must say the same thing: five minutes, single use.
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcKeyReady).toBe('配对链接已复制。有效期 5 分钟，且只能使用一次；请让朋友立刻打开。')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcKeyExpires).toBe('有效期至 {time}，只能使用一次。')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcKeySingleUse).toBe('配对码只能使用一次；如果已经用过，请重新生成。')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcAppKeyLabel).toBe('配对码（可直接粘贴到入口页）')
-    expect(MOBILE_CONTROL_MESSAGES.zh.pcEntryLinkLabel).toBe('配对链接（推荐，直接打开）')
+  it('states the durable-link rule instead of a window in every locale', () => {
+    // The panel must agree with the server: the link does not expire and needs no
+    // code, and only an explicit regeneration replaces it.
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkDurable).toBe('链接长期有效，无需配对码；重新生成后旧链接立即失效。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkReady).toBe('访问链接已复制。链接长期有效，朋友随时打开都能进入。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcLinkRegenerated).toBe('已生成新的访问链接并复制，旧链接已失效。')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcAppKeyLabel).toBe('配对码（备用，可粘贴到入口页）')
+    expect(MOBILE_CONTROL_MESSAGES.zh.pcEntryLinkLabel).toBe('访问链接（直接打开，无需配对码）')
     const en = MOBILE_CONTROL_MESSAGES.en as Record<string, string>
     const it = MOBILE_CONTROL_MESSAGES.it as Record<string, string>
-    expect(en.pcKeyReady).toMatch(/5 minutes/u)
-    expect(en.pcKeyReady).toMatch(/only once/u)
-    expect(en.pcKeyExpires).toContain('{time}')
-    expect(en.pcKeySingleUse).toMatch(/generate a new one/u)
-    expect(it.pcKeyReady).toMatch(/5 minuti/u)
-    expect(it.pcKeyReady).toMatch(/una sola volta/u)
-    expect(it.pcKeyExpires).toContain('{time}')
-    expect(it.pcKeySingleUse).toMatch(/generalo di nuovo/u)
+    expect(en.pcLinkDurable).toMatch(/does not expire|stays valid/u)
+    expect(en.pcLinkDurable).toMatch(/no pairing code/u)
+    expect(en.pcLinkRegenerated).toMatch(/previous link no longer works/u)
+    expect(it.pcLinkDurable).toMatch(/non serve alcun codice/u)
+    expect(it.pcLinkRegenerated).toMatch(/non funziona più/u)
     // The labels must stay unambiguous about which value goes where.
     expect(en.pcAppKeyLabel).toMatch(/paste it into the entry page/u)
     expect(en.pcEntryLinkLabel).toMatch(/open it directly/u)
-    expect(it.pcAppKeyLabel).toMatch(/incollarlo nella pagina di ingresso/u)
+    expect(it.pcAppKeyLabel).toMatch(/incollalo nella pagina di ingresso/u)
     expect(it.pcEntryLinkLabel).toMatch(/aprilo direttamente/u)
-    // Only the expiry line takes an interpolation, so a stray placeholder cannot leak.
+    // No window is rendered on this tab, so no link message takes a placeholder, and
+    // none of them may promise the old five-minute single-use rule.
+    const placeholderFree = [
+      'pcGenerateLink', 'pcCopyLink', 'pcGeneratingLink', 'pcRegenerateLink', 'pcLinkReady',
+      'pcLinkDurable', 'pcLinkRegenerated', 'pcAppKeyLabel', 'pcEntryLinkLabel',
+    ]
     for (const catalog of Object.values(MOBILE_CONTROL_MESSAGES)) {
       const record = catalog as Record<string, string>
-      for (const key of ['pcKeyReady', 'pcKeySingleUse', 'pcAppKeyLabel', 'pcEntryLinkLabel']) {
-        expect(record[key], key).not.toContain('{')
+      for (const [key, value] of Object.entries(record)) {
+        if (!key.startsWith('pc')) continue
+        expect(value, key).not.toMatch(/5\s*(分钟|minutes|minuti)/u)
+        expect(value, key).not.toMatch(/只能使用一次|only once|una sola volta/u)
       }
-      expect(record.pcKeyExpires).toContain('{time}')
+      for (const key of placeholderFree) expect(record[key], key).not.toContain('{')
     }
   })
 
-  it('renders the server expiry under the pair result instead of assuming the default', () => {
+  it('copies the link the gateway returned and regenerates only on request', () => {
     const text = source()
-    expect(text).toContain("t('pcKeyExpires', { time: formatTime(expiresAt) })")
-    expect(text).toContain('const expiresAt = typeof data.expiresAt === \'number\' && Number.isFinite(data.expiresAt) && data.expiresAt > 0 ? data.expiresAt : 0')
-    expect(text).toContain('pcPairExpiry.hidden = expiresAt === 0')
-    expect(text).toContain("const pcSingleUse = element('p', 'dsh-mobile-control__component-note'); pcSingleUse.textContent = t('pcKeySingleUse')")
-    expect(text).toContain('pcPairResult.append(pcPairKeyRow, pcPairLinkRow, pcPairExpiry)')
-    // The window length stays a server-side default: the panel asks for the default
-    // window and only ever displays the instant the server returns.
-    expect(text).toContain("controlRequestJson(path, { method: 'POST', body: '{}' })")
+    expect(text).toContain("const appKey = typeof data.appKey === 'string' ? data.appKey : ''")
+    expect(text).toContain("const entryUrl = typeof data.entryUrl === 'string' ? data.entryUrl : ''")
+    expect(text).toContain("await showPcLink(appKey, entryUrl, regenerate ? t('pcLinkRegenerated') : t('pcLinkReady'))")
+    expect(text).toContain('JSON.stringify(regenerate ? { regenerate: true } : {})')
+    expect(text).toContain("pcPair.textContent = pcLinkActive ? t('pcCopyLink') : t('pcGenerateLink')")
+    expect(text).toContain('pcRegenerate.hidden = !pcLinkActive')
+    expect(text).toContain("(entryLink as Record<string, unknown>).active === true")
+    expect(text).toContain("pcRegenerate.addEventListener('click', () => { requestPcLink(true) })")
+    // The five-minute framing and the local window request are gone from this tab.
+    expect(text).not.toContain('pcKeyExpires')
+    expect(text).not.toContain('pcPairExpiry')
+    expect(text).not.toContain('pcKeySingleUse')
+    expect(text).not.toContain('pcSingleUse')
+    expect(text).not.toContain('pcGenerateKey')
     expect(text).not.toContain('ttlMs')
+  })
+
+  it('sends the SakuraFrp entry mode with the tunnel and only claims trust when the probe verified it', () => {
+    const text = source()
+    // One save both picks the tunnel and decides how its public entry presents a
+    // certificate, so the mode and the bound subdomain travel with the tunnel id.
+    expect(text).toContain("entryMode: sakuraEntryMode.value === 'autoHttps' ? 'autoHttps' : 'tls'")
+    expect(text).toContain("if (boundDomain !== '') body.boundDomain = boundDomain")
+    expect(text).toContain('body: sakuraConfigureBody(tunnelId)')
+    // `trustedEntry` is only the configured mode; the verified flag decides the copy,
+    // so the panel cannot promise a trusted certificate on the strength of a setting.
+    expect(text).toContain("const sakuraTrusted = sakuraProvider.trustedCertificate === true")
+    expect(text).toContain("sakuraTrustedNote.textContent = sakuraTrusted ? t('sakuraTrustedNote') : t('sakuraUntrustedNote')")
+    expect(text).toContain('sakuraTrustedNote.hidden = !sakuraTrustedEntry')
+    expect(text).toContain("sakuraEntryMode.value = sakuraProvider.entryMode === 'autoHttps' ? 'autoHttps' : 'tls'")
+    expect(text).toContain("sakuraBoundDomain.value = typeof sakuraProvider.boundDomain === 'string' ? sakuraProvider.boundDomain : ''")
+    // Automatic HTTPS without a bound subdomain is known to fail, so the panel asks
+    // for the subdomain instead of saving a channel the probe would reject.
+    expect(text).toContain("if (sakuraEntryMode.value === 'autoHttps' && sakuraBoundDomain.value.trim() === '') {")
+    expect(text).toContain("remoteStatus.textContent = t('sakuraBoundDomainMissing')")
+    // The subdomain field is irrelevant to the plugin-certificate mode.
+    expect(text).toContain('sakuraBoundDomainLabel.hidden = !automaticHttps')
+    expect(text).toContain('sakuraEntryHint.hidden = !automaticHttps')
+    expect(text).toContain("sakuraEntryMode.addEventListener('change', syncSakuraEntryFields)")
+  })
+
+  it('maps every trusted-entry failure code to copy and to a next step', () => {
+    const text = source()
+    const codes = [
+      'sakurafrp_bound_domain_missing',
+      'sakurafrp_bound_domain_invalid',
+      'sakurafrp_entry_mode_invalid',
+      'sakurafrp_config_unsupported',
+      'sakurafrp_certificate_untrusted',
+    ]
+    const diagnostics = readFileSync(new URL('../src/diagnostics.ts', import.meta.url), 'utf8')
+    for (const code of codes) {
+      // A code the server can report must reach the localized table, and the
+      // diagnostic guidance must have a next step rather than a generic line.
+      expect(text, code).toContain(`${code}: '`)
+      expect(text).toContain(`'${code}'`)
+      expect(diagnostics, code).toContain(`${code}: '`)
+    }
   })
 })

@@ -320,7 +320,35 @@ describe('README', () => {
     expect(readme).toContain('valid for 5 minutes by default')
     expect(readme).toContain('Install as a desktop app')
     expect(readme).not.toContain('1-trust-certificate.cmd')
-    expect(readme).toContain('does not include a certificate file')
+    expect(readme).toContain('No certificate is needed: just open the link.')
+  })
+
+  it('tells the friend to open the link first and keeps the code as a fallback', () => {
+    const titles = {
+      zh: '打开主人发来的链接',
+      en: 'Open the link the owner sent',
+      it: 'Apri il link che ti ha inviato il proprietario',
+    } as const
+    const openFirst = {
+      zh: '主人会把 PC 入口链接发给你',
+      en: 'The owner sends you the PC entry link',
+      it: 'Il proprietario ti invia il link di ingresso al PC',
+    } as const
+    const noCertificate = {
+      zh: '无需安装证书，直接打开链接即可。',
+      en: 'No certificate is needed: just open the link.',
+      it: 'Non serve alcun certificato: apri semplicemente il link.',
+    } as const
+
+    for (const locale of ['zh', 'en', 'it'] as const) {
+      const readme = renderPcPackageReadme({ ...BASE, locale })
+      expect(readme, locale).toContain(titles[locale])
+      expect(readme, locale).toContain(openFirst[locale])
+      expect(readme, locale).toContain(noCertificate[locale])
+      // The link comes before the code, and nothing asks for a code up front.
+      expect(readme.indexOf(titles[locale]), locale).toBeGreaterThan(readme.indexOf(ENTRY_URL))
+      expect(readme, locale).not.toMatch(/ask the owner for the code first|先向主人索要配对码/u)
+    }
   })
 
   it('pins the 5-minute, single-use and three-forms wording in every locale', () => {
@@ -374,7 +402,9 @@ describe('README', () => {
 
     expect(readme).toContain('1-trust-certificate.cmd')
     expect(readme).toContain('dsh-mobile-ca.cer')
-    expect(readme).not.toContain('does not include a certificate file')
+    expect(readme).not.toContain('No certificate is needed')
+    expect(readme).not.toContain('无需安装证书')
+    expect(readme).not.toContain('Non serve alcun certificato')
     expect(readme).toContain(ENTRY_URL)
   })
 

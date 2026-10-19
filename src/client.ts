@@ -715,6 +715,11 @@ const REMOTE_ERROR_MESSAGE_KEYS: Readonly<Record<string, string>> = {
   sakurafrp_invalid_output: 'sakuraInvalidOutput',
   sakurafrp_settings_invalid: 'sakuraSettingsInvalid',
   sakurafrp_port_reservation_failed: 'sakuraPortReservationFailed',
+  sakurafrp_bound_domain_missing: 'sakuraBoundDomainMissing',
+  sakurafrp_bound_domain_invalid: 'sakuraBoundDomainInvalid',
+  sakurafrp_entry_mode_invalid: 'sakuraEntryModeInvalid',
+  sakurafrp_config_unsupported: 'sakuraConfigUnsupported',
+  sakurafrp_certificate_untrusted: 'sakuraCertificateUntrusted',
   remote_component_launch_failed: 'remoteComponentLaunchFailed',
 }
 
@@ -731,6 +736,8 @@ const DIAGNOSTIC_CONTROLLER_ACTION_CODES: ReadonlySet<string> = new Set([
   'sakurafrp_component_missing', 'sakurafrp_component_invalid', 'sakurafrp_config_fetch_failed',
   'sakurafrp_launch_failed', 'sakurafrp_start_timeout', 'sakurafrp_stopped', 'sakurafrp_exited',
   'sakurafrp_invalid_output', 'sakurafrp_settings_invalid', 'sakurafrp_port_reservation_failed',
+  'sakurafrp_bound_domain_missing', 'sakurafrp_bound_domain_invalid', 'sakurafrp_entry_mode_invalid',
+  'sakurafrp_config_unsupported', 'sakurafrp_certificate_untrusted',
   'remote_component_launch_failed',
 ])
 
@@ -935,6 +942,28 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const sakuraTunnelRefresh = element('button', 'dsh-mobile-control__primary'); sakuraTunnelRefresh.type = 'button'; sakuraTunnelRefresh.textContent = t('sakuraTunnelsRefresh')
   sakuraTunnelRow.append(sakuraTunnelSelect, sakuraTunnelRefresh)
   const sakuraTunnelHint = element('p', 'dsh-mobile-control__frp-hint'); sakuraTunnelHint.textContent = t('sakuraTunnelEmpty')
+  // Trusted entry (子域绑定 + 自动 HTTPS): the owner chooses how the public entry
+  // presents its certificate, and only automatic HTTPS needs the bound subdomain.
+  const sakuraEntryFields = element('div', 'dsh-mobile-control__frp-fields')
+  const sakuraEntryModeLabel = element('label', 'dsh-mobile-control__field'); sakuraEntryModeLabel.textContent = t('sakuraEntryMode')
+  const sakuraEntryMode = element('select', 'dsh-mobile-control__ws-paths-input'); sakuraEntryMode.setAttribute('aria-label', t('sakuraEntryMode'))
+  for (const [value, label] of [['tls', t('sakuraEntryModeTls')], ['autoHttps', t('sakuraEntryModeAutoHttps')]] as const) {
+    const option = element('option'); option.value = value; option.textContent = label; sakuraEntryMode.append(option)
+  }
+  sakuraEntryModeLabel.append(sakuraEntryMode)
+  const sakuraBoundDomainLabel = element('label', 'dsh-mobile-control__field'); sakuraBoundDomainLabel.textContent = t('sakuraBoundDomain')
+  const sakuraBoundDomain = element('input'); sakuraBoundDomain.type = 'text'; sakuraBoundDomain.autocomplete = 'off'; sakuraBoundDomain.spellcheck = false; sakuraBoundDomain.placeholder = t('sakuraBoundDomainPlaceholder')
+  sakuraBoundDomainLabel.append(sakuraBoundDomain)
+  sakuraEntryFields.append(sakuraEntryModeLabel, sakuraBoundDomainLabel)
+  const sakuraEntryHint = element('p', 'dsh-mobile-control__frp-hint'); sakuraEntryHint.textContent = t('sakuraBoundDomainHint')
+  const sakuraTrustedNote = element('p', 'dsh-mobile-control__component-note'); sakuraTrustedNote.hidden = true
+  const syncSakuraEntryFields = (): void => {
+    const automaticHttps = sakuraEntryMode.value === 'autoHttps'
+    sakuraBoundDomainLabel.hidden = !automaticHttps
+    sakuraEntryHint.hidden = !automaticHttps
+  }
+  sakuraEntryMode.addEventListener('change', syncSakuraEntryFields)
+  syncSakuraEntryFields()
   const sakuraConfigure = element('button', 'dsh-mobile-control__primary dsh-mobile-control__frp-action'); sakuraConfigure.type = 'button'; sakuraConfigure.textContent = t('sakuraConfigureSave')
   const sakuraComponentStatus = element('p', 'dsh-mobile-control__component-status'); sakuraComponentStatus.textContent = t('checkingComponent')
   const sakuraInstall = element('button', 'dsh-mobile-control__primary'); sakuraInstall.type = 'button'; sakuraInstall.textContent = t('installFrpc')
@@ -946,7 +975,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const sakuraOfficial = element('a', 'dsh-mobile-control__text-link'); sakuraOfficial.href = 'https://www.natfrp.com/'; sakuraOfficial.target = '_blank'; sakuraOfficial.rel = 'noopener noreferrer'; sakuraOfficial.textContent = t('officialDownload')
   const sakuraPurge = element('button', 'dsh-mobile-control__danger'); sakuraPurge.type = 'button'; sakuraPurge.textContent = t('sakuraPurge')
   sakuraDetailsBody.append(sakuraDetailsText, sakuraStorage, sakuraOfficial, sakuraPurge); sakuraDetails.append(sakuraDetailsSummary, sakuraDetailsBody)
-  sakuraSetup.append(sakuraSetupTitle, sakuraTokenNote, sakuraPanelLink, sakuraTokenLabel, sakuraTokenSave, sakuraTunnelsTitle, sakuraTunnelStatus, sakuraTunnelRow, sakuraTunnelHint, sakuraConfigure, sakuraComponentStatus, sakuraInstall, sakuraDetails)
+  sakuraSetup.append(sakuraSetupTitle, sakuraTokenNote, sakuraPanelLink, sakuraTokenLabel, sakuraTokenSave, sakuraTunnelsTitle, sakuraTunnelStatus, sakuraTunnelRow, sakuraTunnelHint, sakuraEntryFields, sakuraEntryHint, sakuraTrustedNote, sakuraConfigure, sakuraComponentStatus, sakuraInstall, sakuraDetails)
   // The cloudflared provider now runs named tunnels only, so the setup card keeps
   // the saved tunnel fields and the component install/cleanup disclosure.
   const cloudflaredSetup = element('section', 'dsh-mobile-control__cpolar-setup dsh-mobile-control__cloudflared-setup'); cloudflaredSetup.hidden = true
@@ -1177,11 +1206,21 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   const pcChannelList = element('div', 'dsh-mobile-control__pc-channels')
   const pcChannelsEmpty = element('p', 'dsh-mobile-control__component-note'); pcChannelsEmpty.textContent = t('pcNoChannels'); pcChannelsEmpty.hidden = true
   const pcActions = element('div', 'dsh-mobile-control__actions')
-  const pcPair = element('button', 'dsh-mobile-control__primary'); pcPair.type = 'button'; pcPair.textContent = t('pcGenerateKey'); pcPair.disabled = true
+  const pcPair = element('button', 'dsh-mobile-control__primary'); pcPair.type = 'button'; pcPair.textContent = t('pcGenerateLink'); pcPair.disabled = true
   const pcPackage = element('button', 'dsh-mobile-control__secondary'); pcPackage.type = 'button'; pcPackage.textContent = t('pcDownloadPackage'); pcPackage.disabled = true
   pcActions.append(pcPair, pcPackage)
-  const pcSingleUse = element('p', 'dsh-mobile-control__component-note'); pcSingleUse.textContent = t('pcKeySingleUse')
+  // The link is a standing invitation, not a five-minute window, so the note states
+  // the rule instead of counting down to an expiry.
+  const pcDurableNote = element('p', 'dsh-mobile-control__component-note'); pcDurableNote.textContent = t('pcLinkDurable')
   const pcPairResult = element('div', 'dsh-mobile-control__pc-pair'); pcPairResult.hidden = true
+  const pcPairLinkRow = element('div', 'dsh-mobile-control__pc-pair-row')
+  const pcPairLinkLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairLinkLabel.textContent = t('pcEntryLinkLabel')
+  const pcPairLinkValueRow = element('div', 'dsh-mobile-control__pc-pair-value-row')
+  const pcPairLinkValue = element('code', 'dsh-mobile-control__pc-pair-value')
+  const pcPairLinkCopy = element('button', 'dsh-mobile-control__pc-copy'); pcPairLinkCopy.type = 'button'; pcPairLinkCopy.textContent = t('pcCopyUrl')
+  pcPairLinkCopy.addEventListener('click', () => { void copyPcText(pcPairLinkValue.textContent ?? '', t('pcLinkReady'), t('pairingLink')) })
+  pcPairLinkValueRow.append(pcPairLinkValue, pcPairLinkCopy)
+  pcPairLinkRow.append(pcPairLinkLabel, pcPairLinkValueRow)
   const pcPairKeyRow = element('div', 'dsh-mobile-control__pc-pair-row')
   const pcPairKeyLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairKeyLabel.textContent = t('pcAppKeyLabel')
   const pcPairKeyValueRow = element('div', 'dsh-mobile-control__pc-pair-value-row')
@@ -1190,13 +1229,9 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   pcPairKeyCopy.addEventListener('click', () => { void copyPcText(pcPairKeyValue.textContent ?? '', t('pcKeyCopied'), t('pairingKey')) })
   pcPairKeyValueRow.append(pcPairKeyValue, pcPairKeyCopy)
   pcPairKeyRow.append(pcPairKeyLabel, pcPairKeyValueRow)
-  const pcPairLinkRow = element('div', 'dsh-mobile-control__pc-pair-row')
-  const pcPairLinkLabel = element('span', 'dsh-mobile-control__pc-pair-label'); pcPairLinkLabel.textContent = t('pcEntryLinkLabel')
-  const pcPairLinkValue = element('code', 'dsh-mobile-control__pc-pair-value')
-  pcPairLinkRow.append(pcPairLinkLabel, pcPairLinkValue)
-  // The window is a single five-minute one, so its exact end belongs next to the code.
-  const pcPairExpiry = element('p', 'dsh-mobile-control__pc-pair-note'); pcPairExpiry.hidden = true
-  pcPairResult.append(pcPairKeyRow, pcPairLinkRow, pcPairExpiry)
+  const pcRegenerate = element('button', 'dsh-mobile-control__secondary'); pcRegenerate.type = 'button'; pcRegenerate.textContent = t('pcRegenerateLink'); pcRegenerate.hidden = true
+  pcRegenerate.addEventListener('click', () => { requestPcLink(true) })
+  pcPairResult.append(pcPairLinkRow, pcPairKeyRow, pcRegenerate)
   const pcCertificate = element('p', 'dsh-mobile-control__component-note dsh-mobile-control__pc-certificate'); pcCertificate.hidden = true
   const pcCertificateNote = element('span'); pcCertificateNote.textContent = `${t('pcCertificateNote')} `
   const pcCertificateLink = element('a', 'dsh-mobile-control__text-link'); pcCertificateLink.textContent = t('pcDownloadCertificate'); pcCertificateLink.setAttribute('download', 'dsh-mobile-ca.cer'); pcCertificateLink.rel = 'noopener'
@@ -1206,20 +1241,24 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     const step = element('li'); step.textContent = t(stepKey); pcSteps.append(step)
   }
   const pcStatus = element('p', 'dsh-mobile-control__status'); pcStatus.setAttribute('role', 'status'); pcStatus.setAttribute('aria-live', 'polite')
-  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcActions, pcSingleUse, pcPairResult, pcCertificate, pcSteps, pcStatus)
+  pcView.append(pcIntro, pcChannelList, pcChannelsEmpty, pcActions, pcDurableNote, pcPairResult, pcCertificate, pcSteps, pcStatus)
   let pcChannels: readonly PcClientChannel[] = []
   let pcActiveChannel: 'lan' | 'remote' | '' = ''
-  let pcEntryPath = PC_ENTRY_PATH_FALLBACK
   let pcPackagePath = PC_PACKAGE_PATH_FALLBACK
   let pcBusy = false
   let pcPackageBusy = false
+  /** Whether the selected channel already holds a durable entry link. */
+  let pcLinkActive = false
   const pcChannelName = (channel: 'lan' | 'remote'): string => channel === 'lan' ? t('lan') : t('remote')
   const syncPcControls = (): void => {
     const available = pcActiveChannel !== ''
     pcPair.disabled = !available || pcBusy
     pcPackage.disabled = !available || pcPackageBusy
+    pcPair.textContent = pcLinkActive ? t('pcCopyLink') : t('pcGenerateLink')
     pcPair.setAttribute('aria-busy', String(pcBusy))
     pcPackage.setAttribute('aria-busy', String(pcPackageBusy))
+    pcRegenerate.disabled = !available || pcBusy
+    pcRegenerate.hidden = !pcLinkActive
   }
   /** Copy one PC value, or show it for manual copying when the clipboard is denied. */
   const copyPcText = async (value: string, copied: string, kind: string): Promise<void> => {
@@ -1247,6 +1286,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
         pcActiveChannel = entry.channel
         renderPcChannels()
         syncPcControls()
+        refreshPcLinkState(entry.channel)
       })
       const copy = element('button', 'dsh-mobile-control__pc-copy'); copy.type = 'button'; copy.textContent = t('pcCopyUrl')
       copy.setAttribute('aria-label', t('pcCopyUrlAria', { channel: pcChannelName(entry.channel) }))
@@ -1259,7 +1299,6 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   }
   const renderPcInfo = (data: Record<string, unknown>): void => {
     const info = pcClientInfo(data)
-    pcEntryPath = info.entryPath
     pcPackagePath = info.packagePath
     pcChannels = info.channels
     if (!pcChannels.some(entry => entry.channel === pcActiveChannel)) pcActiveChannel = pcChannels[0]?.channel ?? ''
@@ -1267,6 +1306,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     if (info.certificateUrl !== undefined) pcCertificateLink.href = info.certificateUrl
     renderPcChannels()
     syncPcControls()
+    if (pcActiveChannel !== '') refreshPcLinkState(pcActiveChannel)
   }
   const loadPcInfo = (): void => {
     pcStatus.classList.remove('is-key')
@@ -1275,31 +1315,45 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       pcStatus.textContent = t('pcInfoFailed', { error: String(error) })
     })
   }
-  const generatePcKey = (): void => {
+  /** Ask the selected channel whether it already holds a durable entry link. */
+  const refreshPcLinkState = (channel: 'lan' | 'remote'): void => {
+    void controlRequestJson(`/api/mobile-access/${channel}/status`).then(data => {
+      if (pcActiveChannel !== channel) return
+      const entryLink = data.entryLink
+      pcLinkActive = typeof entryLink === 'object' && entryLink !== null
+        && (entryLink as Record<string, unknown>).active === true
+      syncPcControls()
+    }, () => {
+      // A channel that is not running cannot report its link; keep the current label.
+      if (pcActiveChannel !== channel) return
+      syncPcControls()
+    })
+  }
+  /** Show one entry link and put it on the clipboard, so no code has to be typed. */
+  const showPcLink = async (appKey: string, entryUrl: string, copied: string): Promise<void> => {
+    pcPairLinkValue.textContent = entryUrl
+    pcPairKeyValue.textContent = appKey
+    pcPairResult.hidden = false
+    await copyPcText(entryUrl, copied, t('pairingLink'))
+  }
+  const requestPcLink = (regenerate: boolean): void => {
     if (pcBusy || pcActiveChannel === '') return
     const channel = pcActiveChannel
-    const channelInfo = pcChannels.find(entry => entry.channel === channel)
-    if (channelInfo === undefined) return
     pcBusy = true
     syncPcControls()
-    pcPairResult.hidden = true
     pcStatus.classList.remove('is-key')
-    pcStatus.textContent = t('pcGeneratingKey')
-    // The pairing window is the same one the phone uses; only the entry link differs.
-    const path = channel === 'remote' ? '/api/mobile-access/remote/pairing/open' : '/api/mobile-access/lan/pairing/open'
-    void controlRequestJson(path, { method: 'POST', body: '{}' }).then(async data => {
+    pcStatus.textContent = t('pcGeneratingLink')
+    // The durable link is issued and stored by the channel's gateway, so every panel
+    // asks for the same link and only an explicit regeneration replaces it.
+    void controlRequestJson(`/api/mobile-access/${channel}/link`, {
+      method: 'POST',
+      body: JSON.stringify(regenerate ? { regenerate: true } : {}),
+    }).then(async data => {
       const appKey = typeof data.appKey === 'string' ? data.appKey : ''
-      if (appKey === '') { pcStatus.textContent = t('keyGenerationFailed'); return }
-      const entryUrl = `${channelInfo.origin}${pcEntryPath}#key=${encodeURIComponent(appKey)}`
-      // The window ends at a server-chosen instant, so the panel shows that instant
-      // rather than assuming the configured default.
-      const expiresAt = typeof data.expiresAt === 'number' && Number.isFinite(data.expiresAt) && data.expiresAt > 0 ? data.expiresAt : 0
-      pcPairKeyValue.textContent = appKey
-      pcPairLinkValue.textContent = entryUrl
-      pcPairExpiry.textContent = expiresAt === 0 ? '' : t('pcKeyExpires', { time: formatTime(expiresAt) })
-      pcPairExpiry.hidden = expiresAt === 0
-      pcPairResult.hidden = false
-      await copyPcText(entryUrl, t('pcKeyReady'), t('pairingLink'))
+      const entryUrl = typeof data.entryUrl === 'string' ? data.entryUrl : ''
+      if (appKey === '' || entryUrl === '') { pcStatus.textContent = t('keyGenerationFailed'); return }
+      pcLinkActive = true
+      await showPcLink(appKey, entryUrl, regenerate ? t('pcLinkRegenerated') : t('pcLinkReady'))
     }, error => { pcStatus.textContent = t('requestFailed', { error: String(error) }) }).finally(() => {
       pcBusy = false
       syncPcControls()
@@ -1332,7 +1386,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       syncPcControls()
     })
   }
-  pcPair.addEventListener('click', generatePcKey)
+  pcPair.addEventListener('click', () => { requestPcLink(false) })
   pcPackage.addEventListener('click', downloadPcPackage)
   syncPcControls()
   header.append(title, headerActions); actions.append(toggle, pair, linkPair)
@@ -1752,6 +1806,17 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     sakuraChoiceBadge.textContent = sakuraConfiguration.configured === true ? t('ready') : t('mainlandPreferred')
     sakuraTokenSet = sakuraConfiguration.tokenSet === true
     sakuraToken.placeholder = sakuraTokenSet ? t('sakuraTokenSaved') : t('tokenPlaceholder')
+    // Trusted entry: the mode decides whether the friend installs the plugin CA. The
+    // verified flag comes from the start-up probe, so the panel never promises a
+    // publicly trusted certificate on the strength of the setting alone.
+    sakuraEntryMode.value = sakuraProvider.entryMode === 'autoHttps' ? 'autoHttps' : 'tls'
+    sakuraBoundDomain.value = typeof sakuraProvider.boundDomain === 'string' ? sakuraProvider.boundDomain : ''
+    syncSakuraEntryFields()
+    const sakuraTrusted = sakuraProvider.trustedCertificate === true
+    const sakuraTrustedEntry = sakuraProvider.trustedEntry === true
+    sakuraTrustedNote.hidden = !sakuraTrustedEntry
+    sakuraTrustedNote.textContent = sakuraTrusted ? t('sakuraTrustedNote') : t('sakuraUntrustedNote')
+    sakuraTrustedNote.classList.toggle('is-key', sakuraTrustedEntry && !sakuraTrusted)
     const sakuraTunnelError = typeof sakuraConfiguration.errorCode === 'string' ? sakuraConfiguration.errorCode : ''
     const configuredSakuraTunnelName = typeof sakuraConfiguration.tunnelName === 'string' ? sakuraConfiguration.tunnelName : ''
     if (typeof sakuraConfiguration.tunnelId === 'number') configuredSakuraTunnelId = sakuraConfiguration.tunnelId
@@ -1971,8 +2036,20 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     }
     sakuraTunnelHint.textContent = t('sakuraTunnelHint')
   }
+  // The entry mode and the bound subdomain travel with the tunnel, so one save both
+  // picks the tunnel and decides how its public entry presents a certificate. The
+  // server reads an empty subdomain as "unchanged", so it is only sent when filled.
+  const sakuraConfigureBody = (tunnelId: number): string => {
+    const body: Record<string, unknown> = {
+      tunnelId,
+      entryMode: sakuraEntryMode.value === 'autoHttps' ? 'autoHttps' : 'tls',
+    }
+    const boundDomain = sakuraBoundDomain.value.trim()
+    if (boundDomain !== '') body.boundDomain = boundDomain
+    return JSON.stringify(body)
+  }
   const establishSakuraChannel = (tunnelId: number): Promise<Record<string, unknown>> =>
-    controlRequestJson('/api/mobile-access/remote/sakurafrp/configure', { method: 'POST', body: JSON.stringify({ tunnelId }) }, LONG_CONTROL_REQUEST_TIMEOUT_MS)
+    controlRequestJson('/api/mobile-access/remote/sakurafrp/configure', { method: 'POST', body: sakuraConfigureBody(tunnelId) }, LONG_CONTROL_REQUEST_TIMEOUT_MS)
   const sakuraTokenSaveClick = (): void => {
     if (remoteProviderBusy) return
     const token = sakuraToken.value.trim()
@@ -2029,13 +2106,20 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
       remoteStatus.textContent = t('sakuraTunnelEmpty')
       return
     }
+    // Automatic HTTPS without a bound subdomain cannot serve a trusted certificate,
+    // so ask for the subdomain instead of saving a channel that is known to fail.
+    if (sakuraEntryMode.value === 'autoHttps' && sakuraBoundDomain.value.trim() === '') {
+      remoteStatus.textContent = t('sakuraBoundDomainMissing')
+      sakuraBoundDomain.focus()
+      return
+    }
     remoteProviderBusy = true
     sakuraConfigure.disabled = true
     sakuraConfigure.setAttribute('aria-busy', 'true')
     sakuraConfigure.textContent = t('saving')
     // Saving now also establishes the channel (component check, tunnel API,
     // gateway start), so this request needs the long budget.
-    void controlRequestJson('/api/mobile-access/remote/sakurafrp/configure', { method: 'POST', body: JSON.stringify({ tunnelId }) }, LONG_CONTROL_REQUEST_TIMEOUT_MS)
+    void controlRequestJson('/api/mobile-access/remote/sakurafrp/configure', { method: 'POST', body: sakuraConfigureBody(tunnelId) }, LONG_CONTROL_REQUEST_TIMEOUT_MS)
       .then(data => {
         remoteStatus.textContent = t('sakuraConfigured')
         renderRemote(data)

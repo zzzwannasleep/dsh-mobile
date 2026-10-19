@@ -11,7 +11,7 @@
 | 使用固定 Cloudflare 域名，而非临时随机地址 | [命名隧道](CLOUDFLARE_TUNNEL.md) | [Named tunnel](CLOUDFLARE_TUNNEL.en.md) |
 | 页面加载慢、实时连接反复重连或长操作超时 | [慢链路与重连](SLOW_CONNECTIONS.md) | [Slow links and reconnection](SLOW_CONNECTIONS.en.md) |
 
-在 Android App 中连接远程通道时请选择 **远程访问**。远程通道仍要求 DSH Mobile 配对，不能直接暴露普通 DSH。SakuraFrp 仅支持 TCP 类型隧道，App 配对时固定插件私有 CA。
+在 Android App 中连接远程通道时请选择 **远程访问**。远程通道仍要求 DSH Mobile 配对，不能直接暴露普通 DSH。SakuraFrp 仅支持 TCP 类型隧道：默认模式由插件在本机用私有 CA 终结 TLS，App 配对时固定该 CA；把隧道绑定到子域名并开启自动 HTTPS 后，公网 TLS 改由 frpc 用 natfrp 的公开证书终结，App 按平台信任校验、不固定插件 CA，电脑端安装包也不含证书。
 
 ## 0.6.0 新增功能 / New features
 

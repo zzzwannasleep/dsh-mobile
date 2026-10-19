@@ -32,6 +32,7 @@ import {
 } from './access.js'
 import type { ResolvedGatewayConfig } from './config.js'
 import { ClientModulePreferenceStore, parseExcludedClientModules, type ClientModuleEntry, type ClientModulePreferenceView } from './client-module-preferences.js'
+import { JsonEntryLinkStore, createEntryLinkSecret } from './entry-link.js'
 import { cleanFrontendExclusions } from './client-module-clean.js'
 import { renderClientModuleRecoveryPage } from './client-module-recovery.js'
 import { ensureMobileCompatibility, MOBILE_COMPAT_PATH } from './mobile-compat-bootstrap.js'
@@ -1239,6 +1240,9 @@ export class MobileAccessGateway {
   private readonly clientModuleOperations = new Set<AbortController>()
   private readonly clientModuleTasks = new Set<Promise<ClientModulePreferenceView>>()
   private readonly clientModuleRevocations = new Set<Promise<void>>()
+  /** Durable PC entry link; the raw secret is only ever returned to the loopback admin. */
+  private readonly entryLinkStore: JsonEntryLinkStore
+  private entryLinkSecret: string | undefined
 
   constructor(
     readonly config: ResolvedGatewayConfig,
@@ -1253,6 +1257,9 @@ export class MobileAccessGateway {
     this.clientModulePreferences = clientModulePreferences ?? new ClientModulePreferenceStore(
       join(dirname(config.stateFile), `${basename(config.stateFile)}.client-modules.json`), config.excludedClientModules,
     )
+    // The durable entry link lives next to the device store, so each channel keeps
+    // its own link and a LAN link is never valid on the remote entry.
+    this.entryLinkStore = new JsonEntryLinkStore(dirname(config.stateFile))
     this.listenerTlsEnabled = config.tls.mode === 'provided'
     this.tlsEnabled = config.publicTls
     this.access = new AccessController(store, {
@@ -1307,6 +1314,17 @@ export class MobileAccessGateway {
     if (this.started || this.server !== undefined) throw new Error('mobile-access gateway cannot be started twice')
     this.started = true
     await this.access.initialize()
+    // Install the durable entry link before the listener accepts traffic. A file
+    // that cannot be read must not take mobile access down with it: warn, keep
+    // serving, and let the panel offer a fresh link.
+    try {
+      this.entryLinkSecret = await this.entryLinkStore.load()
+      this.access.setEntrySecret(this.entryLinkSecret)
+    } catch {
+      this.entryLinkSecret = undefined
+      this.access.setEntrySecret(undefined)
+      process.emitWarning('DSH Mobile: the stored PC entry link could not be read; generate a new link.', { code: 'DSH_MOBILE_ENTRY_LINK_INVALID' })
+    }
     try {
       await this.clientModulePreferences.initialize()
       if (this.config.pairingCaFile !== undefined) {
@@ -1647,6 +1665,37 @@ export class MobileAccessGateway {
     const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
     if (typeof body.token !== 'string' || (body.label !== undefined && typeof body.label !== 'string')) {
       throw new HttpError(400, 'bad_request')
+    }
+    // A durable entry link is opened again and again by the same computer, so pairing
+    // through it must not register a fresh device every time. When the request already
+    // carries a valid device binding, refresh that device's session instead. A one-time
+    // code keeps its original semantics, and a stale binding falls through to pairing.
+    if (this.access.matchesEntrySecret(body.token)
+      && this.renewLimiter.take(request.socket.remoteAddress ?? 'unknown', Date.now())) {
+      const cookies = browserAuthCookies(request.headers.cookie)
+      const bindings = this.tlsEnabled ? cookies.get(HOST_DEVICE_COOKIE) : undefined
+      if (bindings === undefined || bindings.length === 1) {
+        try {
+          const device = authenticatedCookie(
+            cookies.get(DEVICE_COOKIE) ?? [],
+            token => this.access.authorizeDevice(token),
+            candidate => bindings === undefined || candidate.deviceId === bindings[0],
+          )
+          const renewed = await this.access.renew(device.value)
+          this.setSessionCookies(response, renewed, Date.now())
+          this.setBrowserDeviceBinding(response, renewed.deviceId, device.result.deviceExpiresAt)
+          sendJson(response, 200, {
+            paired: true,
+            reused: true,
+            deviceId: renewed.deviceId,
+            csrfToken: renewed.csrfToken,
+            sessionExpiresAt: renewed.sessionExpiresAt,
+          }, this.tlsEnabled)
+          return
+        } catch (error) {
+          if (!(error instanceof HttpError) || error.status !== 401) throw error
+        }
+      }
     }
     const result = await this.access.pair(request.socket.remoteAddress ?? 'unknown', body.token, body.label as string | undefined)
     const now = Date.now()
@@ -3377,6 +3426,7 @@ export class MobileAccessGateway {
             sendJson(response, 200, {
               gateway: this.address(),
               pairing: this.access.pairingStatus(),
+              entryLink: this.access.entryLinkStatus(),
               deviceCount: this.access.listDevices().length,
               resources: {
                 connections: this.connectedSockets.size,
@@ -3418,6 +3468,31 @@ export class MobileAccessGateway {
               appPairUrl,
               qrSvg,
             }, false)
+            return
+          }
+          if (request.method === 'POST' && target.decodedPathname === `${prefix}/link`) {
+            const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+            if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') throw new HttpError(400, 'bad_request')
+            const created = body.regenerate === true || this.entryLinkSecret === undefined
+            if (created) {
+              const secret = createEntryLinkSecret()
+              await this.entryLinkStore.save(secret)
+              this.entryLinkSecret = secret
+              this.access.setEntrySecret(secret)
+            }
+            // A durable link is reusable, so the app key is the secret itself; the
+            // dsh1/dsh2 prefix only tells an old client whether our CA is pinned.
+            const requiresRemoteCa = this.config.pairingCaFile !== undefined && !this.config.discovery
+            const appKey = `dsh${requiresRemoteCa ? '2' : '1'}.${this.config.instanceId}.${this.entryLinkSecret as string}`
+            const entryUrl = `${this.address().origin}${PC_ENTRY_PATH}#key=${appKey}`
+            sendJson(response, created ? 201 : 200, { appKey, entryUrl, created }, false)
+            return
+          }
+          if (request.method === 'POST' && target.decodedPathname === `${prefix}/link/revoke`) {
+            await this.entryLinkStore.clear()
+            this.entryLinkSecret = undefined
+            this.access.setEntrySecret(undefined)
+            sendJson(response, 200, { revoked: true }, false)
             return
           }
           if (request.method === 'POST' && target.decodedPathname === `${prefix}/devices/revoke`) {

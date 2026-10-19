@@ -43,7 +43,7 @@
 
 DSH Mobile 是一个 DeepSeek Harness 插件，让手机浏览器或 Android App 通过局域网，或可选的 cloudflared 命名隧道、SakuraFrp 远程通道连接电脑，继续使用同一份会话、工作区、消息和工具。电脑端分别启停局域网与远程访问、分别管理配对授权；Android App 统一显示已配对电脑。插件不修改 DeepSeek Harness 源码。
 
-移动访问使用独立 HTTPS 与设备配对；Android App 固定局域网私有 CA；cloudflared 命名隧道使用 Cloudflare 边缘证书，SakuraFrp 通道由电脑端以配对私有 CA 终结 TLS，App 在配对时固定该 CA。
+移动访问使用独立 HTTPS 与设备配对；Android App 固定局域网私有 CA；cloudflared 命名隧道使用 Cloudflare 边缘证书；SakuraFrp 默认由电脑端以配对私有 CA 终结 TLS、App 在配对时固定该 CA，绑定子域并开启自动 HTTPS 后改用 natfrp 的公开证书。
 
 它还能在 DSH 对话里用 `/mobile <需求>` 定制手机端。
 
@@ -152,7 +152,7 @@ dsh plugin --profile web add dshmarket
 
 | 连接方式 | 需要准备 | 地址特点与注意事项 |
 | --- | --- | --- |
-| SakuraFrp（默认） | SakuraFrp 账号与访问密钥，创建一条 TCP 隧道 | 入口为节点域名/IP + 远程端口；App 配对时固定插件私有 CA |
+| SakuraFrp（默认） | SakuraFrp 账号与访问密钥，创建一条 TCP 隧道 | 默认入口为节点域名/IP + 远程端口，App 配对时固定插件私有 CA；绑定子域 + 自动 HTTPS 后入口为 `https://<子域>:<端口>`（端口 443 时省略），使用公开证书 |
 | cloudflared 命名隧道 | Cloudflare 账号与域名 | 固定域名；[配置指南](docs/CLOUDFLARE_TUNNEL.md) |
 
 <p align="center">
@@ -169,7 +169,7 @@ dsh plugin --profile web add dshmarket
 
 在面板选择对应通道后：
    - **cloudflared 命名隧道**：已有 Cloudflare 账号和域名时，填入连接器令牌、公网域名与本机转发端口，即可获得重启后不变的固定地址（令牌只存私有目录、只经环境变量传给 cloudflared）。步骤见 [Cloudflare 命名隧道](docs/CLOUDFLARE_TUNNEL.md)。
-   - **SakuraFrp**：在 [SakuraFrp 用户面板](https://www.natfrp.com/user/) 创建一条 **TCP 类型** 隧道（本地目标可留空，插件会自动把本地指向设为本机 DSH 网关端口），复制「访问密钥」粘贴到面板并保存，然后在隧道列表里选择该隧道并连接。frpc 官方组件按需下载校验到插件私有目录；远程入口是节点域名与远程端口（如 `https://frp-ski.com:58789`），App 配对时会固定插件私有 CA（浏览器直接访问会提示证书不受信任，属预期）。注意：内地节点按平台合规要求仅允许 HTTPS 访问；若隧道开启了「访问认证」，请在 SakuraFrp 面板关闭，否则手机 IP 变化后需要重新授权。
+   - **SakuraFrp**：在 [SakuraFrp 用户面板](https://www.natfrp.com/user/) 创建一条 **TCP 类型** 隧道（本地目标可留空，插件会自动把本地指向设为本机 DSH 网关端口），复制「访问密钥」粘贴到面板并保存，然后在隧道列表里选择该隧道并连接。frpc 官方组件按需下载校验到插件私有目录，默认模式下远程入口是节点域名与远程端口（如 `https://frp-ski.com:58789`），TLS 由插件在本机用配对私有 CA 终结，App 配对时会固定该 CA，浏览器直接访问会提示证书不受信任，属预期。想让入口免装证书，可在 SakuraFrp 面板把隧道 **绑定到一个免费子域** 并让「自动 HTTPS」保持「自动」，再在 **移动访问 → 远程** 的 SakuraFrp 设置里把 **公网入口证书** 选为 **SakuraFrp 自动 HTTPS（无需安装）**、在 **已绑定的子域名** 里填写该子域名（设置项 `entryMode: 'autoHttps'` 与 `boundDomain`；子域名要先在 SakuraFrp 面板绑定，面板不会保存空的子域名）：frpc 会加载 natfrp 为这个子域签发的证书并自己终结 TLS，入口变成 `https://<绑定子域>:<远程端口>`（端口 443 时省略），浏览器直接信任；隧道类型保持 TCP，插件的本地目标保持明文 HTTP。插件启动时用系统信任库实际握手验证，验证通过才标记为受信任；只开自动 HTTPS 而不绑定子域时 frpc 会用节点域名生成自签证书，插件会报告 `sakurafrp_certificate_untrusted`（这是如实提示，不是故障），选了自动 HTTPS 却没填子域会报告 `sakurafrp_bound_domain_missing`，取回的 frpc 配置没有可用本地目标会报告 `sakurafrp_config_unsupported`。注意：内地节点按平台合规要求仅允许 HTTPS 访问；若隧道开启了「访问认证」，请在 SakuraFrp 面板关闭，否则手机 IP 变化后需要重新授权。
 
 </details>
 
@@ -178,7 +178,7 @@ dsh plugin --profile web add dshmarket
 
 > **远程通知说明**：浏览器的 `Notification` 权限按 Origin 分别授权，网页系统通知只显示在运行该网页的设备上。Android App 的任务提醒是独立的 0.4.0 功能，需要在 App 内 DSH 的 **设置 → 通用设置** 中主动开启，且依赖 WebView 页面仍存活；它不是通用的后台推送。需要可靠的后台推送时，请使用你已配置的服务端 webhook 或机器人通道。
 
-cloudflared 命名隧道使用 Cloudflare 账号令牌，能保留重启后不变的固定公网域名，但有限流且依赖 Cloudflare 网络。SakuraFrp 适合需要国内节点与固定端口的用户；仅支持 TCP 类型隧道，远程入口是节点的 IP 与端口，请遵守 SakuraFrp 的服务条款（公开游戏服务器等用途有专门限制）。插件会校验按需下载的固定版本组件；本机托管的配置与程序保存在 `$DSH_HOME/mobile-access/`，可在面板中清理。
+cloudflared 命名隧道使用 Cloudflare 账号令牌，能保留重启后不变的固定公网域名，但有限流且依赖 Cloudflare 网络。SakuraFrp 适合需要国内节点与固定端口的用户；仅支持 TCP 类型隧道，默认入口是节点的 IP 与端口，绑定子域并开启自动 HTTPS 后入口是 `https://<子域>:<端口>` 并使用 natfrp 的公开证书，请遵守 SakuraFrp 的服务条款（公开游戏服务器等用途有专门限制）。插件会校验按需下载的固定版本组件；本机托管的配置与程序保存在 `$DSH_HOME/mobile-access/`，可在面板中清理。
 
 各通道的系统和组件支持范围见[兼容性](#兼容性)。本机托管的程序、凭据与配置可从面板清理。
 
@@ -186,7 +186,7 @@ cloudflared 命名隧道使用 Cloudflare 账号令牌，能保留重启后不�
 
 ### PC 端（Windows 浏览器）
 
-朋友在自己的 Windows 电脑上不需要安装 DSH 或客户端程序：在 **移动访问 → PC 端** 点击 **生成配对码**、**下载 PC 安装包**，把 `dsh-mobile-pc.zip` 发给他；他解压后按需信任证书、运行启动脚本并输入配对码，就能在浏览器里使用同一份 DSH，浏览器支持时还可以把入口页安装成桌面应用。配对码默认 5 分钟内有效、被第一台设备使用后即失效，直接发送面板里复制的 PC 入口链接最省事（输入框也接受配对码或应用密钥）；证书只在自签入口需要：cloudflared 命名隧道用 Cloudflare 边缘证书，SakuraFrp 只支持 TCP 隧道、由插件私有 CA 在本机终结 TLS。PC 使用独立的 `desktop.css` / `desktop.js` 定制层，与手机端的 `mobile.css` / `mobile.js` 互斥。完整步骤、证书与撤销说明见 [PC 端指南](docs/PC_CLIENT.md)。
+朋友在自己的 Windows 电脑上不需要安装 DSH 或客户端程序：在 **移动访问 → PC 端** 点击 **生成访问链接**（这条通道已有链接时，按钮显示为 **复制访问链接**）、**下载 PC 安装包**，把 `dsh-mobile-pc.zip` 和链接一起发给他；他解压后按需信任证书、运行启动脚本并打开链接，就能在浏览器里使用同一份 DSH，浏览器支持时还可以把入口页安装成桌面应用。访问链接不会过期、可以重复使用，**重新生成链接** 会让旧链接立即失效；**配对码（备用）** 留给手机端流程，仍是默认 5 分钟的一次性凭据。证书只在自签入口需要：cloudflared 命名隧道用 Cloudflare 边缘证书，SakuraFrp 默认由插件私有 CA 在本机终结 TLS、绑定子域并开启自动 HTTPS 后改用 natfrp 的公开证书，两者都不需要安装证书。PC 使用独立的 `desktop.css` / `desktop.js` 定制层，与手机端的 `mobile.css` / `mobile.js` 互斥。完整步骤、证书与撤销说明见 [PC 端指南](docs/PC_CLIENT.md)。
 
 这是待发布功能，随下一个插件版本提供；现有局域网、远程通道与 Android App 不受影响。
 

@@ -4,10 +4,14 @@
  * The archive is written by hand (STORE records, CRC-32, fixed timestamps) so
  * the plugin needs no compression dependency and identical input produces
  * byte-identical output. It never carries a pairing token, a device secret or
- * an absolute local path: the pairing code is short-lived (5 minutes by
- * default, `pairingTtlMs`) and single use, so the README tells the friend to
- * open the page first and then ask the owner for a fresh code or the whole
- * entry link.
+ * an absolute local path: the owner sends the durable entry link separately, so
+ * the README tells the friend to open that link first and only mentions the
+ * short-lived code (5 minutes by default, `pairingTtlMs`) as the fallback when
+ * the owner sent a code instead.
+ *
+ * A certificate step exists only for a self-signed entry: when the gateway
+ * supplies no certificate (cloudflared's edge certificate, or SakuraFrp
+ * 子域绑定 + 自动 HTTPS) the package ships none and says so.
  */
 
 /** Entry stored without compression inside the package ZIP. */
@@ -37,7 +41,11 @@ export interface PcPackageInput {
   readonly locale: PcPackageLocale
   /** Product label used in the README title; defaults to `DSH Mobile`. */
   readonly productName?: string
-  /** Included only when the gateway has a pairing certificate to share. */
+  /**
+   * Included only when the gateway has a pairing certificate to share. A
+   * publicly trusted entry — cloudflared, or SakuraFrp 子域绑定 + 自动 HTTPS —
+   * supplies none, and the README then says no certificate is needed.
+   */
   readonly certificate?: PcPackageCertificate
 }
 
@@ -306,7 +314,7 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
     titleSuffix: ' 电脑端使用说明',
     intro: [
       '这个压缩包里是电脑端访问 DSH 所需的文件。请先解压，然后按下面的步骤操作，不需要安装任何软件。',
-      '配对码由主人生成，会另外发给你。',
+      '主人会把配对链接发给你；打开链接即可，不需要手动输入配对码。',
     ],
     unzip: {
       title: '解压',
@@ -334,14 +342,13 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
       ],
     },
     pair: {
-      title: '输入配对码',
+      title: '打开主人发来的链接',
       body: [
-        '页面会要求输入配对码。请先打开页面，再向主人索取：配对码默认 5 分钟内有效，而且只能使用一次（主人可以在插件设置里把它改成 10 秒到 15 分钟）。',
-        '配对码被第一台设备成功使用后即失效，所以第二台电脑，或同一台电脑上的第二个浏览器，需要请主人重新生成。',
-        '输入框接受三种写法：原始配对码、应用密钥（dsh1.<实例>.<配对码>，自签远程入口是 dsh2.<实例>.<配对码>）或整条 PC 入口链接（形如 https://…/mobile-access/pc#key=…）。直接打开主人发来的链接最省事，不必手动输入。',
-        '主人在 DSH Mobile 的“PC 端”里点“生成配对码”，把配对码或链接发给你。',
-        '如果页面提示“配对码无效、已过期或已被使用”，请再向主人要一个新的；如果提示请求来源被拒绝，说明这台电脑和主人的电脑不在同一网络，或链接地址不对。',
+        '主人会把 PC 入口链接发给你（形如 https://…/mobile-access/pc#key=…）。直接打开它，浏览器会自动完成配对，不需要输入任何内容。',
+        '如果你只拿到一个配对码，也可以打开上面的地址，把配对码粘进页面上的输入框：配对码默认 5 分钟内有效，而且只能使用一次（主人可以在插件设置里把它改成 10 秒到 15 分钟）。',
+        '输入框同样接受原始配对码、应用密钥（dsh1.<实例>.<配对码>，自签远程入口是 dsh2.<实例>.<配对码>）或整条 PC 入口链接。',
         '配对成功后这台电脑会被记住，以后打开不需要再次输入。',
+        '如果页面提示链接或配对码无效、已过期或已被使用，请再向主人要一个新的；如果提示请求来源被拒绝，说明这台电脑和主人的电脑不在同一网络，或链接地址不对。',
       ],
     },
     install: {
@@ -358,13 +365,13 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
       '如果页面打不开，或浏览器提示连接不安全，请把屏幕上的提示告诉主人。',
     ],
     certificateNote: '证书只安装到当前 Windows 用户，仅用于这条加密连接。',
-    noCertificateNote: '本安装包不包含证书文件。',
+    noCertificateNote: '无需安装证书，直接打开链接即可。',
   },
   en: {
     titleSuffix: ' on your PC',
     intro: [
       'This archive contains the files for using DSH on a Windows PC. Unzip it first, then follow the steps below; you do not need to install any software.',
-      'The pairing code is created by the owner and sent to you separately.',
+      'The owner sends you a pairing link; open it and there is nothing to type.',
     ],
     unzip: {
       title: 'Unzip',
@@ -392,14 +399,13 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
       ],
     },
     pair: {
-      title: 'Enter the pairing code',
+      title: 'Open the link the owner sent',
       body: [
-        'The page asks for a pairing code. Open the page first, then ask the owner: a code is valid for 5 minutes by default and can be used only once (the owner can change the time from 10 seconds to 15 minutes).',
-        'The first device to pair consumes the code, so a second PC, or a second browser on the same PC, needs a freshly generated code.',
-        'The field accepts three forms: the raw code, the app key (dsh1.<instance>.<code>, or dsh2.<instance>.<code> for a self-signed remote entry) or the whole PC entry link (shaped like https://…/mobile-access/pc#key=…). Opening the link the owner sent you is the easiest path; there is nothing to type.',
-        'In DSH Mobile the owner opens the "PC" tab, clicks "Generate pairing code", and sends you the code or the link.',
-        'If the page says the code is invalid, expired or already used, ask the owner for a new one; if it says the request source was refused, this PC and the owner\'s computer are not on the same network, or the link address is wrong.',
+        'The owner sends you the PC entry link (shaped like https://…/mobile-access/pc#key=…). Open it directly: the browser pairs this PC automatically, with nothing to type.',
+        'If you only received a pairing code, open the address above and paste the code into the field on the page: a code is valid for 5 minutes by default and can be used only once (the owner can change the time from 10 seconds to 15 minutes).',
+        'The field also accepts the raw code, the app key (dsh1.<instance>.<code>, or dsh2.<instance>.<code> for a self-signed remote entry) or the whole PC entry link.',
         'After pairing, this PC is remembered and you do not need a new code next time.',
+        'If the page says the link or code is invalid, expired or already used, ask the owner for a new one; if it says the request source was refused, this PC and the owner\'s computer are not on the same network, or the link address is wrong.',
       ],
     },
     install: {
@@ -416,13 +422,13 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
       'If the page does not open, or the browser warns about the connection, show the owner what the page says.',
     ],
     certificateNote: 'The certificate is installed for the current Windows user only and only for this connection.',
-    noCertificateNote: 'This package does not include a certificate file.',
+    noCertificateNote: 'No certificate is needed: just open the link.',
   },
   it: {
     titleSuffix: ' sul tuo PC',
     intro: [
       'Questo archivio contiene i file per usare DSH su un PC Windows. Estrailo prima, poi segui i passaggi qui sotto; non devi installare nulla.',
-      'Il codice di abbinamento viene creato dal proprietario e ti arriva separatamente.',
+      'Il proprietario ti invia un link di abbinamento: aprilo e non devi digitare nulla.',
     ],
     unzip: {
       title: 'Estrai l\'archivio',
@@ -450,14 +456,13 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
       ],
     },
     pair: {
-      title: 'Inserisci il codice di abbinamento',
+      title: 'Apri il link che ti ha inviato il proprietario',
       body: [
-        'La pagina chiede il codice di abbinamento. Apri prima la pagina e poi chiedilo al proprietario: il codice vale 5 minuti per impostazione predefinita e si usa una sola volta (il proprietario può cambiare la durata da 10 secondi a 15 minuti).',
-        'Il codice viene consumato dalla prima apparecchiatura che si abbina, quindi un secondo PC, o un secondo browser sullo stesso PC, ha bisogno di un codice nuovo.',
-        'Il campo accetta tre forme: il codice grezzo, la chiave di abbinamento (dsh1.<istanza>.<codice>, oppure dsh2.<istanza>.<codice> per un ingresso remoto autofirmato) o l\'intero link di ingresso al PC (del tipo https://…/mobile-access/pc#key=…). Aprire il link che ti ha inviato il proprietario è la via più semplice: non devi digitare nulla.',
-        'In DSH Mobile il proprietario apre la scheda "PC", fa clic su "Genera codice di abbinamento" e ti invia il codice o il link.',
-        'Se la pagina dice che il codice non è valido, è scaduto o è già stato usato, chiedine uno nuovo al proprietario; se dice che l\'origine della richiesta è stata rifiutata, questo PC e il computer del proprietario non sono sulla stessa rete, oppure l\'indirizzo del link è sbagliato.',
+        'Il proprietario ti invia il link di ingresso al PC (del tipo https://…/mobile-access/pc#key=…). Aprilo direttamente: il browser abbina questo PC da solo, senza digitare nulla.',
+        'Se hai ricevuto solo un codice di abbinamento, apri l\'indirizzo qui sopra e incolla il codice nel campo della pagina: il codice vale 5 minuti per impostazione predefinita e si usa una sola volta (il proprietario può cambiare la durata da 10 secondi a 15 minuti).',
+        'Il campo accetta anche il codice grezzo, la chiave di abbinamento (dsh1.<istanza>.<codice>, oppure dsh2.<istanza>.<codice> per un ingresso remoto autofirmato) o l\'intero link di ingresso al PC.',
         'Dopo l\'abbinamento questo PC viene ricordato e non serve un nuovo codice.',
+        'Se la pagina dice che il link o il codice non è valido, è scaduto o è già stato usato, chiedine uno nuovo al proprietario; se dice che l\'origine della richiesta è stata rifiutata, questo PC e il computer del proprietario non sono sulla stessa rete, oppure l\'indirizzo del link è sbagliato.',
       ],
     },
     install: {
@@ -474,7 +479,7 @@ const README_COPY: Record<PcPackageLocale, ReadmeCopy> = {
       'Se la pagina non si apre o il browser segnala la connessione, mostra al proprietario il messaggio che compare.',
     ],
     certificateNote: 'Il certificato viene installato solo per l\'utente Windows corrente e solo per questa connessione.',
-    noCertificateNote: 'Questo pacchetto non include un file di certificato.',
+    noCertificateNote: 'Non serve alcun certificato: apri semplicemente il link.',
   },
 }
 

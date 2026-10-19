@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { lstat, readFile } from 'node:fs/promises'
+import { request as httpsRequest } from 'node:https'
 import { createServer } from 'node:net'
 import { isAbsolute, join, resolve } from 'node:path'
 import { isIP } from './ip.js'
@@ -16,9 +17,17 @@ import { settleRemoteResources, terminateRemoteProcess, type RemoteProviderContr
  * v4 API with the user's 访问密钥 (access token), points an existing TCP tunnel
  * at the local DSH remote gateway, fetches a ready-to-run upstream frpc config
  * from `/tunnel/config`, and runs the pinned upstream frpc the component manager
- * already installs. The gateway terminates TLS itself with the pairing-CA-signed
- * ingress certificate, so the Android app can pin the CA exactly as it did for
- * the removed self-hosted FRP channel.
+ * already installs.
+ *
+ * The public entry has two modes. In the default `tls` mode a plain TCP tunnel
+ * forwards raw TCP, so the gateway itself terminates TLS with the pairing-CA
+ * signed ingress certificate and the Android app pins that CA; friends on a PC
+ * must trust the same CA. In `autoHttps` mode the owner binds a natfrp subdomain
+ * (子域绑定) and leaves 自动 HTTPS on 自动, so frpc loads the provider's own
+ * certificate for that subdomain and terminates TLS itself, forwarding plaintext
+ * HTTP to the local gateway
+ * (https://doc.natfrp.com/bestpractice/domain-bind.html). The entry is then
+ * publicly trusted and no certificate step is needed anywhere.
  */
 
 export const SAKURAFRP_API_BASE = 'https://api.natfrp.com/v4'
@@ -42,6 +51,16 @@ const MAX_TOKEN_LENGTH = 512
 /** Product-facing states, shared with the other remote providers. */
 export type SakuraFrpState = 'off' | 'unavailable' | 'starting' | 'connecting' | 'ready' | 'error'
 
+/**
+ * How the public entry terminates TLS.
+ *
+ * `tls` is a raw TCP tunnel whose TLS endpoint is the plugin's own gateway,
+ * signed by the pairing CA the app pins. `autoHttps` is natfrp's 子域绑定 +
+ * 自动 HTTPS mode: frpc terminates TLS with the provider's certificate for the
+ * bound subdomain and forwards plaintext HTTP to the local gateway.
+ */
+export type SakuraFrpEntryMode = 'tls' | 'autoHttps'
+
 /** Safe SakuraFrp state returned only through the loopback DSH control route. */
 export interface SakuraFrpStatus {
   readonly enabled: boolean
@@ -49,6 +68,10 @@ export interface SakuraFrpStatus {
   readonly origin?: string
   readonly loginUrl?: string
   readonly errorCode?: string
+  /** The configured entry is publicly trusted, so no client certificate step applies. */
+  readonly trustedEntry?: boolean
+  /** The public entry certificate verified against the system trust store. */
+  readonly trustedCertificate?: boolean
 }
 
 /** One tunnel as returned by `GET /tunnels`; only the fields we consume are typed. */
@@ -70,6 +93,10 @@ export interface SakuraFrpTunnel {
 export interface SakuraFrpConfiguration {
   readonly tokenSet: boolean
   readonly tunnelId?: number
+  /** Always present: the resolved entry mode, defaulting to `tls`. */
+  readonly entryMode: SakuraFrpEntryMode
+  /** The bound natfrp subdomain when the owner saved one. */
+  readonly boundDomain?: string
   readonly storagePath: string
 }
 
@@ -89,6 +116,39 @@ export function validateSakuraFrpTunnelId(value: unknown): number {
     throw new Error('sakurafrp_tunnel_id_invalid')
   }
   return Number(value)
+}
+
+/** Validate the entry mode selected in the desktop panel. */
+export function validateSakuraFrpEntryMode(value: unknown): SakuraFrpEntryMode {
+  if (value !== 'tls' && value !== 'autoHttps') throw new Error('sakurafrp_entry_mode_invalid')
+  return value
+}
+
+/** Maximum length of one DNS label, in characters. */
+const MAX_DNS_LABEL_LENGTH = 63
+/** Maximum length of a DNS name, in characters. */
+const MAX_DNS_NAME_LENGTH = 253
+const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u
+
+/**
+ * Validate the natfrp subdomain bound to the tunnel.
+ *
+ * The bound domain becomes the public entry host, so it must be a lowercase DNS
+ * name the URL parser and the TLS SNI extension both accept: 3–253 characters,
+ * at least two labels of 1–63 characters, only `[a-z0-9-]`, and no leading or
+ * trailing hyphen inside a label.
+ */
+export function validateSakuraFrpBoundDomain(value: unknown): string {
+  if (typeof value !== 'string' || value.length < 3 || value.length > MAX_DNS_NAME_LENGTH
+    || value !== value.toLowerCase() || value.endsWith('.')) {
+    throw new Error('sakurafrp_bound_domain_invalid')
+  }
+  const labels = value.split('.')
+  if (labels.length < 2
+    || labels.some(label => label.length < 1 || label.length > MAX_DNS_LABEL_LENGTH || !DNS_LABEL_PATTERN.test(label))) {
+    throw new Error('sakurafrp_bound_domain_invalid')
+  }
+  return value
 }
 
 function tunnelType(value: unknown): string {
@@ -269,10 +329,85 @@ export function createSakuraFrpApiClient(options: { readonly fetchImpl?: typeof 
 
 const MAX_SETTINGS_BYTES = 4 * 1024
 
-/** Persisted provider settings: the access token and the selected tunnel id. */
+/**
+ * TOML/INI assignment whose local target is a single `host:port` address.
+ *
+ * natfrp's own frpc distribution is configured in INI (`plugin_local_addr`),
+ * while the pinned upstream frp 0.70.1 this plugin runs reads TOML, where the
+ * `https2http` plugin names the same target `localAddr`. Both spellings are
+ * accepted so the rewrite does not depend on which generator answered.
+ */
+const PLUGIN_LOCAL_ADDR = /^(\s*(?:plugin_local_addr|localAddr)\s*=\s*)("?)([^"#\r\n]*?)("?)(\s*(?:[#;].*)?)$/iu
+/** TOML/INI assignment whose local target is the numeric proxy port. */
+const LOCAL_PORT = /^(\s*(?:local_port|localPort)\s*=\s*)("?)(\d+)("?)(\s*(?:[#;].*)?)$/iu
+/** TOML/INI assignment whose local target is the bind address. */
+const LOCAL_IP = /^(\s*(?:local_ip|localIP)\s*=\s*)("?)([^"#\s]+)("?)(\s*(?:[#;].*)?)$/iu
+
+/**
+ * Rewrite one config text line by line, keeping CRLF endings and untouched
+ * lines byte-identical. Returns undefined when no line matched.
+ */
+function replaceConfigLines(config: string, rewrite: (line: string) => string | undefined): string | undefined {
+  let changed = false
+  const text = config.split('\n').map(rawLine => {
+    const ending = rawLine.endsWith('\r') ? '\r' : ''
+    const line = ending === '' ? rawLine : rawLine.slice(0, -1)
+    const next = rewrite(line)
+    if (next === undefined) return rawLine
+    changed = true
+    return `${next}${ending}`
+  }).join('\n')
+  return changed ? text : undefined
+}
+
+/**
+ * Point the fetched frpc config at the local plaintext ingress port.
+ *
+ * natfrp's `/tunnel/config` generates the proxy block from the tunnel the owner
+ * configured, and 自动 HTTPS adds a plugin that forwards to
+ * `plugin_local_addr` (INI) or `localAddr` (TOML). The public host is natfrp's,
+ * but the local target must be this plugin's loopback ingress, so the plugin
+ * rewrites whichever shape the config uses: the plugin address when present,
+ * otherwise the proxy's `local_port` (and `local_ip` when present), in either
+ * the INI or the TOML spelling. Indentation, quoting and trailing comments
+ * survive the rewrite; a config with neither shape cannot forward anything and
+ * fails with `sakurafrp_config_unsupported` instead of silently serving nothing.
+ */
+export function patchSakuraFrpConfigTarget(config: string, port: number): string {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error('sakurafrp_config_unsupported')
+  }
+  const target = `127.0.0.1:${String(port)}`
+  const pluginPatched = replaceConfigLines(config, line => {
+    const match = PLUGIN_LOCAL_ADDR.exec(line)
+    return match === null ? undefined : `${match[1]}${match[2]}${target}${match[4]}${match[5]}`
+  })
+  if (pluginPatched !== undefined) return pluginPatched
+  const localPortPatched = replaceConfigLines(config, line => {
+    const match = LOCAL_PORT.exec(line)
+    return match === null ? undefined : `${match[1]}${match[2]}${String(port)}${match[4]}${match[5]}`
+  })
+  if (localPortPatched === undefined) throw new Error('sakurafrp_config_unsupported')
+  return replaceConfigLines(localPortPatched, line => {
+    const match = LOCAL_IP.exec(line)
+    return match === null ? undefined : `${match[1]}${match[2]}127.0.0.1${match[4]}${match[5]}`
+  }) ?? localPortPatched
+}
+
+/**
+ * Persisted provider settings: the access token, the selected tunnel id and how
+ * the public entry terminates TLS.
+ *
+ * `entryMode` defaults to `tls`, so a settings file written before the field
+ * existed keeps the raw-TCP behaviour byte for byte: the gateway terminates TLS
+ * with the pairing CA and the app pins it. `autoHttps` selects natfrp's 子域绑定
+ * + 自动 HTTPS mode and requires `boundDomain`.
+ */
 export interface SakuraFrpSettings {
   readonly token?: string
   readonly tunnelId?: number
+  readonly entryMode: SakuraFrpEntryMode
+  readonly boundDomain?: string
 }
 
 function parseSakuraFrpSettings(value: unknown): SakuraFrpSettings {
@@ -280,15 +415,22 @@ function parseSakuraFrpSettings(value: unknown): SakuraFrpSettings {
     throw new Error('sakurafrp_settings_invalid')
   }
   const record = value as Record<string, unknown>
-  if (Reflect.ownKeys(record).some(key => key !== 'version' && key !== 'token' && key !== 'tunnelId')) {
+  if (Reflect.ownKeys(record).some(key => key !== 'version' && key !== 'token' && key !== 'tunnelId'
+    && key !== 'entryMode' && key !== 'boundDomain')) {
     throw new Error('sakurafrp_settings_invalid')
   }
   if (record.version !== undefined && record.version !== 1) throw new Error('sakurafrp_settings_invalid')
   const token = record.token === undefined || record.token === '' ? undefined : validateSakuraFrpToken(record.token)
   const tunnelId = record.tunnelId === undefined ? undefined : validateSakuraFrpTunnelId(record.tunnelId)
+  const entryMode = record.entryMode === undefined ? 'tls' : validateSakuraFrpEntryMode(record.entryMode)
+  const boundDomain = record.boundDomain === undefined || record.boundDomain === ''
+    ? undefined
+    : validateSakuraFrpBoundDomain(record.boundDomain)
   return Object.freeze({
     ...(token === undefined ? {} : { token }),
     ...(tunnelId === undefined ? {} : { tunnelId }),
+    entryMode,
+    ...(boundDomain === undefined ? {} : { boundDomain }),
   })
 }
 
@@ -297,7 +439,7 @@ export class SakuraFrpSettingsStore {
   readonly stateRoot: string
   readonly settingsFile: string
   readonly configFile: string
-  private settingsValue: SakuraFrpSettings = Object.freeze({})
+  private settingsValue: SakuraFrpSettings = Object.freeze({ entryMode: 'tls' })
   private errorCode: string | undefined
 
   constructor(stateDirectory: string, private readonly ownedRoot = stateDirectory) {
@@ -309,7 +451,7 @@ export class SakuraFrpSettingsStore {
 
   /** Load private settings while rejecting links, oversized files and unknown fields. */
   async initialize(): Promise<void> {
-    this.settingsValue = Object.freeze({})
+    this.settingsValue = Object.freeze({ entryMode: 'tls' })
     this.errorCode = undefined
     try { await assertManagedParents(this.ownedRoot, this.settingsFile, 'sakurafrp') } catch {
       this.errorCode = 'sakurafrp_settings_invalid'
@@ -329,7 +471,7 @@ export class SakuraFrpSettingsStore {
       this.settingsValue = parseSakuraFrpSettings(JSON.parse(await readFile(this.settingsFile, 'utf8')) as unknown)
       this.errorCode = undefined
     } catch {
-      this.settingsValue = Object.freeze({})
+      this.settingsValue = Object.freeze({ entryMode: 'tls' })
       this.errorCode = 'sakurafrp_settings_invalid'
     }
   }
@@ -340,6 +482,8 @@ export class SakuraFrpSettingsStore {
     return Object.freeze({
       tokenSet: settings.token !== undefined,
       ...(settings.tunnelId === undefined ? {} : { tunnelId: settings.tunnelId }),
+      entryMode: settings.entryMode,
+      ...(settings.boundDomain === undefined ? {} : { boundDomain: settings.boundDomain }),
       storagePath: this.stateRoot,
     })
   }
@@ -350,14 +494,27 @@ export class SakuraFrpSettingsStore {
   }
 
   /** Merge a partial write; an empty string keeps the stored value. */
-  async configure(partial: { readonly token?: unknown; readonly tunnelId?: unknown }): Promise<SakuraFrpConfiguration> {
+  async configure(partial: {
+    readonly token?: unknown
+    readonly tunnelId?: unknown
+    readonly entryMode?: unknown
+    readonly boundDomain?: unknown
+  }): Promise<SakuraFrpConfiguration> {
     const token = partial.token === '' || partial.token === undefined ? this.settingsValue.token : validateSakuraFrpToken(partial.token)
     const tunnelId = partial.tunnelId === undefined || partial.tunnelId === ''
       ? this.settingsValue.tunnelId
       : validateSakuraFrpTunnelId(partial.tunnelId)
+    const entryMode = partial.entryMode === undefined || partial.entryMode === ''
+      ? this.settingsValue.entryMode
+      : validateSakuraFrpEntryMode(partial.entryMode)
+    const boundDomain = partial.boundDomain === undefined || partial.boundDomain === ''
+      ? this.settingsValue.boundDomain
+      : validateSakuraFrpBoundDomain(partial.boundDomain)
     const settings = Object.freeze({
       ...(token === undefined ? {} : { token }),
       ...(tunnelId === undefined ? {} : { tunnelId }),
+      entryMode,
+      ...(boundDomain === undefined ? {} : { boundDomain }),
     })
     await writeManagedPrivateFile(this.ownedRoot, this.settingsFile, `${JSON.stringify(settings)}\n`, 'sakurafrp')
     this.settingsValue = settings
@@ -369,7 +526,7 @@ export class SakuraFrpSettingsStore {
   async purge(): Promise<SakuraFrpConfiguration> {
     await removeManagedTree(this.ownedRoot, this.settingsFile, 'sakurafrp')
     await removeManagedTree(this.ownedRoot, this.configFile, 'sakurafrp')
-    this.settingsValue = Object.freeze({})
+    this.settingsValue = Object.freeze({ entryMode: 'tls' })
     this.errorCode = undefined
     return this.status()
   }
@@ -425,14 +582,80 @@ export function isSakuraFrpRegistration(line: string): boolean {
     || /proxy added/iu.test(line)
 }
 
+/**
+ * Verdict of verifying the public entry certificate against the system trust
+ * store. `unreachable` means the probe itself could not complete, so the
+ * certificate stays unverified rather than being reported as untrusted.
+ */
+export type SakuraFrpCertificateProbe = 'trusted' | 'untrusted' | 'unreachable'
+
+/** Node TLS error codes that mean the presented certificate is not trusted. */
+const CERTIFICATE_ERROR_PATTERN = /CERT|SELF_SIGNED|UNABLE_TO_GET_ISSUER|UNABLE_TO_VERIFY_LEAF/u
+
+function isCertificateFailure(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return typeof code === 'string' && CERTIFICATE_ERROR_PATTERN.test(code)
+}
+
+/**
+ * Ask the public entry for its health page over HTTPS with the system trust
+ * store, and report whether the certificate really verifies.
+ *
+ * No `ca` is supplied, so this is the same verification a friend's browser
+ * performs: a self-signed leaf — the plugin's own ingress CA, or 自动 HTTPS
+ * being switched off — fails with a certificate error and answers `untrusted`.
+ * Only that verdict fails the tunnel; a probe that never completed stays
+ * `unreachable` so a transient network problem cannot take a working entry down.
+ */
+export function probeSakuraFrpTrustedCertificate(origin: string, timeoutMs = 5_500): Promise<SakuraFrpCertificateProbe> {
+  return new Promise<SakuraFrpCertificateProbe>(resolveProbe => {
+    let settled = false
+    let timer: NodeJS.Timeout | undefined
+    const finish = (outcome: SakuraFrpCertificateProbe): void => {
+      if (settled) return
+      settled = true
+      if (timer !== undefined) clearTimeout(timer)
+      resolveProbe(outcome)
+    }
+    let target: URL
+    try {
+      target = new URL('/mobile-access/health', origin)
+    } catch {
+      finish('unreachable')
+      return
+    }
+    const request = httpsRequest(target, {
+      method: 'GET',
+      headers: { 'user-agent': 'dsh-mobile-sakurafrp-probe' },
+    }, response => {
+      response.resume()
+      finish('trusted')
+    })
+    timer = setTimeout(() => {
+      request.destroy()
+      finish('unreachable')
+    }, timeoutMs)
+    timer.unref()
+    request.on('error', error => { finish(isCertificateFailure(error) ? 'untrusted' : 'unreachable') })
+    request.end()
+  })
+}
+
 /** Controller inputs; the API client and process spawn are injectable for tests. */
 export interface SakuraFrpControllerOptions {
   readonly store: MobileAccessControlStore
   readonly settings: SakuraFrpSettingsStore
   /** The pinned upstream frpc owned by the component manager. */
   readonly component: { readonly executable: string }
-  /** Creates the DSH remote gateway; TLS termination mode is the factory's choice. */
+  /** Creates the TLS-terminating gateway used by the raw-TCP `tls` mode. */
   readonly createGateway: (publicOrigin: string, listenPort: number) => Promise<MobileAccessGateway>
+  /**
+   * Creates the plaintext loopback ingress used by `autoHttps`, where frpc owns
+   * TLS termination and forwards plain HTTP.
+   */
+  readonly createTrustedGateway: (publicOrigin: string, listenPort: number) => Promise<MobileAccessGateway>
+  /** Verifies the public entry certificate; injectable for tests. */
+  readonly probeCertificate?: (origin: string) => Promise<SakuraFrpCertificateProbe>
   readonly api?: SakuraFrpApiClient
   readonly frpcVersion?: string
   readonly onStatus?: (status: SakuraFrpStatus) => void
@@ -490,7 +713,7 @@ export class SakuraFrpController implements RemoteProviderController {
 
   /** Return state safe for the desktop control UI. */
   status(): SakuraFrpStatus {
-    return publicStatus(this.latest)
+    return publicStatus({ ...this.latest, trustedEntry: this.trustedEntry() })
   }
 
   /** Enable or disable SakuraFrp without changing LAN or other provider state. */
@@ -562,6 +785,10 @@ export class SakuraFrpController implements RemoteProviderController {
       this.publish({ enabled: true, state: 'unavailable', loginUrl: SAKURAFRP_LOGIN_URL, errorCode: 'sakurafrp_tunnel_missing' })
       return
     }
+    if (settings.entryMode === 'autoHttps' && settings.boundDomain === undefined) {
+      this.publish({ enabled: true, state: 'unavailable', loginUrl: SAKURAFRP_LOGIN_URL, errorCode: 'sakurafrp_bound_domain_missing' })
+      return
+    }
     let executableEntry
     try { executableEntry = await lstat(this.options.component.executable) } catch {
       this.publish({ enabled: true, state: 'unavailable', errorCode: 'sakurafrp_component_missing' })
@@ -586,17 +813,32 @@ export class SakuraFrpController implements RemoteProviderController {
     }
     if (tunnel.status === 2) { await this.failGeneration(generation, 'sakurafrp_tunnel_banned'); return }
     if (tunnel.type !== 'tcp') { await this.failGeneration(generation, 'sakurafrp_tunnel_type_unsupported'); return }
-    // The entry host prefers the tunnel's export field; the common case is
-    // export=false, so the node list (keyed by node id) provides the public host.
-    const entry = deriveSakuraFrpEntry(tunnel) ?? await (async () => {
-      try { return deriveSakuraFrpNodeEntry(tunnel, await api.listNodes(settings.token as string)) }
-      catch (error) {
-        await this.failGeneration(generation, error instanceof Error ? error.message : 'sakurafrp_api_error')
-        return undefined
+    let origin: string
+    if (settings.entryMode === 'autoHttps') {
+      // 子域绑定 + 自动 HTTPS: frpc loads the provider's certificate for the
+      // bound subdomain and terminates TLS itself, so the public host is that
+      // subdomain rather than the node address a raw TCP tunnel would expose.
+      const remotePort = Number(tunnel.remote)
+      if (!Number.isSafeInteger(remotePort) || remotePort < 1 || remotePort > 65_535) {
+        await this.failGeneration(generation, 'sakurafrp_entry_unknown')
+        return
       }
-    })()
-    if (entry === undefined) { await this.failGeneration(generation, 'sakurafrp_entry_unknown'); return }
-    const origin = new URL(`https://${entry.host}:${String(entry.port)}`).origin
+      // `new URL` drops the default port, so a remote port of 443 becomes a
+      // bare `https://<boundDomain>` origin.
+      origin = new URL(`https://${settings.boundDomain}:${String(remotePort)}`).origin
+    } else {
+      // The entry host prefers the tunnel's export field; the common case is
+      // export=false, so the node list (keyed by node id) provides the public host.
+      const entry = deriveSakuraFrpEntry(tunnel) ?? await (async () => {
+        try { return deriveSakuraFrpNodeEntry(tunnel, await api.listNodes(settings.token as string)) }
+        catch (error) {
+          await this.failGeneration(generation, error instanceof Error ? error.message : 'sakurafrp_api_error')
+          return undefined
+        }
+      })()
+      if (entry === undefined) { await this.failGeneration(generation, 'sakurafrp_entry_unknown'); return }
+      origin = new URL(`https://${entry.host}:${String(entry.port)}`).origin
+    }
     this.originValue = origin
 
     // Prefer the port the tunnel already forwards to so an existing dedicated
@@ -636,7 +878,9 @@ export class SakuraFrpController implements RemoteProviderController {
     await this.releaseReservation(reservation)
     let gateway: MobileAccessGateway
     try {
-      gateway = await this.options.createGateway(origin, reservation.port)
+      gateway = await (settings.entryMode === 'autoHttps'
+        ? this.options.createTrustedGateway(origin, reservation.port)
+        : this.options.createGateway(origin, reservation.port))
     } catch (error) {
       const conflict = (error as NodeJS.ErrnoException | undefined)?.code === 'EADDRINUSE'
       await this.failGeneration(generation, conflict ? 'sakurafrp_tunnel_port_unavailable' : 'gateway_start_failed')
@@ -651,6 +895,10 @@ export class SakuraFrpController implements RemoteProviderController {
     let config: string
     try {
       config = await api.fetchTunnelConfig(settings.token, tunnel.id, frpcVersion)
+      // natfrp generates the proxy block from the tunnel, so in trusted mode the
+      // local target still has to be moved onto the plaintext ingress. The
+      // config text is written as-is in `tls` mode, exactly as before.
+      if (settings.entryMode === 'autoHttps') config = patchSakuraFrpConfigTarget(config, reservation.port)
     } catch (error) {
       await this.failGeneration(generation, error instanceof Error ? error.message : 'sakurafrp_config_fetch_failed')
       return
@@ -730,7 +978,38 @@ export class SakuraFrpController implements RemoteProviderController {
     if (this.gatewayValue === undefined || this.latest.state === 'ready') return
     if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
     this.startupTimer = undefined
-    this.publish({ enabled: true, state: 'ready', ...(this.originValue === undefined ? {} : { origin: this.originValue }), loginUrl: SAKURAFRP_LOGIN_URL })
+    const origin = this.originValue
+    const ready = (trustedCertificate?: boolean): void => {
+      this.publish({
+        enabled: true,
+        state: 'ready',
+        ...(origin === undefined ? {} : { origin }),
+        loginUrl: SAKURAFRP_LOGIN_URL,
+        ...(trustedCertificate === undefined ? {} : { trustedCertificate }),
+      })
+    }
+    if (!this.trustedEntry() || origin === undefined) {
+      ready()
+      return
+    }
+    // 自动 HTTPS promises a publicly trusted entry, so readiness claims it only
+    // after the real handshake verifies against the system trust store. A
+    // self-signed answer means the mode is not actually enabled; anything else
+    // is a probe that never completed and leaves the entry unverified.
+    const probe = this.options.probeCertificate ?? probeSakuraFrpTrustedCertificate
+    let outcome: SakuraFrpCertificateProbe
+    try { outcome = await probe(origin) } catch { outcome = 'unreachable' }
+    if (generation !== this.generation || !this.enabled || this.disposed) return
+    if (outcome === 'untrusted') {
+      await this.failGeneration(generation, 'sakurafrp_certificate_untrusted')
+      return
+    }
+    ready(outcome === 'trusted' ? true : undefined)
+  }
+
+  /** Whether the configured entry is the publicly trusted 自动 HTTPS mode. */
+  private trustedEntry(): boolean {
+    return this.options.settings.settings().entryMode === 'autoHttps'
   }
 
   private async failGeneration(generation: number, code: string): Promise<void> {
@@ -769,5 +1048,7 @@ function publicStatus(status: SakuraFrpStatus): SakuraFrpStatus {
     ...(status.origin === undefined ? {} : { origin: status.origin }),
     ...(status.loginUrl === undefined ? {} : { loginUrl: status.loginUrl }),
     ...(status.errorCode === undefined ? {} : { errorCode: status.errorCode }),
+    ...(status.trustedEntry === undefined ? {} : { trustedEntry: status.trustedEntry }),
+    ...(status.trustedCertificate === undefined ? {} : { trustedCertificate: status.trustedCertificate }),
   })
 }

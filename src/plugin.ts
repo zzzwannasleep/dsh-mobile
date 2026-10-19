@@ -58,7 +58,10 @@ import {
   SakuraFrpSettingsStore,
   createSakuraFrpApiClient,
   type SakuraFrpConfiguration,
+  type SakuraFrpStatus,
   type SakuraFrpTunnel,
+  validateSakuraFrpBoundDomain,
+  validateSakuraFrpEntryMode,
   validateSakuraFrpToken,
   validateSakuraFrpTunnelId,
 } from './sakurafrp.js'
@@ -170,6 +173,8 @@ function mapAdminError(error: unknown): HttpError {
     'sakurafrp_token_invalid',
     'sakurafrp_tunnel_id_invalid',
     'sakurafrp_settings_invalid',
+    'sakurafrp_entry_mode_invalid',
+    'sakurafrp_bound_domain_invalid',
   ].includes(error.message)) return new HttpError(400, error.message)
   if (error instanceof Error && error.message.startsWith('sakurafrp_')) {
     return new HttpError(409, error.message)
@@ -415,7 +420,7 @@ function remoteControlPayload(
   status: RemoteProviderStatus,
   gateway: MobileAccessGateway | undefined,
   cloudflaredStatus: RemoteProviderStatus,
-  sakurafrpStatus: RemoteProviderStatus,
+  sakurafrpStatus: SakuraFrpStatus,
   cloudflaredComponent: CloudflaredComponentStatus,
   cloudflaredConfiguration: CloudflaredTunnelStatus,
   frpComponent: FrpComponentStatus,
@@ -443,6 +448,14 @@ function remoteControlPayload(
         bundled: false,
         running: sakurafrpStatus.enabled,
         state: sakurafrpStatus.state,
+        // The panel picks the entry mode and the bound subdomain from these
+        // flat fields; `configuration` carries the same settings snapshot.
+        entryMode: sakurafrpConfiguration.entryMode,
+        ...(sakurafrpConfiguration.boundDomain === undefined ? {} : { boundDomain: sakurafrpConfiguration.boundDomain }),
+        // True when 子域绑定 + 自动 HTTPS makes the entry publicly trusted, so no
+        // client certificate step applies.
+        trustedEntry: sakurafrpStatus.trustedEntry === true,
+        ...(sakurafrpStatus.trustedCertificate === undefined ? {} : { trustedCertificate: sakurafrpStatus.trustedCertificate }),
         component: frpComponent,
         configuration: sakurafrpConfiguration,
       },
@@ -650,6 +663,23 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
   const remoteStatusLogger = (provider: string) => (status: RemoteProviderStatus): void => {
     logger.info('remote %s state=%s%s', provider, status.state, status.errorCode === undefined ? '' : ` errorCode=${status.errorCode}`)
   }
+  /**
+   * Gateway factory for the trusted SakuraFrp entry (子域绑定 + 自动 HTTPS).
+   *
+   * frpc loads natfrp's own certificate for the bound subdomain and terminates
+   * TLS itself, forwarding plaintext HTTP, so the plugin's listener must be the
+   * plaintext loopback ingress. That is exactly the configuration the
+   * cloudflared path already builds: no plugin CA, public TLS URLs.
+   */
+  const createTrustedSakuraFrpGateway = createRemoteGateway
+  const sakurafrpController = new SakuraFrpController({
+    store: sakurafrpStore,
+    settings: sakurafrpSettings,
+    component: { executable: frpComponent.executable },
+    createGateway: createSakuraFrpGateway,
+    createTrustedGateway: createTrustedSakuraFrpGateway,
+    onStatus: remoteStatusLogger('sakurafrp'),
+  })
   const remoteControllers: Record<RemoteProvider, RemoteProviderController> = {
     cloudflared: new CloudflaredController({
       store: cloudflaredStore,
@@ -658,13 +688,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       createGateway: createRemoteGateway,
       onStatus: remoteStatusLogger('cloudflared'),
     }),
-    sakurafrp: new SakuraFrpController({
-      store: sakurafrpStore,
-      settings: sakurafrpSettings,
-      component: { executable: frpComponent.executable },
-      createGateway: createSakuraFrpGateway,
-      onStatus: remoteStatusLogger('sakurafrp'),
-    }),
+    sakurafrp: sakurafrpController,
   }
   const remoteProviders = new RemoteProviderCoordinator(initialRemoteProvider, remoteControllers, remoteProviderStore)
   const remoteController = () => remoteProviders.controller()
@@ -679,7 +703,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     remoteController().status(),
     remoteController().gateway(),
     remoteControllers.cloudflared.status(),
-    remoteControllers.sakurafrp.status(),
+    sakurafrpController.status(),
     cloudflaredComponent.status(),
     cloudflaredTunnel.status(),
     frpComponent.status(),
@@ -732,7 +756,11 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       catch { networkError = 'network_interface_unavailable' }
     }
     const remote = remoteController().status()
+    // The pinned-CA self-check only applies to the raw-TCP entry. In 子域绑定 +
+    // 自动 HTTPS mode the public certificate is natfrp's, so the check is skipped
+    // and the diagnostics use their default system-trust probe instead.
     const pinnedSakuraFrpProbe = remoteProviders.selected === 'sakurafrp'
+      && sakurafrpController.status().trustedEntry !== true
       && remote.enabled && remote.state === 'ready' && remote.origin !== undefined
       && remoteControllers.sakurafrp.gateway() !== undefined
       ? async (): Promise<{ state: 'ready' | 'unreachable'; latencyMs?: number }> => {
@@ -792,9 +820,11 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       return Object.freeze(channels)
     },
     certificate: async (channel: 'lan' | 'remote') => {
+      // A trusted SakuraFrp entry (子域绑定 + 自动 HTTPS) serves natfrp's public
+      // certificate, so the package must not ship the plugin CA for it.
       const file = channel === 'lan'
         ? template.pairingCaFile
-        : remoteProviders.selected === 'sakurafrp'
+        : remoteProviders.selected === 'sakurafrp' && sakurafrpController.status().trustedEntry !== true
           ? tlsIngressPaths(remoteDeviceFile).caCertFile
           : undefined
       if (file === undefined) return undefined
@@ -993,7 +1023,14 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
         if (request.method === 'POST' && target.decodedPathname === `${LOCAL_ADMIN_PREFIX}/remote/sakurafrp/configure`) {
           const body = await readJsonObject(request, 4096)
           await remoteProviders.mutate(async () => {
-            await sakurafrpSettings.configure({ tunnelId: validateSakuraFrpTunnelId(body.tunnelId) })
+            await sakurafrpSettings.configure({
+              tunnelId: validateSakuraFrpTunnelId(body.tunnelId),
+              // A blank field means "leave this as it was", the same convention
+              // the store applies to a blank token; any other value must be
+              // valid, so a panel typo is a 400 instead of a silent entry mode.
+              ...(body.entryMode === undefined || body.entryMode === '' ? {} : { entryMode: validateSakuraFrpEntryMode(body.entryMode) }),
+              ...(body.boundDomain === undefined || body.boundDomain === '' ? {} : { boundDomain: validateSakuraFrpBoundDomain(body.boundDomain) }),
+            })
             // "Save and connect" is the whole flow: reconnect() starts a disabled
             // provider with the saved tunnel and restarts a live frpc so the new
             // selection takes effect. Failures land in the published state, not

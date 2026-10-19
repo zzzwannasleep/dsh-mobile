@@ -19,6 +19,12 @@ export interface AccessControllerOptions {
   readonly rateLimitWindowMs: number
   readonly maxPairingAttempts: number
   readonly maxRateLimitKeys: number
+  /**
+   * Optional durable entry secret accepted by {@link AccessController.pair} in
+   * place of a short pairing window. It is reusable, so a copied entry link keeps
+   * working until the owner regenerates it; only its digest is retained here.
+   */
+  readonly entrySecret?: string
   readonly now?: () => number
 }
 
@@ -199,6 +205,7 @@ export class AccessController {
   private readonly pairLimiter: BoundedRateLimiter
   private devices: StoredDevice[] = []
   private pairingWindow: PairingWindow | undefined
+  private entryDigest: Buffer | undefined
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly sessionEndedListeners = new Set<(authorization: SessionAuthorization, reason: SessionEndReason) => void>()
   private mutation: Promise<void> = Promise.resolve()
@@ -208,6 +215,7 @@ export class AccessController {
 
   constructor(private readonly store: DeviceStore, private readonly options: AccessControllerOptions) {
     this.now = options.now ?? Date.now
+    this.entryDigest = options.entrySecret === undefined ? undefined : digest(options.entrySecret)
     this.pairLimiter = new BoundedRateLimiter(
       options.maxPairingAttempts,
       options.rateLimitWindowMs,
@@ -304,6 +312,38 @@ export class AccessController {
     })
   }
 
+  /**
+   * Install or clear the durable entry secret without touching the device store.
+   *
+   * The gateway loads the persisted secret and calls this after construction, so
+   * a link the owner sent last month still pairs after a DSH restart.
+   */
+  setEntrySecret(secret: string | undefined): void {
+    if (secret === undefined || secret === '') {
+      this.entryDigest = undefined
+      return
+    }
+    if (secret.length > 512) throw new AccessError(400, 'invalid_request')
+    this.entryDigest = digest(secret)
+  }
+
+  /** Whether a durable entry link is installed; the secret itself never leaves the gateway. */
+  entryLinkStatus(): { readonly active: boolean } {
+    return Object.freeze({ active: this.entryDigest !== undefined })
+  }
+
+  /**
+   * Whether a presented token is the durable entry secret. Never consumes it.
+   *
+   * The pair route uses this to tell a reusable link from a one-time code: a
+   * reusable link may refresh an already-bound device, a code may not.
+   */
+  matchesEntrySecret(token: string): boolean {
+    if (this.entryDigest === undefined || token.length > 512) return false
+    const secret = normalizePairingToken(token)
+    return secret.length <= 512 && matchesDigest(secret, this.entryDigest)
+  }
+
   /** Consume the pairing window exactly once and persist only the device-token digest. */
   async pair(sourceKey: string, token: string, label?: string): Promise<PairingResult> {
     this.requireInitialized()
@@ -314,11 +354,16 @@ export class AccessController {
     if (secret.length > 512) throw new AccessError(401, 'authentication_failed')
     return this.exclusive(async () => {
       const window = this.pairingWindow
-      if (window === undefined || window.expiresAt <= now || !matchesDigest(secret, window.digest)) {
+      const windowMatches = window !== undefined && window.expiresAt > now && matchesDigest(secret, window.digest)
+      // The durable entry link is a reusable bearer secret, so pairing through it
+      // never consumes anything: the owner's copied link keeps working until it is
+      // regenerated. The short window keeps its one-time semantics.
+      const entryMatches = this.entryDigest !== undefined && matchesDigest(secret, this.entryDigest)
+      if (!windowMatches && !entryMatches) {
         if (window !== undefined && window.expiresAt <= now) this.pairingWindow = undefined
         throw new AccessError(401, 'authentication_failed')
       }
-      this.pairingWindow = undefined
+      if (windowMatches) this.pairingWindow = undefined
       const active = this.devices.filter(device => device.revokedAt === undefined && device.expiresAt > now)
       if (active.length >= this.options.maxDevices) throw new AccessError(409, 'device_limit')
 

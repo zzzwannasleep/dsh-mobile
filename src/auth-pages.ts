@@ -75,12 +75,13 @@ interface PcEntryCopy {
   readonly trustLink: string
   readonly trustWarning: string
   readonly trustWindows: string
-  readonly codeTitle: string
-  readonly codeBody: string
+  readonly linkTitle: string
+  readonly linkBody: string
   readonly installTitle: string
   readonly installBody: string
   readonly formTitle: string
   readonly formHelp: string
+  readonly codeFallback: string
   readonly devicePlaceholder: string
   readonly installButton: string
   readonly installHint: string
@@ -93,70 +94,73 @@ const PC_COPY: Record<AuthPageLocale, PcEntryCopy> = {
     title: 'Connect this PC to DSH',
     brand: 'DSH Mobile',
     heading: 'Connect this PC to DSH',
-    lead: 'This page pairs this browser with the DSH running on the owner’s computer. Afterwards DSH opens here like an ordinary web app.',
-    stepsTitle: 'Three short steps',
+    lead: 'The owner only has to send one link. Opening it connects this browser to the DSH running on their computer; afterwards DSH opens here like an ordinary web app.',
+    stepsTitle: 'Follow these steps',
     trustTitle: 'Trust the certificate first',
     trustBody: 'Download and install the certificate before anything else. Until it is installed the browser shows a “not secure” warning for this address — that warning is expected, and it disappears once the certificate is trusted.',
     trustLink: 'Download the certificate',
     trustWarning: 'Open the downloaded file and confirm the security prompt, then reopen this page.',
     trustWindows: 'Open the downloaded file, confirm the Windows security prompt, then close and reopen this tab.',
-    codeTitle: 'Enter the pairing code',
-    codeBody: 'Ask the owner for the pairing code and paste it on the right. A code is valid for 5 minutes by default and can be used once, so ask for a fresh one whenever it expires.',
+    linkTitle: 'Open the link the owner sent',
+    linkBody: 'The owner only has to send one link: opening it signs this computer in to their DSH automatically, with no pairing code to type. The link keeps working until the owner regenerates it in DSH.',
     installTitle: 'Install it as a desktop app (optional)',
     installBody: 'In Edge or Chrome open the ⋯ menu and choose Apps → Install this site as an app. When the browser offers the install, a button appears below the form.',
-    formTitle: 'Pair this PC',
-    formHelp: 'Paste the pairing code, the pairing key or the whole link the owner sent.',
+    formTitle: 'Pairing code (fallback)',
+    formHelp: 'Fill this in only when the owner sent a short one-time pairing code instead of a link.',
+    codeFallback: 'A pairing code is valid for 5 minutes by default and can be used once.',
     devicePlaceholder: 'This PC',
     installButton: 'Install as desktop app',
     installHint: 'Installing adds a Start-menu entry and an app window; nothing else on the computer changes.',
-    securityNote: 'The code is sent once to the owner’s computer and is removed from the page address.',
-    noScript: 'Pairing needs JavaScript. Enable it and reload this page.',
+    securityNote: 'The key in the link is sent to the owner’s computer once when it is opened, and is removed from the page address immediately.',
+    noScript: 'Connecting needs JavaScript. Enable it and reload this page.',
   },
   zh: {
     title: '把这台电脑连接到 DSH',
     brand: 'DSH Mobile',
     heading: '把这台电脑连接到 DSH',
-    lead: '这个页面把当前浏览器与电脑上的 DSH 配对。配对完成后，DSH 会像普通网页应用一样在这里打开。',
-    stepsTitle: '三步即可完成',
+    lead: '主人只需要发来一条链接。打开它就能把当前浏览器连上他电脑上的 DSH，之后 DSH 会像普通网页应用一样在这里打开。',
+    stepsTitle: '按下面的步骤完成',
     trustTitle: '先信任证书',
     trustBody: '请先下载并安装证书。安装之前浏览器会提示此地址“不安全”，这是正常现象；证书被信任后提示就会消失。',
     trustLink: '下载证书',
     trustWarning: '打开下载的文件并确认安全提示，然后重新打开本页面。',
     trustWindows: '打开下载的文件，确认 Windows 的安全提示，然后关闭并重新打开本标签页。',
-    codeTitle: '输入配对码',
-    codeBody: '向电脑的主人索取配对码，粘贴在右侧。配对码默认 5 分钟内有效，且只能使用一次；过期后请再要一个新的。',
+    linkTitle: '打开主人发来的链接',
+    linkBody: '主人只需要发来一条链接：打开它就会自动把这台电脑登录进他的 DSH，不需要输入任何配对码。这条链接一直有效，直到主人在 DSH 里重新生成它。',
     installTitle: '可选：安装为桌面应用',
     installBody: '在 Edge 或 Chrome 中打开 ⋯ 菜单，选择“应用 → 将此站点作为应用安装”。浏览器支持安装时，表单下方会出现按钮。',
-    formTitle: '配对此电脑',
-    formHelp: '粘贴主人发来的配对码、配对密钥或整条链接都可以。',
+    formTitle: '配对码（备用）',
+    formHelp: '只有主人发来的是一条短期一次性配对码、而不是链接时，才需要在这里填写。',
+    codeFallback: '配对码有效期默认 5 分钟，且只能使用一次。',
     devicePlaceholder: '这台电脑',
     installButton: '安装为桌面应用',
     installHint: '安装后会多一个开始菜单入口和独立窗口，电脑上的其他内容不变。',
-    securityNote: '配对码只发送一次到主人的电脑，并会从页面地址中移除。',
-    noScript: '配对需要 JavaScript，请开启后刷新本页面。',
+    securityNote: '链接里的密钥只会在打开时发送到主人的电脑一次，并会立刻从页面地址中移除。',
+    noScript: '连接需要 JavaScript，请开启后刷新本页面。',
   },
   it: {
     title: 'Collega questo PC a DSH',
     brand: 'DSH Mobile',
     heading: 'Collega questo PC a DSH',
-    lead: 'Questa pagina abbina il browser al DSH in esecuzione sul computer del proprietario. Dopo l’abbinamento DSH si apre qui come una normale app web.',
-    stepsTitle: 'Tre passaggi brevi',
+    lead: 'Al proprietario basta inviare un link. Aprendolo questo browser si collega al DSH in esecuzione sul suo computer; poi DSH si apre qui come una normale app web.',
+    stepsTitle: 'Segui questi passaggi',
     trustTitle: 'Prima installa il certificato',
     trustBody: 'Scarica e installa il certificato prima di tutto. Finché non è installato il browser segnala che questo indirizzo non è sicuro: è previsto e l’avviso scompare dopo aver installato il certificato.',
     trustLink: 'Scarica il certificato',
     trustWarning: 'Apri il file scaricato e conferma l’avviso di sicurezza, poi riapri questa pagina.',
     trustWindows: 'Apri il file scaricato, conferma l’avviso di sicurezza di Windows, poi chiudi e riapri questa scheda.',
-    codeTitle: 'Inserisci il codice di abbinamento',
-    codeBody: 'Chiedi il codice di abbinamento al proprietario e incollalo a destra. Il codice vale 5 minuti per impostazione predefinita e si usa una sola volta: se scade, chiedine uno nuovo.',
+    linkTitle: 'Apri il link inviato dal proprietario',
+    linkBody: 'Al proprietario basta inviare un link: aprendolo questo computer accede automaticamente al suo DSH, senza digitare alcun codice di abbinamento. Il link resta valido finché il proprietario non lo rigenera in DSH.',
     installTitle: 'Installa come app desktop (facoltativo)',
     installBody: 'In Edge o Chrome apri il menu ⋯ e scegli App → Installa questo sito come app. Quando il browser lo propone, sotto il modulo compare un pulsante.',
-    formTitle: 'Abbina questo PC',
-    formHelp: 'Incolla il codice, la chiave di abbinamento o il link completo inviato dal proprietario.',
+    formTitle: 'Codice di abbinamento (alternativa)',
+    formHelp: 'Compila questo campo solo se il proprietario ha inviato un codice monouso di breve durata invece del link.',
+    codeFallback: 'Il codice di abbinamento vale 5 minuti per impostazione predefinita e si usa una sola volta.',
     devicePlaceholder: 'Questo PC',
     installButton: 'Installa come app desktop',
     installHint: 'L’installazione aggiunge una voce nel menu Start e una finestra dedicata; il resto del computer non cambia.',
-    securityNote: 'Il codice viene inviato una sola volta al computer del proprietario e viene rimosso dall’indirizzo della pagina.',
-    noScript: 'Per l’abbinamento serve JavaScript: attivalo e ricarica la pagina.',
+    securityNote: 'La chiave contenuta nel link viene inviata una sola volta al computer del proprietario quando lo apri e viene rimossa subito dall’indirizzo della pagina.',
+    noScript: 'Per collegarsi serve JavaScript: attivalo e ricarica la pagina.',
   },
 }
 
@@ -366,6 +370,7 @@ h3{margin:0 0 4px;font-size:16px;line-height:1.35}
 .steps p{margin:0 0 6px;color:#4b5563}
 .steps a{color:#2563eb}
 .help{margin:0 0 14px;font-size:14px;color:#6b7280}
+.field .help{margin:6px 0 0}
 .steps .help{margin-bottom:0}
 .note{margin:14px 0 0;font-size:13px;color:#6b7280}
 .field{margin:0 0 14px}
@@ -390,8 +395,8 @@ output{display:block;margin-top:12px;font-size:14px;color:#4b5563}
       <h2 id="guide-title">${pc.stepsTitle}</h2>
       <ol class="steps">
 ${trustStep}      <li>
-        <h3>${pc.codeTitle}</h3>
-        <p>${pc.codeBody}</p>
+        <h3>${pc.linkTitle}</h3>
+        <p>${pc.linkBody}</p>
       </li>
       <li>
         <h3>${pc.installTitle}</h3>
@@ -405,7 +410,8 @@ ${trustStep}      <li>
       <form id="pair-form">
         <div class="field">
           <label for="pair-token">${copy.pairingCode}</label>
-          <input id="pair-token" autocomplete="one-time-code" required>
+          <input id="pair-token" autocomplete="one-time-code" required aria-describedby="pair-token-help">
+          <p class="help" id="pair-token-help">${pc.codeFallback}</p>
         </div>
         <div class="field">
           <label for="device-label">${copy.deviceName}</label>

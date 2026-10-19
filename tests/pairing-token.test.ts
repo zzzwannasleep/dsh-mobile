@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -119,5 +120,34 @@ describe('pairing with a pasted app key or entry link', () => {
     await expect(access.openPairing(300_000)).resolves.toMatchObject({ expiresAt: clock + 300_000 })
     await expect(access.openPairing(300_001)).rejects.toMatchObject({ status: 400 })
     await expect(access.openPairing(9_999)).rejects.toMatchObject({ status: 400 })
+  })
+})
+
+describe('durable entry link normalization', () => {
+  it('accepts the app key and the whole entry link built from the durable secret', async () => {
+    const secret = randomBytes(32).toString('base64url')
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-pairing-'))
+    directories.push(directory)
+    const access = new AccessController(new JsonDeviceStore(join(directory, 'devices.json')), {
+      pairingTtlMs: 300_000,
+      deviceTtlMs: 3_600_000,
+      sessionTtlMs: 30_000,
+      maxDevices: 4,
+      maxSessions: 8,
+      rateLimitWindowMs: 60_000,
+      maxPairingAttempts: 8,
+      maxRateLimitKeys: 8,
+      entrySecret: secret,
+      now: () => clock,
+    })
+    controllers.push(access)
+    await access.initialize()
+
+    const appKey = `dsh1.3f2a1b.${secret}`
+    const link = `https://192.168.1.10:3443/mobile-access/pc#key=${appKey}`
+    await expect(access.pair('friend-a', appKey, 'App key')).resolves.toMatchObject({ deviceToken: expect.any(String) })
+    await expect(access.pair('friend-b', link, 'Entry link')).resolves.toMatchObject({ deviceToken: expect.any(String) })
+    await expect(access.pair('friend-c', `  "${secret}"  `, 'Wrapped')).resolves.toMatchObject({ deviceToken: expect.any(String) })
+    await expect(access.pair('friend-d', `${secret}x`, 'Almost')).rejects.toMatchObject({ status: 401 })
   })
 })

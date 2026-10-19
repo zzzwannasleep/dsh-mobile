@@ -134,6 +134,11 @@ const REMOTE_ERROR_GUIDANCE: Readonly<Record<string, string>> = Object.freeze({
   sakurafrp_start_timeout: '确认隧道在线、节点可用后点击“重新连接”。',
   sakurafrp_stopped: '点击“重新连接”。',
   sakurafrp_exited: '确认 SakuraFrp 隧道状态后重新连接；仍失败时复制诊断报告。',
+  sakurafrp_bound_domain_missing: '该入口使用自动 HTTPS 但尚未绑定子域名；请在 SakuraFrp 面板绑定后填写子域名。',
+  sakurafrp_bound_domain_invalid: '子域名格式不正确，请从 SakuraFrp 面板复制绑定的纯主机名，例如 dsh.xxxxx.nyat.app。',
+  sakurafrp_entry_mode_invalid: '不支持该入口证书模式；请选择插件自签证书或 SakuraFrp 自动 HTTPS。',
+  sakurafrp_config_unsupported: 'SakuraFrp 返回的配置里没有可指向 DSH 网关的本机目标；请删除后重建该隧道，或改选其他隧道。',
+  sakurafrp_certificate_untrusted: '自动 HTTPS 未真正生效：公网入口仍出示不受信任的证书；请确认该隧道已绑定子域名并开启「自动 HTTPS」，然后重新连接。',
   gateway_start_failed: '确认 DSH 正在运行后重新连接。',
 })
 
